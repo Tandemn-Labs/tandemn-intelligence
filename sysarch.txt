@@ -1,0 +1,193 @@
+The Complete System: End to End
+Let me walk through the entire architecture as one continuous flow, with a concrete example threaded through every step so you can see exactly what happens at each stage.
+
+The Setup: What Exists Before Any Job Arrives
+Before anything runs, you have three foundational pieces of infrastructure.
+The Performance Database. A collection of benchmark results from controlled profiling runs. Each entry says something like "Qwen-72B on 4×A100-80GB with TP=4, PP=1, batch size 32, input length 512, output length 256 gives TPOT 26ms, TTFT 180ms, throughput 480 tok/s." You have these for various models, GPU types, parallelism configs, and load levels. The database is sparse — you can't benchmark every possible combination — but it covers the most common configurations. On top of the raw data sits an interpolation layer that uses domain-aware analytical models (roofline analysis, TP communication scaling laws, memory capacity models) to estimate metrics for configs you haven't directly benchmarked.
+The Resource Map. A live inventory of your GPU cluster. Right now let's say you have 16× A100-80GB, 8× H100, and 8× L40S. Some are allocated to existing jobs, some are free. The map tracks what's available, what's allocated to whom, and the cost per GPU-hour for each type.
+The Policy Memory. Initially empty. Over time this fills with records of past decisions and their outcomes. Early on the system has no history to learn from. That's fine — it relies on the perf DB and LLM reasoning. As jobs run, this memory accumulates and the system gets smarter.
+
+The Example Scenario
+A user submits this request: "Deploy Qwen-72B for an internal application. Expected 10 concurrent users initially, could scale to 80 during business hours. TPOT SLO of 35ms, TTFT SLO of 500ms. This is a production serving endpoint, medium-high priority."
+Let's follow this request through every module.
+
+Step 1: Module 1 — The Oracle Scopes the Landscape
+The Oracle is not an LLM. It's a pure numerical engine. Before the LLM ensemble even sees the request, the Oracle pre-computes the feasible landscape.
+First, it eliminates impossible configurations using hard constraints. Qwen-72B has roughly 72 billion parameters, which in FP16 means about 144GB of weight memory. A single A100-80GB can't hold that, so TP=1 on A100 is immediately impossible. TP=2 on A100 puts 72GB of weights per GPU — that's 90% of memory before KV cache, too tight. TP=4 on A100 puts 36GB per GPU, leaving 44GB for KV cache and activations — feasible. TP=8 on A100 works too but needs 8 GPUs per replica. On H100-80GB the math is similar. On L40S with 48GB memory, even TP=4 puts 36GB of weights per GPU and leaves only 12GB for KV cache — probably too tight for 80 concurrent users with reasonable context lengths. So L40S is likely eliminated for this model.
+Qwen-72B has 64 attention heads and 8 KV heads (GQA). TP must divide both evenly. TP=1, 2, 4, 8 all divide 64 and 8. TP=3, 5, 6 don't divide 64 evenly — eliminated. PP must divide the 80 layers. PP=1, 2, 4, 5, 8, 10 work. PP=3, 6, 7 don't — eliminated.
+After this pruning, the feasible space might look like:
+
+4× A100, TP=4, PP=1 — Oracle predicts TPOT ~27ms at 10 users, ~33ms at 80 users
+8× A100, TP=4, PP=1, DP=2 — Oracle predicts TPOT ~27ms at 10 users, ~28ms at 80 users (more capacity)
+8× A100, TP=8, PP=1 — Oracle predicts TPOT ~24ms at 10 users, ~30ms at 80 users
+4× H100, TP=4, PP=1 — Oracle predicts TPOT ~18ms at 10 users, ~24ms at 80 users
+8× H100, TP=4, PP=1, DP=2 — Oracle predicts TPOT ~18ms at 10 users, ~19ms at 80 users
+8× A100, TP=4, PP=2 — Oracle predicts TPOT ~30ms at 10 users, ~36ms at 80 users (PP bubble hurts)
+
+Each option also has a predicted cost, TTFT, throughput, and a confidence rating based on how close it is to actual perf DB entries.
+If the CatBoost correction model has been trained (from prior jobs), it adjusts these predictions. Maybe the system has learned that the analytical model consistently underestimates TPOT for Qwen models at high batch sizes by about 3ms. The corrected prediction for 4× A100 at 80 users becomes ~36ms instead of ~33ms — which is now above the 35ms SLO. This kind of correction is exactly why the CatBoost layer matters over time.
+The Oracle packages all this into a structured landscape that Module 2 can query.
+
+Step 2: Module 2 — The LLM Ensemble Proposes Configurations
+Now the LLMs get involved. Three or four independent reasoning LLMs each receive the same context: the user's request (Qwen-72B, 10-80 users, 35ms TPOT SLO, medium-high priority), the Oracle's feasible landscape with predicted metrics, the resource map (what GPUs are currently available), and any relevant entries from the policy memory (past decisions for similar situations).
+Each LLM independently proposes a configuration with detailed reasoning.
+LLM-1 might propose: 4× H100, TP=4, PP=1, DP=1. Reasoning: "H100s give the most headroom. At predicted 24ms TPOT for 80 users, we're 31% under SLO, which provides comfortable margin for the CatBoost correction uncertainty. Single replica keeps it simple. We can add a replica later if load exceeds 80."
+LLM-2 might propose: 4× A100, TP=4, PP=1, DP=1, with autoscale trigger to add a second replica at 50 users. Reasoning: "Start cheap with A100s. At 10 users the predicted 27ms TPOT is well under SLO. When load grows, add a replica rather than paying for H100s from the start. Total cost is lower if the load stays under 50 most of the time."
+LLM-3 might propose: 8× A100, TP=4, PP=1, DP=2 from the start. Reasoning: "The user said this could scale to 80 users. The CatBoost correction suggests 4× A100 might hit 36ms at 80 users, which violates SLO. Start with two replicas to guarantee compliance. Cost is higher but SLO risk is near zero."
+LLM-4 might propose: 4× A100, TP=4, PP=1, DP=1. Reasoning: "Simple and cheap. Even the corrected prediction of 36ms at peak is only marginally over SLO, and peak load might not actually reach 80. Save the H100s for jobs that need them."
+Now the debate phase. Your C-PMI judge (or debate-based ensemble) facilitates discussion. The judge asks pointed questions.
+"LLM-4, you acknowledge the corrected prediction is 36ms at peak which violates the 35ms SLO. This is a medium-high priority production endpoint. How do you justify the risk?"
+LLM-4 responds: "Fair point. The 36ms prediction has uncertainty of ±4ms, so there's roughly a 40% chance we're actually fine. But for a production endpoint, that risk level is too high. I revise my recommendation to align with LLM-2's approach: start with 4× A100 but set a tight autoscale trigger."
+"LLM-1, you propose H100s. Only 8 H100s are available in the cluster. If this job takes 4 of them, that limits options for future high-demand jobs. Is that justified for a medium-high priority workload?"
+LLM-1 responds: "The resource constraint is valid. However, H100s provide 31% headroom versus A100s which are borderline. If another critical job arrives that needs H100s, we can re-evaluate at that point — the Swap Arbiter would handle that. But I accept that LLM-2's A100 + autoscale approach is more resource-efficient."
+After 2-3 rounds of this, the ensemble votes. The judge synthesizes.
+Final ranked output:
+
+Primary recommendation: 4× A100, TP=4, PP=1, DP=1, with autoscale to DP=2 at 40 concurrent users or if TPOT crosses 30ms. Oracle predicts TPOT 27ms at 10 users, 33ms at 60 users, 28ms at 80 users with DP=2. Cost: $12.80/hr base, $25.60/hr when scaled.
+Alternative (conservative): 4× H100, TP=4, PP=1, DP=1. Better performance but higher cost and consumes scarce H100 resources. Oracle predicts TPOT 18-24ms across load range. Cost: $16/hr.
+Alternative (aggressive): 8× A100, TP=4, PP=1, DP=2. Guarantees compliance but overpays at low load. Cost: $25.60/hr from the start.
+
+
+Step 3: Guardrails Validate
+Each proposed config passes through the validation stack.
+Hard constraints: All three pass. Memory fits, TP divides heads correctly, GPUs are available, interconnect is adequate.
+Blacklist: Clean. None of these configs have failed before (or the system is new and the blacklist is empty).
+Soft constraints: Config 1 gets a minor warning — "at peak corrected prediction of ~36ms without autoscale, cutting it close to SLO." Configs 2 and 3 get no warnings. No config has enough warnings to trigger LLM sanity review.
+All three configs enter the candidate pool.
+
+Step 4: Module 4 — The Controller Makes the Final Call
+For initial placement, the controller runs a simplified version of the MPC. It doesn't need the deadband or Kalman filter yet (no live metrics exist). It just evaluates the three candidates over a planning horizon.
+The gain scheduler looks at the expected load profile: starts at 10 users, might ramp to 80 during business hours (say 9am-6pm), drops back to 10-20 at night. This is a medium-load regime trending toward high-load during business hours. The gain scheduler sets moderate SLO penalty weights and moderate cost weights.
+The MPC simulates each config over, say, the next 8 hours (a full business day cycle).
+Simulating Config 1 (4× A100 + autoscale):
+
+Hours 0-2 (10 users): TPOT 27ms, cost $12.80/hr. Green zone, comfortable.
+Hour 3 (load ramps to 40): TPOT 30ms, hitting autoscale trigger. Add replica. 5-minute transition where new replica loads weights — existing replica handles traffic alone, TPOT briefly spikes to maybe 34ms. Then DP=2 kicks in, TPOT drops to 22ms. Cost jumps to $25.60/hr.
+Hours 4-8 (load at 60-80 then declining): DP=2 handles everything comfortably. TPOT 24-28ms. When load drops below 30 at end of day, system is overprovisioned but the MPC might recommend scaling back down tomorrow.
+Total cost over 8 hours: roughly $12.80×3 + $25.60×5 = $166.40. One autoscale event. SLO never violated (brief spike to 34ms during scale-up is within tolerance).
+
+Simulating Config 2 (4× H100):
+
+All 8 hours: TPOT ranges from 18ms to 24ms. Never any stress. No reconfigurations needed.
+Total cost over 8 hours: $16×8 = $128. Zero events. But 4 H100s are locked up all day, including overnight when they're massively overprovisioned for 10 users.
+
+Simulating Config 3 (8× A100 DP=2):
+
+All 8 hours: TPOT ranges from 22ms to 28ms. Comfortable throughout. No reconfigurations.
+Total cost over 8 hours: $25.60×8 = $204.80. Zero events. But massively overprovisioned for the first 3 hours.
+
+The MPC cost function weighs SLO penalties, GPU cost, swap costs, and underutilization penalties.
+Config 2 actually wins on raw cost ($128 vs $166) and has zero risk. But the MPC also factors in opportunity cost of the H100s — if it knows other jobs are likely to need H100s, the implicit cost goes up. Let's say the resource contention is moderate. Config 2's adjusted cost might be $128 + $20 opportunity cost = $148. Config 1 is $166 but uses only A100s which are abundant.
+Depending on the exact weights and resource situation, the MPC might pick Config 1 (cheaper resource class, acceptable risk) or Config 2 (bulletproof, slightly more expensive in real dollars but uses scarce resources). Let's say it picks Config 1 because A100s are abundant and the autoscale plan is sound.
+Output: Deploy 4× A100-80GB, TP=4, PP=1, DP=1. Autoscale trigger: add replica when concurrent users exceed 40 OR filtered TPOT exceeds 30ms.
+
+Step 5: Deployment and Module 3 — The Monitor Begins
+The job deploys. vLLM starts, loads Qwen-72B weights across 4 A100s with TP=4. After about 2 minutes of initialization, the model is serving requests.
+Module 3 starts collecting metrics immediately. Every 5-10 seconds, it records raw TPOT, TTFT, throughput, GPU utilization, memory usage, batch sizes, queue depth, and concurrent user count.
+The Kalman filter in Module 4 Layer 1 starts building its estimate of true system state. For the first minute or so, its uncertainty is high — it doesn't have enough observations to smooth reliably. After 2-3 minutes, it settles into a reliable filtered estimate.
+Let's say the initial reality looks like this:
+
+10 concurrent users
+Raw TPOT readings: 24ms, 31ms, 22ms, 28ms, 26ms, 35ms, 23ms, 27ms (noisy)
+Kalman filtered TPOT: 27ms with uncertainty ±3ms
+Oracle predicted: 27ms
+
+The delta (actual minus predicted) is approximately 0ms. The Oracle nailed it. Module 5 records this data point — for this exact config and load, the analytical prediction was accurate. The CatBoost correction model (when it eventually trains) will see that no correction was needed here.
+The deadband checks: 27ms against 35ms SLO. That's 77% of SLO. Firmly in GREEN zone. The pipeline stops. The controller does nothing.
+This continues for two hours. The system is quiet. Metrics are logged. Everything is fine.
+
+Step 6: Load Ramps Up — The Controller Activates
+At hour 3, traffic starts climbing. 20 users... 30... 38.
+The Kalman filter tracks the change. Because load is increasing steadily (not a sudden spike), the filter adapts its trust toward new measurements — it recognizes the system is in transition, not just experiencing noise.
+At 38 concurrent users, filtered TPOT reads 30.5ms. The deadband computes: 30.5 / 35 = 87% of SLO. Still in GREEN zone (under 90% threshold for YELLOW entry). The controller stays quiet.
+But the autoscale trigger that Module 2 defined was 40 users OR TPOT exceeding 30ms. The TPOT condition is met. This is a pre-programmed rule, not the MPC — it fires deterministically.
+The system initiates autoscaling to DP=2. A second replica of 4× A100 with TP=4 starts loading weights.
+Module 4 Layer 5 (Anti-Windup) activates. It registers: "action in progress for this job, estimated duration 3 minutes for weight loading plus 2 minutes settling, total freeze 5 minutes." During this period, the deadband controller is suppressed for this job. The Kalman filter keeps running (it needs continuous data), but its output doesn't trigger any actions.
+During the 3-minute weight loading, the original replica handles all traffic alone. Load is now 42 users on a single DP=1 instance. Filtered TPOT climbs to 33ms. This would normally trigger YELLOW in the deadband, but the anti-windup guard says "action in progress, ignore."
+At minute 3, the second replica comes online. The load balancer distributes traffic across both replicas. Almost immediately, TPOT drops. By minute 5, filtered TPOT reads 22ms with 42 users across DP=2.
+The anti-windup guard lifts at minute 5. The Kalman filter has already adapted to the new regime. The deadband checks: 22ms / 35ms = 63% of SLO. GREEN zone. All quiet.
+Module 5 records: "at 42 users with DP=2, TPOT is 22ms. Oracle predicted 21ms for this load and config. Delta = +1ms." Almost perfect prediction. Another data point for CatBoost.
+
+Step 7: Peak Load — Steady State Under Pressure
+Traffic peaks at 75 concurrent users during business hours. Filtered TPOT reads 27ms across the two replicas. That's 77% of SLO. GREEN zone. The system handles peak load without any intervention.
+But Module 5's active exploration sub-component (Sub-component C) notices something during this quiet period. The system is in GREEN zone on a medium-high priority job. It checks: is there a config we're uncertain about that might be better? The CatBoost uncertainty estimator says "we've never seen Qwen-72B on H100 with TP=2 — uncertainty is very high for that config, and the predicted TPOT (corrected) is 20ms, which would be excellent." But this is a production endpoint with medium-high priority, and the exploration policy says don't explore on anything above medium priority. So exploration is skipped. The right call — you don't experiment on production. That exploration opportunity gets logged for a future low-priority job with a similar model.
+
+Step 8: Something Goes Wrong — The Controller Responds
+Let's say at hour 5, something unexpected happens. A co-located job on the same physical node starts a heavy prefill burst, causing memory bandwidth contention. Or maybe the request distribution shifts — users start sending much longer prompts than before. Whatever the cause, TPOT starts climbing.
+Filtered TPOT: 30ms... 32ms... 34ms.
+The deadband checks: 34ms / 35ms = 97% of SLO. This crosses the YELLOW-HIGH threshold (set at 110% in the earlier architecture, but let's say we set it at 95% for a tighter SLO — the exact thresholds are configurable). The controller wakes up.
+Layer 3 — Gain Scheduler: Current utilization is around 65%, load is relatively stable (no rapid change). This is medium-load regime. Moderate weights, 2-hour planning horizon, 15-minute minimum between corrections.
+Layer 4 — MPC runs. It generates candidates:
+
+Do nothing (current DP=2 on A100s)
+Add another replica (DP=3 on A100s)
+Swap to H100 replicas (4× H100, TP=4, DP=2)
+Increase TP to 8 within existing replicas (8× A100, TP=8, DP=1) — wait, this would require a full reconfiguration with downtime, and we'd go from two replicas to one with higher TP, which reduces capacity. Bad idea. The soft constraint scorer flags this heavily.
+
+The MPC simulates forward 2 hours with the load forecast (load stays around 75 for another hour, then drops to 40):
+Do nothing: TPOT stays at 34ms, borderline SLO violation for 1 hour, then drops to 26ms as load decreases. Total: moderate SLO penalty for the first hour, then fine.
+Add replica (DP=3): 5-minute transition. TPOT drops to ~19ms. Cost increases by $12.80/hr. For the second hour when load drops to 40, three replicas are massive overkill (TPOT would be ~14ms, utilization below 20%). Total: no SLO penalty but significant overprovisioning cost, and you'd want to scale back down in an hour.
+Swap to H100: Much more disruptive — need to reload weights on new hardware, probably 5-8 minutes of degraded service. During swap, one replica goes down while H100 replica loads. TPOT on remaining single A100 replica spikes to 45ms+ (well above SLO). After swap completes, TPOT drops to ~20ms. Total: significant SLO violation during swap, then excellent performance. The one-time cost is high.
+The MPC's cost function:
+
+"Do nothing" has a moderate total cost. The SLO violation is mild (34ms vs 35ms target) and temporary.
+"Add replica" has low SLO cost but high GPU cost and upcoming waste.
+"Swap to H100" has brutal transition cost that outweighs the performance benefit for a problem that resolves itself in an hour.
+
+MPC picks "do nothing." The SLO violation is marginal, temporary, and the load is going to drop. The cost of any intervention exceeds the cost of riding it out. This is exactly the kind of decision the MPC is good at — it looked ahead and saw that the problem resolves itself, so burning money or causing downtime to fix it is wasteful.
+The controller outputs NO_ACTION with reasoning: "TPOT at 97% of SLO but load forecast shows decline in 60 minutes. Cost of intervention exceeds projected SLO penalty. Recommend monitoring."
+Now here's the subtlety: the deadband has hysteresis. The system entered YELLOW-HIGH. It stays in YELLOW-HIGH even as TPOT wobbles between 32-34ms. The MPC will re-evaluate at the next cycle (say 10 minutes later). If at that point TPOT has risen to 37ms (above the RED threshold at 125% of SLO), the RED emergency plan fires — add a replica immediately, no MPC deliberation. If TPOT has dropped to 30ms, the MPC still runs (still in YELLOW due to hysteresis) and likely still says "do nothing." Only when TPOT drops below the hysteresis exit threshold (say 90% of SLO, which is 31.5ms) does the system return to GREEN and the controller goes back to sleep.
+An hour later, load drops to 40 users. TPOT drops to 23ms. The deadband returns to GREEN. But now it notices something else — 23ms is 66% of SLO with 40 users on DP=2. That's comfortable but not wasteful enough to trigger YELLOW-LOW (which was set at 70% or below of SLO). The system stays as-is.
+If load drops further to 15 users overnight, TPOT might hit 16ms — 46% of SLO. Now the deadband flags YELLOW-LOW (overprovisioned). The gain scheduler selects low-load regime (high cost weight, low SLO weight). The MPC evaluates scaling down to DP=1. The simulation shows DP=1 at 15 users gives TPOT ~24ms, well under SLO, at half the cost. The transition is simple — just drain and remove one replica, no weight reloading on the remaining one. Swap cost is near zero. MPC recommends scaling down.
+The anti-windup registers the action (replica removal, ~1 minute transition, 3 minutes settling). The controller freezes. The replica is removed. Metrics stabilize. TPOT reads 24ms on DP=1. GREEN zone. The system saved $12.80/hr for the overnight period.
+
+Step 9: Module 5 — The System Learns
+Throughout all of this, Module 5 has been recording every observation.
+CatBoost correction data accumulated from this job so far:
+ConfigLoadOracle Predicted TPOTActual TPOTResidualTP4 DP1 A10010 users27ms27ms0msTP4 DP1 A10038 users30ms30.5ms+0.5msTP4 DP2 A10042 users21ms22ms+1msTP4 DP2 A10075 users26ms27ms+1msTP4 DP2 A10075 users (contention)26ms34ms+8msTP4 DP1 A10015 users24ms24ms0ms
+Most residuals are tiny — the Oracle is accurate under normal conditions. But that +8ms outlier during contention is valuable. The CatBoost model, once it has enough data points across jobs, will learn that co-location contention adds TPOT that the analytical model doesn't predict. It will learn which features correlate with contention (maybe it correlates with total cluster GPU utilization, or with specific co-located workload types). Future Oracle predictions will include this correction.
+Policy memory entry for this job:
+Context: Qwen-72B, 10-80 users, 35ms TPOT SLO, A100 cluster.
+Decision: 4× A100 TP=4 DP=1 with autoscale to DP=2 at 40 users or TPOT > 30ms.
+Outcome: SLO met except for a brief period during contention (34ms, marginal). Autoscale triggered once, worked smoothly. Total cost was competitive. Stability was good — ran for hours without needing the MPC to intervene.
+Score: 0.78 out of 1.0 (docked slightly for the contention-related close call).
+Next time a similar job arrives (large model, variable load, A100 cluster), the LLM ensemble will see this entry as a few-shot example. They'll know this approach works but that contention is a risk factor, and might adjust their autoscale trigger more conservatively or recommend requesting node isolation for medium-high priority jobs.
+
+Step 10: Module 6 — The Swap Arbiter in Action
+Let's say while all this is happening with our Qwen-72B job, there's also a batch processing job (Job-B) running DeepSeek-V3 on 8× A100 with TP=8. It was placed 3 hours ago with a 6-hour completion estimate. It's now halfway done, running fine, throughput is 30% above target.
+A new high-priority request arrives: deploy Llama-70B for a customer demo, needs to be live in 10 minutes, 5 users, strict 25ms TPOT SLO. The resource map shows only L40S GPUs free, which can't comfortably run 70B.
+The Swap Arbiter evaluates options.
+Option A: Take 4× A100 from Job-B (reduce from 8 to 4, TP=8 becomes impossible, reconfigure to TP=4). Give those 4× A100 to the Llama-70B demo.
+Benefit side: The demo is high-priority and needs A100-class hardware. Getting it online meets a critical business need. The value is high.
+Cost side: Job-B must reconfigure from TP=8 to TP=4 with only 4 GPUs. This means weight reloading (3-4 minutes downtime), throughput reduction (maybe 40% lower throughput with half the GPUs), and Job-B's completion time extends from 3 more hours to maybe 5 more hours. But Job-B has no strict deadline and is 30% above throughput target — even with 40% less throughput, it might still be above its original target. The Arbiter checks with the Oracle: "DeepSeek-V3 on 4× A100, TP=4, what's the throughput?" Oracle says the throughput at the current batch size would be roughly 65% of what it was at TP=8 on 8 GPUs. That brings Job-B from 130% of target to about 85% of target — below target but no hard SLO violation since it's a batch job with flexible deadlines.
+KV cache loss: Zero for Job-B since it's batch processing with checkpointing. The current batch can be restarted.
+Net Benefit Score: High positive. The demo (critical, time-sensitive, revenue-impacting) gains a lot. Job-B (medium priority, flexible deadline, still near target) loses a moderate amount. Transition cost is moderate (one reconfiguration). The NBS is clearly positive.
+Option B: Wait for H100s to free up from another job.
+The Arbiter checks: no H100s are expected to free up in the next 30 minutes. The demo needs to be live in 10 minutes. This option fails the timing constraint.
+Option C: Deploy the demo on mixed resources or suboptimal config.
+The Arbiter checks: Llama-70B on L40S would require TP=4 with 4× L40S, but with only 48GB per L40S, memory is extremely tight for KV cache. The Oracle says it'll work for 5 users but TPOT would be ~40ms, above the 25ms SLO. Fails the SLO constraint.
+The Arbiter recommends Option A. But this is a cross-priority swap affecting a running job, so it triggers the LLM override review.
+The LLM receives the full NBS breakdown and context: "We want to take 4 A100s from a batch job that's halfway done and 30% above target, to serve a high-priority customer demo. The batch job will slow down but still nearly hit its throughput target. The demo must go live in 10 minutes."
+The LLM reviews and approves: "This is a clear case. The demo is time-critical and high-priority. Job-B has headroom and flexible deadlines. One consideration: notify Job-B's owner that their completion estimate has changed from 3 hours to approximately 5 hours. Proceed with the swap."
+The swap executes. Module 4's anti-windup guard activates for Job-B (freezing its controller during reconfiguration). The demo job deploys on the freed A100s. Module 3 starts monitoring both the reconfigured Job-B and the new demo job.
+After the demo ends (say 2 hours later), the Swap Arbiter notices that 4× A100 are now free. It checks: should these go back to Job-B? Job-B is currently at 85% of target throughput with 4 GPUs. Adding 4 back would restore it to full speed and help it finish on time. NBS is positive. The swap is non-controversial (giving resources back to the original owner), so no LLM review needed. Job-B gets its GPUs back, reconfigures to TP=8, and finishes on schedule.
+Module 5 records the entire episode. The policy memory now contains a multi-job interaction example: "when a high-priority demo needed A100s urgently, we borrowed from an overperforming batch job and returned them after. Outcome: demo succeeded, batch job delayed by ~1 hour but completed fine, total cost roughly equivalent. Score: 0.9."
+
+Step 11: Active Exploration — The System Gets Smarter
+A week later, traffic patterns are well-established. The system has served dozens of jobs. The CatBoost correction model has 500+ data points and its predictions are tight. Most jobs deploy smoothly on the first try with minimal corrections needed.
+But the exploration manager notices a gap. Across all Qwen-72B deployments, the system has always used TP=4 on A100s. It's never tried TP=2 with PP=2 on A100s for this model. The CatBoost uncertainty for that config is very high. The Oracle's analytical prediction says it should work (TPOT ~29ms at moderate load), but the pipeline bubble from PP=2 might be better or worse than predicted. The optimistic estimate (predicted minus uncertainty) suggests it could be as good as 23ms, which would make it strictly better than the current default.
+A low-priority internal testing job arrives: Qwen-72B, 5 users, relaxed 50ms TPOT SLO. Perfect exploration candidate — low priority, low load, generous SLO, lots of headroom if the experiment fails.
+The exploration manager activates. Instead of the default TP=4 PP=1, it recommends TP=2 PP=2 on 4× A100 (same GPU count, different parallelism strategy). The system deploys this config.
+The monitor observes: actual TPOT is 32ms. The Oracle predicted 29ms. The residual is +3ms — the PP pipeline bubble is slightly worse than the analytical model estimated. But 32ms is well under the 50ms SLO and the config works.
+This data point is valuable. The CatBoost model now has a real observation for TP=2 PP=2 on Qwen-72B on A100. Its uncertainty for this config region drops dramatically. And the observation tells the system: "TP=2 PP=2 works but is about 5ms worse than TP=4 PP=1 for this model. Not a better default, but a viable fallback if TP=4 isn't possible for some resource reason."
+The exploration budget ticks: that's one exploration out of the last 50 decisions, well within the 10% budget. The beta coefficient decays slightly — the system is a little less exploratory than before because one more region of config space is now known.
+
+The Steady State: What the System Looks Like After a Month
+After running for weeks, the system has transformed.
+The Oracle is significantly more accurate than it was on day one. The CatBoost correction model has thousands of observations and has learned systematic biases: the analytical model underestimates TPOT for MoE models by about 5ms due to expert routing overhead it doesn't capture. It overestimates TTFT for models with GQA because the KV cache computation is more efficient than the roofline analysis assumes. Under high cluster-wide utilization, all predictions are about 8% too optimistic due to memory bandwidth contention.
+Module 2's LLM ensemble produces better first-shot configs because the policy memory is rich with examples. For common scenarios (Llama-70B on A100, Qwen-72B serving, batch processing jobs), the LLMs have seen 10-20 similar past decisions and their outcomes. Their proposals are well-calibrated and rarely need correction.
+Module 4's controller fires less frequently. Because initial placements are better and predictions are tighter, jobs land in the GREEN zone and stay there more often. The deadband rarely triggers YELLOW. Reconfigurations happen maybe once or twice a day across the whole cluster instead of several times per job.
+Module 6's Swap Arbiter has learned the cluster's patterns. It knows that batch jobs submitted on Monday mornings tend to be large and compete with serving jobs that ramp up at 9am. It pre-positions resources accordingly, based on accumulated policy memory patterns.
+The exploration manager has mapped most of the common config space. Uncertainty is low for standard configs. But when a new GPU type arrives (say H200s) or a new model architecture appears (say a model with a novel attention pattern), uncertainty spikes in those regions and the system ramps up exploration again — carefully, on low-priority jobs, building knowledge.
+The system's total cost has declined over the month. Fewer reconfigurations means less downtime. Better initial placements means less overprovisioning. Active exploration discovered two config patterns that are 15% cheaper than the defaults the LLMs would have suggested. The CatBoost correction catches contention issues before they cause SLO violations.
+That's the complete picture. Every module has a clear role, every signal flows in one direction through a well-defined pipeline, and the system improves with every job it runs.
