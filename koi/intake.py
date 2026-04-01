@@ -127,8 +127,13 @@ def _parse_resource_map_response(
 ) -> ResourceMap:
     """
     Convert raw endpoint JSON → ResourceMap.
-    Handles both Shape A (plain list) and Shape B (wrapper object).
+    Handles Shape A (plain list), Shape B (wrapper object),
+    and Shape C (Orca's {instances[], quotas[]} format).
     """
+    # Shape C — Orca's {instances[], quotas[]} format
+    if isinstance(data, dict) and "instances" in data and "quotas" in data:
+        return _parse_orca_resource_format(data, vpc_id=vpc_id, region=region)
+
     if isinstance(data, list):
         raw_resources = data
         resolved_vpc = vpc_id or "vpc-unknown"
@@ -220,6 +225,95 @@ def _parse_resource_map_response(
 
     if not resources:
         raise ValueError("Resource map endpoint returned no GPU resources.")
+
+    return ResourceMap(
+        vpc_id=resolved_vpc,
+        region=resolved_region,
+        resources=resources,
+    )
+
+
+def _parse_orca_resource_format(
+    data: Dict[str, Any],
+    vpc_id: Optional[str] = None,
+    region: Optional[str] = None,
+) -> ResourceMap:
+    """
+    Convert Orca's {instances[], quotas[]} → ResourceMap (Shape C).
+
+    Orca returns raw AWS instance catalog + per-region quota info.
+    This function joins them: for each instance type, find the best region
+    (most available vCPU for that quota family), compute max launchable
+    instances from quota headroom, and emit GPUResource entries.
+
+    This is the only place that understands AWS quota semantics.
+    Koi is stateless w.r.t. quota — every /decide call gets fresh data.
+    """
+    instances = data.get("instances", [])
+    quotas = data.get("quotas", [])
+    resolved_vpc = vpc_id or "vpc-unknown"
+
+    resources: List[GPUResource] = []
+    for inst in instances:
+        family = inst.get("quota_family", "")
+        vcpus = int(inst.get("vcpus", 0))
+        if vcpus <= 0:
+            continue
+
+        # Find best region for this family (most available on-demand vCPU)
+        family_quotas = [
+            q for q in quotas
+            if q.get("family") == family and q.get("market") == "on_demand"
+        ]
+        best = max(
+            family_quotas,
+            key=lambda q: q.get("baseline_vcpus", 0) - q.get("used_vcpus", 0),
+            default=None,
+        )
+        if not best or best.get("baseline_vcpus", 0) <= 0:
+            continue
+
+        available_vcpu = best["baseline_vcpus"] - best.get("used_vcpus", 0)
+        max_instances = available_vcpu // vcpus
+        gpus_per_instance = int(inst.get("gpus_per_instance", 1))
+        total_gpus = max_instances * gpus_per_instance
+        if total_gpus <= 0:
+            continue
+
+        gpu_type = inst.get("gpu_type", "UNKNOWN")
+        gpu_type_upper = gpu_type.upper()
+
+        gpu_memory_gb = (
+            _coerce_float(inst.get("gpu_memory_gb"))
+            or _GPU_MEMORY_GB.get(gpu_type_upper)
+            or 40.0
+        )
+        interconnect = (
+            inst.get("interconnect")
+            or _GPU_INTERCONNECT.get(gpu_type_upper)
+            or "PCIe"
+        )
+        cost = _coerce_float(inst.get("cost_per_instance_hour_usd")) or 0.0
+        instance_type = inst.get("instance_type", f"unknown-{gpu_type.lower()}")
+        best_region = best.get("region") or region or "us-east-1"
+
+        resources.append(GPUResource(
+            gpu_type=gpu_type,
+            instance_type=instance_type,
+            gpus_per_instance=gpus_per_instance,
+            total_gpus=total_gpus,
+            allocated_gpus=0,  # Orca already accounts for used vCPUs
+            cost_per_instance_hour_usd=cost,
+            gpu_memory_gb=gpu_memory_gb,
+            region=best_region,
+            interconnect=interconnect,
+        ))
+
+    if not resources:
+        raise ValueError("Orca resource map yielded no GPU resources (all quota families exhausted).")
+
+    # Use the first resource's region as the map-level region
+    resolved_region = region or (resources[0].region if resources else "us-east-1")
 
     return ResourceMap(
         vpc_id=resolved_vpc,
