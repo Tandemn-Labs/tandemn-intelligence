@@ -80,7 +80,7 @@ async def health():
     koi: KoiPlacement = app.state.koi
     return {
         "status": "ok",
-        "perfdb_entries": len(koi.oracle.perf_rag.records) if hasattr(koi.oracle, "perf_rag") else 0,
+        "perfdb_entries": len(koi.oracle.rag.records) if hasattr(koi.oracle, "rag") else 0,
         "model": koi.ensemble.model,
         "tracked_jobs": len(app.state.tracked_jobs),
     }

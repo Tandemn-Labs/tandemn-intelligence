@@ -281,6 +281,10 @@ def _parse_orca_resource_format(
             continue
 
         gpu_type = inst.get("gpu_type", "UNKNOWN")
+        # Normalize generic "A100" to A100-40GB/A100-80GB based on VRAM
+        gpu_mem_raw = _coerce_float(inst.get("gpu_memory_gb"))
+        if gpu_type.upper() == "A100" and gpu_mem_raw:
+            gpu_type = "A100-80GB" if gpu_mem_raw >= 70 else "A100-40GB"
         gpu_type_upper = gpu_type.upper()
 
         gpu_memory_gb = (

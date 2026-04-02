@@ -691,10 +691,11 @@ def _validate_proposed_config(
             f"{resource.gpu_memory_gb}GB VRAM). Increase TP or use quantization."
         ), None
 
-    # Instance type sanity
+    # Instance type sanity — auto-correct gpu_type from instance mapping
     if instance_type and instance_type in INSTANCE_TO_GPU:
-        if INSTANCE_TO_GPU[instance_type] != gpu_type:
-            return False, f"instance_type '{instance_type}' maps to {INSTANCE_TO_GPU[instance_type]}, not {gpu_type}", None
+        expected_gpu = INSTANCE_TO_GPU[instance_type]
+        if expected_gpu != gpu_type:
+            gpu_type = expected_gpu
     if not instance_type or instance_type not in INSTANCE_TO_GPU:
         instance_type = resource.instance_type
 
@@ -759,7 +760,7 @@ async def _call_one_thinker(
         try:
             response = await client.messages.create(
                 model=model,
-                max_tokens=2500,
+                max_tokens=8192,
                 system=THINKER_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_prompt}],
             )
@@ -886,7 +887,7 @@ async def _call_judge(
     try:
         response = await client.messages.create(
             model=model,
-            max_tokens=3000,
+            max_tokens=8192,
             system=JUDGE_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
         )

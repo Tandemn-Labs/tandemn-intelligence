@@ -520,10 +520,28 @@ class PerfRAG:
             return []
 
         seen_keys: set = set()
-        all_results: List[Dict] = []
+        # per_gpu: guaranteed slots per GPU type (best record for that type)
+        per_gpu: Dict[str, List[Dict]] = {g: [] for g in available_gpu_types}
+        overflow: List[Dict] = []  # everything else, filled by similarity
 
-        # Limit combination explosion: max 3 GPUs × 4 TPs × 3 PPs = 36 queries
-        for gpu_type in available_gpu_types[:3]:
+        def _add(rec: Dict, target: List) -> bool:
+            key = (
+                str(rec.get("model_name", "")),
+                str(rec.get("gpu_type", "")),
+                str(rec.get("tp", 1)),
+                str(rec.get("pp", 1)),
+                str(rec.get("input_len", 0)),
+                str(rec.get("output_len", 0)),
+                str(rec.get("_source", "")),
+            )
+            if key in seen_keys:
+                return False
+            seen_keys.add(key)
+            target.append(rec)
+            return True
+
+        # Query all GPU types (not just top 3) to guarantee coverage
+        for gpu_type in available_gpu_types:
             for tp in tp_options[:4]:
                 for pp in pp_options[:3]:
                     query = self.build_query_text(
@@ -536,24 +554,38 @@ class PerfRAG:
                         output_len=output_len,
                         dtype=dtype,
                     )
-                    # Retrieve k//2 per sub-query, deduplicate globally
                     results = self.retrieve(query, k=max(k // 2, 5))
                     for rec in results:
-                        key = (
-                            str(rec.get("model_name", "")),
-                            str(rec.get("gpu_type", "")),
-                            str(rec.get("tp", 1)),
-                            str(rec.get("pp", 1)),
-                            str(rec.get("input_len", 0)),
-                            str(rec.get("output_len", 0)),
-                            str(rec.get("_source", "")),
-                        )
-                        if key not in seen_keys:
-                            seen_keys.add(key)
-                            all_results.append(rec)
+                        rec_gpu = str(rec.get("gpu_type", ""))
+                        bucket = per_gpu.get(rec_gpu, overflow)
+                        _add(rec, bucket if isinstance(bucket, list) else overflow)
 
-        all_results.sort(key=lambda r: -r.get("_similarity", 0.0))
-        return all_results[:k]
+        # Guarantee 2 records per available GPU type, fill rest by similarity
+        MIN_PER_GPU = 2
+        guaranteed: List[Dict] = []
+        for gpu_type in available_gpu_types:
+            top = sorted(per_gpu.get(gpu_type, []), key=lambda r: -r.get("_similarity", 0.0))
+            guaranteed.extend(top[:MIN_PER_GPU])
+
+        # Remaining slots: best by similarity from overflow + unused per-gpu records
+        remaining_pool = overflow[:]
+        for gpu_type in available_gpu_types:
+            top = sorted(per_gpu.get(gpu_type, []), key=lambda r: -r.get("_similarity", 0.0))
+            remaining_pool.extend(top[MIN_PER_GPU:])
+        remaining_pool.sort(key=lambda r: -r.get("_similarity", 0.0))
+
+        # Deduplicate guaranteed vs remaining
+        guaranteed_keys = {
+            (r.get("gpu_type"), r.get("tp"), r.get("pp"), r.get("input_len"), r.get("output_len"))
+            for r in guaranteed
+        }
+        filler = [r for r in remaining_pool
+                  if (r.get("gpu_type"), r.get("tp"), r.get("pp"), r.get("input_len"), r.get("output_len"))
+                  not in guaranteed_keys]
+
+        result = guaranteed + filler
+        result.sort(key=lambda r: -r.get("_similarity", 0.0))
+        return result[:k]
 
     def format_records_for_llm(self, records: List[Dict], max_show: int = 10) -> str:
         """
