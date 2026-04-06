@@ -1011,9 +1011,6 @@ But if B takes 8 H100 GPUs, they're all gone. And A and C compete for A100s.
 - [ ] Momentum tracking in configuration space
 - [ ] Piggyback exploration (heterogeneous replica in DP≥3)
 
-**Dataset-aware chunking:**
-- [ ] Agent sets chunk_size as part of config (small for fault tolerance, large for throughput)
-
 **Budget enforcement:**
 - [ ] User specifies max spend, agent tracks cost accrual and scales down to stay under
 
@@ -1073,16 +1070,6 @@ Agent decides:
 ```
 
 The Orca watchdog already handles replica death and chunk reclamation. Koi's role is deciding WHETHER to replace (based on SLO math) and WHAT to replace with (same GPU? different? on-demand fallback?).
-
-### Dataset-aware chunking interaction
-
-Koi decides the GPU config but doesn't influence chunk size. Orca uses a fixed chunk size (default 1000 lines). But chunk size interacts with GPU performance:
-- Small chunks (100 lines) = high overhead from chunk pull/push, but faster failover on preemption
-- Large chunks (5000 lines) = lower overhead, but a preempted chunk wastes more work
-- For slow GPUs (L4), smaller chunks mean faster progress visibility
-- For fast GPUs (H100), larger chunks amortize the overhead
-
-Future: agent sets `chunk_size` as part of the config, not just GPU/TP/PP/DP. This is a tuning knob that affects both throughput and fault tolerance.
 
 ### Cost tracking and budget enforcement
 
