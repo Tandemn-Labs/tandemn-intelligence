@@ -1,439 +1,331 @@
 """
-koi/monitor.py — Runtime monitoring loop.
+koi/monitor.py — Three separate async loops for job monitoring.
 
-Responsibilities:
-  - Poll live metrics from running jobs every N seconds
-  - Apply Kalman filter to smooth noisy GPU metrics
-  - Compute running delta = (actual - predicted)
-  - Feed delta to deadband controller to decide if reconfiguration is needed
-  - Emit DeltaRecord to the Refinement engine when job completes
+Loop 1 (TelemetryLoop): 10s polling, pure code, updates JobTracker, checks thresholds
+Loop 2 (SnapshotLoop):  2-5 min, writes chain_snapshots to SQLite
+Loop 3 (TriggerDispatcher): event-driven, fires agent on triggers
 
-Metrics sources (in order of preference):
-  1. vLLM /metrics Prometheus endpoint
-  2. Job-specific metrics API (Tandem internal)
-  3. CloudWatch / GPU monitor (from results.json node*_gpu* fields)
-
-Phase 1: stubs with clean interfaces.
-Phase 2: wire up real Prometheus polling.
+These are independent asyncio.Tasks. They do NOT share a timer.
 """
 
 import asyncio
-import time
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+import logging
 from datetime import datetime
-from enum import Enum
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Coroutine, Dict, List, Optional
 
 from koi.schemas import (
-    DeltaRecord,
-    PESComponents,
-    PlacementDecision,
-    PredictedMetrics,
-    RuntimeMetrics,
-    TaskType,
+    JobTracker, MonitoringStatus, MonitoringTrigger, PlacementConfig,
 )
+from koi.tools.memory import AgenticMemory
+from koi.tools.orca_api import OrcaClient
+
+logger = logging.getLogger("koi.monitor")
+
+# Thresholds
+WARMUP_MINUTES = 5.0
+SLO_GREEN_THRESHOLD = 30.0       # headroom > 30% → ON_TRACK
+SLO_YELLOW_THRESHOLD = 10.0      # headroom 10-30% → AT_RISK
+OVER_PROVISIONED_THRESHOLD = 70.0 # headroom > 70% AND elapsed > 20% → shed
+OVER_PROVISIONED_MIN_ELAPSED = 0.20  # 20% of SLO elapsed before considering scale-down
+EMA_ALPHA = 0.3                   # exponential moving average smoothing
 
 
-# ---------------------------------------------------------------------------
-# Deadband states
-# ---------------------------------------------------------------------------
-
-class SLOState(str, Enum):
-    GREEN = "green"          # comfortable, < 80% of SLO budget used
-    YELLOW_LOW = "yellow_low"  # underprovisioned relative to SLO (<70% util)
-    YELLOW_HIGH = "yellow_high"  # approaching SLO (80-100%)
-    RED = "red"              # SLO violated or imminent (>100%)
-
-
-# ---------------------------------------------------------------------------
-# Simple Kalman filter for 1D metric smoothing
-# ---------------------------------------------------------------------------
-
-class KalmanFilter1D:
+class MonitoringLoop:
     """
-    Single-variable discrete Kalman filter for smoothing noisy metric timeseries.
-
-    State: true metric value (e.g. TPOT in ms)
-    Measurement noise: R — expected variance in raw readings
-    Process noise: Q — expected variance in true value changing over time
-
-    For slowly-changing metrics (TPOT): low Q, higher R (trust model more than measurement)
-    For fast-changing metrics (throughput spikes): higher Q (track changes faster)
-    """
-
-    def __init__(self, initial_value: float, R: float = 25.0, Q: float = 1.0):
-        self.x = initial_value      # state estimate
-        self.P = 50.0               # estimate uncertainty (high initial uncertainty)
-        self.R = R                  # measurement noise variance
-        self.Q = Q                  # process noise variance
-
-    def update(self, measurement: float) -> float:
-        # Predict
-        self.P += self.Q
-
-        # Update (Kalman gain)
-        K = self.P / (self.P + self.R)
-        self.x = self.x + K * (measurement - self.x)
-        self.P = (1 - K) * self.P
-
-        return self.x
-
-    @property
-    def estimate(self) -> float:
-        return self.x
-
-    @property
-    def uncertainty(self) -> float:
-        return self.P ** 0.5  # std dev
-
-
-# ---------------------------------------------------------------------------
-# Deadband controller
-# ---------------------------------------------------------------------------
-
-class DeadbandController:
-    """
-    Two-threshold hysteresis controller.
-
-    Prevents oscillation by requiring the metric to cross both an outer band
-    (to trigger action) and an inner band (to declare "recovered").
-
-    Thresholds are expressed as fractions of the SLO value.
-    """
-
-    def __init__(
-        self,
-        slo_value: float,
-        green_threshold: float = 0.80,     # below this: GREEN
-        yellow_high_threshold: float = 0.90,  # above this: YELLOW_HIGH
-        red_threshold: float = 1.05,       # above this: RED
-        yellow_low_threshold: float = 0.50,   # below this: YELLOW_LOW (overprovisioned)
-    ):
-        self.slo = slo_value
-        self.green_t = green_threshold * slo_value
-        self.yellow_high_t = yellow_high_threshold * slo_value
-        self.red_t = red_threshold * slo_value
-        self.yellow_low_t = yellow_low_threshold * slo_value
-        self._current_state = SLOState.GREEN
-
-    def update(self, filtered_value: float) -> SLOState:
-        """
-        Apply hysteresis: state only changes when crossing the appropriate threshold.
-        Current state is preserved within the band (prevents oscillation).
-        """
-        prev = self._current_state
-
-        if filtered_value >= self.red_t:
-            self._current_state = SLOState.RED
-        elif filtered_value >= self.yellow_high_t:
-            # Only enter YELLOW_HIGH from GREEN or RED — not from YELLOW_LOW
-            if prev in (SLOState.GREEN, SLOState.RED):
-                self._current_state = SLOState.YELLOW_HIGH
-            elif prev == SLOState.YELLOW_HIGH:
-                pass  # stay (hysteresis)
-        elif filtered_value <= self.yellow_low_t:
-            self._current_state = SLOState.YELLOW_LOW
-        elif filtered_value <= self.green_t:
-            # Only return to GREEN if coming down from YELLOW_HIGH (hysteresis exit)
-            if prev in (SLOState.GREEN, SLOState.YELLOW_LOW):
-                self._current_state = SLOState.GREEN
-            elif prev == SLOState.YELLOW_HIGH and filtered_value < self.green_t:
-                self._current_state = SLOState.GREEN
-        else:
-            # In the ambiguous band (green_t to yellow_high_t): stay in current state
-            pass
-
-        return self._current_state
-
-    @property
-    def state(self) -> SLOState:
-        return self._current_state
-
-
-# ---------------------------------------------------------------------------
-# Per-job monitor state
-# ---------------------------------------------------------------------------
-
-@dataclass
-class JobMonitorState:
-    """Live monitoring state for a single running job."""
-    job_id: str
-    decision: PlacementDecision
-    start_time: float = field(default_factory=time.time)
-    last_poll_time: Optional[float] = None
-
-    # Kalman filters per metric
-    kf_tpot: Optional[KalmanFilter1D] = None
-    kf_throughput: Optional[KalmanFilter1D] = None
-
-    # Deadband controllers (initialized once we have SLO values)
-    deadband_tpot: Optional[DeadbandController] = None
-    deadband_throughput: Optional[DeadbandController] = None
-
-    # Current smoothed state
-    current_tpot_ms: Optional[float] = None
-    current_throughput_tps: Optional[float] = None
-    slo_state: SLOState = SLOState.GREEN
-
-    # History for delta computation
-    raw_metrics_history: List[RuntimeMetrics] = field(default_factory=list)
-    reconfiguration_count: int = 0
-    action_in_progress: bool = False     # Anti-windup: suppress corrections during transition
-    action_freeze_until: Optional[float] = None  # timestamp to unfreeze
-
-    def elapsed_hours(self) -> float:
-        return (time.time() - self.start_time) / 3600.0
-
-    def is_frozen(self) -> bool:
-        """Anti-windup: returns True if an action is in progress."""
-        if self.action_in_progress:
-            if self.action_freeze_until and time.time() > self.action_freeze_until:
-                self.action_in_progress = False
-                self.action_freeze_until = None
-                return False
-            return True
-        return False
-
-    def freeze(self, duration_seconds: float = 300.0) -> None:
-        """Freeze the deadband during a reconfiguration."""
-        self.action_in_progress = True
-        self.action_freeze_until = time.time() + duration_seconds
-        self.reconfiguration_count += 1
-
-    def unfreeze(self) -> None:
-        self.action_in_progress = False
-        self.action_freeze_until = None
-
-
-# ---------------------------------------------------------------------------
-# Metrics source interface
-# ---------------------------------------------------------------------------
-
-class MetricsSource(ABC):
-    """Abstract interface for fetching live metrics from a running job."""
-
-    @abstractmethod
-    async def fetch(self, job_id: str) -> Optional[RuntimeMetrics]:
-        """Fetch latest metrics snapshot. Returns None if job not found."""
-        ...
-
-
-class PrometheusMetricsSource(MetricsSource):
-    """
-    Fetches metrics from vLLM's Prometheus /metrics endpoint.
-
-    Expected metrics:
-      vllm:num_requests_running        → concurrent_requests
-      vllm:avg_generation_throughput_toks_per_s → throughput
-      vllm:time_per_output_token_seconds_bucket → TPOT histogram
-      vllm:time_to_first_token_seconds_bucket   → TTFT histogram
-    """
-
-    def __init__(self, base_url: str):
-        self.base_url = base_url.rstrip("/")
-
-    async def fetch(self, job_id: str) -> Optional[RuntimeMetrics]:
-        # TODO: implement aiohttp call to self.base_url/metrics
-        # Parse Prometheus text format → extract key metrics
-        # Return RuntimeMetrics
-        raise NotImplementedError("PrometheusMetricsSource not yet wired up")
-
-
-class MockMetricsSource(MetricsSource):
-    """
-    Mock metrics source for testing.
-    Returns synthetic metrics based on the placement decision's predictions.
-    Adds configurable noise to simulate real-world variance.
-    """
-
-    def __init__(self, base_tpot: float = 27.0, noise_pct: float = 0.10):
-        self.base_tpot = base_tpot
-        self.noise_pct = noise_pct
-        self._call_count = 0
-
-    async def fetch(self, job_id: str) -> Optional[RuntimeMetrics]:
-        import random
-        self._call_count += 1
-        noise = 1 + random.uniform(-self.noise_pct, self.noise_pct)
-        # Simulate occasional spike at call 10-15
-        if 10 <= self._call_count <= 15:
-            noise *= 1.25
-
-        return RuntimeMetrics(
-            job_id=job_id,
-            timestamp=datetime.utcnow(),
-            throughput_tokens_per_sec=1200 * noise,
-            tpot_ms=self.base_tpot * noise,
-            gpu_utilization_pct=65 * noise,
-            gpu_memory_used_gb=39.0,
-            concurrent_requests=20,
-            queue_depth=2,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Main monitor
-# ---------------------------------------------------------------------------
-
-class KoiMonitor:
-    """
-    Monitors all running jobs and feeds deltas to the refinement engine.
+    Manages all three async loops for tracked jobs.
 
     Usage:
-        monitor = KoiMonitor(metrics_source=MockMetricsSource())
-        await monitor.start_job(decision)
-        # runs in background, calls on_action_needed when SLO at risk
-        await monitor.stop_job(job_id)
-        delta_record = monitor.compute_delta(job_id)
+        monitor = MonitoringLoop(orca=orca_client, memory=memory, on_trigger=agent.handle_trigger)
+        monitor.register_job(job_id, config, slo, total_tokens, predicted_tps, decision_id)
+        await monitor.start()  # starts all 3 loops as background tasks
+        await monitor.stop()   # cancels all tasks
     """
 
     def __init__(
         self,
-        metrics_source: Optional[MetricsSource] = None,
-        poll_interval_seconds: float = 30.0,
-        on_action_needed: Optional[Callable[[str, SLOState, JobMonitorState], None]] = None,
+        orca: OrcaClient,
+        memory: AgenticMemory,
+        on_trigger: Optional[Callable[[MonitoringTrigger], Coroutine]] = None,
+        telemetry_interval: float = 10.0,
+        snapshot_interval: float = 180.0,  # 3 minutes
     ):
-        self.metrics_source = metrics_source or MockMetricsSource()
-        self.poll_interval = poll_interval_seconds
-        self.on_action_needed = on_action_needed
-        self._jobs: Dict[str, JobMonitorState] = {}
-        self._tasks: Dict[str, asyncio.Task] = {}
+        self.orca = orca
+        self.memory = memory
+        self.on_trigger = on_trigger  # async callback for Loop 3
+        self.telemetry_interval = telemetry_interval
+        self.snapshot_interval = snapshot_interval
 
-    async def start_job(self, decision: PlacementDecision) -> None:
-        """Begin monitoring a newly deployed job."""
-        predicted = decision.predicted_metrics
-        state = JobMonitorState(
-            job_id=decision.job_id,
-            decision=decision,
+        self.tracked_jobs: Dict[str, JobTracker] = {}
+        self._trigger_queue: asyncio.Queue = asyncio.Queue()
+        self._tasks: List[asyncio.Task] = []
+        self._running = False
+
+    # ------------------------------------------------------------------
+    # Job registration
+    # ------------------------------------------------------------------
+
+    def register_job(
+        self,
+        job_id: str,
+        config: PlacementConfig,
+        slo_deadline_hours: float,
+        total_tokens: int,
+        predicted_tps: float,
+        decision_id: Optional[str] = None,
+    ):
+        tracker = JobTracker(
+            job_id=job_id,
+            decision_id=decision_id,
+            config=config,
+            slo_deadline_hours=slo_deadline_hours,
+            total_tokens=total_tokens,
+            predicted_tps=predicted_tps,
+            tokens_remaining=total_tokens,
         )
+        self.tracked_jobs[job_id] = tracker
+        logger.info(f"[Monitor] Registered job {job_id} (SLO={slo_deadline_hours}h, {total_tokens:,} tokens)")
 
-        # Initialize Kalman filters with predicted values as initial state
-        if predicted.tpot_ms:
-            state.kf_tpot = KalmanFilter1D(predicted.tpot_ms, R=30.0, Q=2.0)
-            state.deadband_tpot = DeadbandController(
-                slo_value=predicted.tpot_ms * 1.5,  # placeholder; real SLO set by job
-            )
-        state.kf_throughput = KalmanFilter1D(
-            predicted.throughput_tokens_per_sec, R=10000.0, Q=500.0
-        )
+    def unregister_job(self, job_id: str):
+        self.tracked_jobs.pop(job_id, None)
+        logger.info(f"[Monitor] Unregistered job {job_id}")
 
-        self._jobs[decision.job_id] = state
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
-        # Start polling loop in background
-        task = asyncio.create_task(self._poll_loop(decision.job_id))
-        self._tasks[decision.job_id] = task
-        print(f"[Monitor] Started monitoring job {decision.job_id}")
+    async def start(self):
+        """Start all 3 loops as background tasks."""
+        self._running = True
+        self._trigger_queue = asyncio.Queue()
+        self._tasks = [
+            asyncio.create_task(self._telemetry_loop(), name="telemetry"),
+            asyncio.create_task(self._snapshot_loop(), name="snapshot"),
+            asyncio.create_task(self._trigger_dispatcher(), name="triggers"),
+        ]
+        logger.info(f"[Monitor] Started 3 async loops (telemetry={self.telemetry_interval}s, snapshot={self.snapshot_interval}s, triggers=event-driven)")
 
-    async def stop_job(self, job_id: str) -> Optional[JobMonitorState]:
-        """Stop monitoring a job (call when job completes or is cancelled)."""
-        if job_id in self._tasks:
-            self._tasks[job_id].cancel()
-            del self._tasks[job_id]
-        return self._jobs.pop(job_id, None)
+    async def stop(self):
+        """Cancel all loops."""
+        self._running = False
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
+        logger.info("[Monitor] Stopped all loops")
 
-    def freeze_job(self, job_id: str, duration_seconds: float = 300.0) -> None:
-        """Anti-windup: suppress corrections during a reconfiguration."""
-        if job_id in self._jobs:
-            self._jobs[job_id].freeze(duration_seconds)
-            print(f"[Monitor] Anti-windup: froze corrections for {job_id} for {duration_seconds}s")
+    # ------------------------------------------------------------------
+    # Loop 1: Telemetry polling (10s, pure code, no LLM)
+    # ------------------------------------------------------------------
 
-    def get_state(self, job_id: str) -> Optional[JobMonitorState]:
-        return self._jobs.get(job_id)
-
-    async def _poll_loop(self, job_id: str) -> None:
-        """Background polling loop for a single job."""
-        while True:
+    async def _telemetry_loop(self):
+        """Poll Orca every N seconds, update trackers, check thresholds."""
+        while self._running:
             try:
-                await asyncio.sleep(self.poll_interval)
-                state = self._jobs.get(job_id)
-                if not state:
-                    break
-
-                metrics = await self.metrics_source.fetch(job_id)
-                if not metrics:
-                    continue
-
-                state.raw_metrics_history.append(metrics)
-                state.last_poll_time = time.time()
-
-                # Apply Kalman filters
-                if state.kf_tpot and metrics.tpot_ms:
-                    filtered_tpot = state.kf_tpot.update(metrics.tpot_ms)
-                    state.current_tpot_ms = filtered_tpot
-
-                    # Check deadband (only if not frozen by anti-windup)
-                    if not state.is_frozen() and state.deadband_tpot:
-                        new_slo_state = state.deadband_tpot.update(filtered_tpot)
-                        if new_slo_state != state.slo_state:
-                            print(
-                                f"[Monitor] Job {job_id}: SLO state "
-                                f"{state.slo_state} → {new_slo_state} "
-                                f"(filtered TPOT={filtered_tpot:.1f}ms)"
-                            )
-                            state.slo_state = new_slo_state
-                            if new_slo_state in (SLOState.YELLOW_HIGH, SLOState.RED):
-                                if self.on_action_needed:
-                                    self.on_action_needed(job_id, new_slo_state, state)
-
-                if state.kf_throughput:
-                    state.current_throughput_tps = state.kf_throughput.update(
-                        metrics.throughput_tokens_per_sec
-                    )
-
+                for job_id in list(self.tracked_jobs.keys()):
+                    await self._poll_job(job_id)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"[Monitor] Error polling job {job_id}: {e}")
+                logger.error(f"[Monitor/L1] Telemetry error: {e}")
+            await asyncio.sleep(self.telemetry_interval)
 
-    def compute_delta(self, job_id: str) -> Optional[DeltaRecord]:
-        """
-        Compute prediction vs actual delta for a completed or running job.
-        Call this when a job completes to feed the refinement engine.
-        """
-        state = self._jobs.get(job_id)
-        if not state or not state.raw_metrics_history:
-            return None
+    async def _poll_job(self, job_id: str):
+        """Single poll iteration for one job."""
+        tracker = self.tracked_jobs.get(job_id)
+        if not tracker:
+            return
 
-        decision = state.decision
-        predicted = decision.predicted_metrics
+        # Fetch metrics from Orca
+        try:
+            metrics = await self.orca.get_job_metrics(job_id)
+            progress = await self.orca.get_chunk_progress(job_id)
+        except Exception as e:
+            logger.warning(f"[Monitor/L1] Failed to fetch metrics for {job_id}: {e}")
+            return
 
-        # Compute actual averages from history (skip first few noisy readings)
-        history = state.raw_metrics_history[2:]  # skip warmup
-        if not history:
-            history = state.raw_metrics_history
+        # Update throughput with EMA
+        tps = metrics.get("avg_generation_throughput_toks_per_s", 0)
+        if tps > 0:
+            tracker.smoothed_tps = _ema(tracker.smoothed_tps, tps, EMA_ALPHA)
 
-        avg_throughput = sum(m.throughput_tokens_per_sec for m in history) / len(history)
-        avg_tpot = (
-            sum(m.tpot_ms for m in history if m.tpot_ms) /
-            max(1, sum(1 for m in history if m.tpot_ms))
-        ) if any(m.tpot_ms for m in history) else None
+        # Estimate tokens from chunk progress
+        total_chunks = progress.get("total", 0)
+        completed_chunks = progress.get("completed", 0)
+        failed_chunks = progress.get("failed", 0)
+        if total_chunks > 0:
+            completion_frac = (completed_chunks + failed_chunks) / total_chunks
+            tracker.tokens_completed = int(tracker.total_tokens * completion_frac)
+            tracker.tokens_remaining = tracker.total_tokens - tracker.tokens_completed
 
-        delta_throughput_pct = (
-            (avg_throughput - predicted.throughput_tokens_per_sec) /
-            max(predicted.throughput_tokens_per_sec, 1) * 100
+        # Time tracking
+        elapsed_s = (datetime.utcnow() - tracker.started_at).total_seconds()
+        tracker.elapsed_hours = elapsed_s / 3600
+
+        # GPU health
+        tracker.gpu_cache_usage = metrics.get("gpu_cache_usage_perc", 0)
+        tracker.gpu_sm_util = metrics.get("gpu_sm_util_pct", 0)
+        tracker.gpu_mem_bw_util = metrics.get("gpu_mem_bw_util_pct", 0)
+
+        # SLO projection
+        tracker.slo_headroom_pct = compute_slo_headroom(
+            tracker.slo_deadline_hours, tracker.elapsed_hours,
+            tracker.tokens_remaining, tracker.smoothed_tps,
         )
-        delta_tpot = (
-            (avg_tpot - predicted.tpot_ms) if (avg_tpot and predicted.tpot_ms) else None
-        )
+        if tracker.smoothed_tps > 0:
+            tracker.projected_eta_hours = tracker.tokens_remaining / tracker.smoothed_tps / 3600
+        else:
+            tracker.projected_eta_hours = float("inf")
 
-        cfg = decision.recommendation
-        return DeltaRecord(
-            vpc_id="unknown",  # set by caller from resource map
+        # Check for completion
+        all_done = progress.get("all_done", False)
+        if all_done or (total_chunks > 0 and (completed_chunks + failed_chunks) >= total_chunks):
+            tracker.status = MonitoringStatus.COMPLETED
+            await self._emit_trigger(job_id, MonitoringStatus.COMPLETED, "All chunks completed")
+            return
+
+        # Check Orca job status
+        try:
+            job_status = await self.orca.get_job_status(job_id)
+            if job_status.get("status") in ("failed", "cancelled"):
+                tracker.status = MonitoringStatus.FAILED
+                await self._emit_trigger(job_id, MonitoringStatus.FAILED,
+                                         f"Orca reports status={job_status.get('status')}")
+                return
+        except Exception:
+            pass
+
+        # Classify status
+        prev_status = tracker.status
+        new_status = _classify_status(tracker)
+        tracker.status = new_status
+
+        # Handle warmup transition
+        if not tracker.warmup_complete and new_status != MonitoringStatus.WARMING_UP:
+            tracker.warmup_complete = True
+            logger.info(f"[Monitor/L1] {job_id}: warmup complete, TPS={tracker.smoothed_tps:.0f}")
+
+        # Emit triggers on state transitions
+        if new_status != prev_status:
+            if new_status == MonitoringStatus.FALLING_BEHIND:
+                await self._emit_trigger(job_id, MonitoringStatus.FALLING_BEHIND,
+                                         f"Headroom={tracker.slo_headroom_pct:.1f}%, TPS={tracker.smoothed_tps:.0f}")
+            elif new_status == MonitoringStatus.OVER_PROVISIONED:
+                await self._emit_trigger(job_id, MonitoringStatus.OVER_PROVISIONED,
+                                         f"Headroom={tracker.slo_headroom_pct:.0f}%, can shed replicas")
+
+    async def _emit_trigger(self, job_id: str, status: MonitoringStatus, hint: str):
+        """Push a trigger event to Loop 3's queue."""
+        tracker = self.tracked_jobs.get(job_id)
+        if not tracker:
+            return
+        trigger = MonitoringTrigger(
+            trigger_type=status,
             job_id=job_id,
-            model_name=decision.model_name,
-            gpu_type=cfg.gpu_type,
-            tp=cfg.tp,
-            pp=cfg.pp,
-            dp=cfg.dp,
-            avg_input_tokens=0,  # set by caller from job request
-            avg_output_tokens=0,
-            task_type="batch",
-            predicted_throughput_tps=predicted.throughput_tokens_per_sec,
-            actual_throughput_tps=avg_throughput,
-            predicted_tpot_ms=predicted.tpot_ms,
-            actual_tpot_ms=avg_tpot,
-            delta_throughput_pct=delta_throughput_pct,
-            delta_tpot_ms=delta_tpot,
-            prediction_data_source=predicted.data_source.value,
+            job_tracker=tracker.model_dump(),
+            diagnosis_hint=hint,
         )
+        await self._trigger_queue.put(trigger)
+        logger.info(f"[Monitor/L1] Trigger: {status.value} for {job_id} — {hint}")
+
+    # ------------------------------------------------------------------
+    # Loop 2: Snapshot loop (2-5 min, writes to SQLite)
+    # ------------------------------------------------------------------
+
+    async def _snapshot_loop(self):
+        """Periodically write chain snapshots to memory."""
+        while self._running:
+            try:
+                for job_id, tracker in list(self.tracked_jobs.items()):
+                    if tracker.status in (MonitoringStatus.WARMING_UP, MonitoringStatus.COMPLETED, MonitoringStatus.FAILED):
+                        continue
+                    if not tracker.decision_id:
+                        continue
+
+                    self.memory.record_chain_snapshot(
+                        decision_id=tracker.decision_id,
+                        job_id=job_id,
+                        throughput_tps=tracker.smoothed_tps,
+                        tokens_completed=tracker.tokens_completed,
+                        tokens_remaining=tracker.tokens_remaining,
+                        elapsed_hours=tracker.elapsed_hours,
+                        slo_headroom_pct=tracker.slo_headroom_pct,
+                        gpu_cache_usage_pct=tracker.gpu_cache_usage,
+                        gpu_sm_util_pct=tracker.gpu_sm_util,
+                        gpu_mem_bw_util_pct=tracker.gpu_mem_bw_util,
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[Monitor/L2] Snapshot error: {e}")
+            await asyncio.sleep(self.snapshot_interval)
+
+    # ------------------------------------------------------------------
+    # Loop 3: Trigger dispatcher (event-driven, fires agent)
+    # ------------------------------------------------------------------
+
+    async def _trigger_dispatcher(self):
+        """Wait for trigger events and dispatch to agent callback."""
+        while self._running:
+            try:
+                trigger = await asyncio.wait_for(
+                    self._trigger_queue.get(), timeout=5.0
+                )
+                if self.on_trigger:
+                    logger.info(f"[Monitor/L3] Dispatching {trigger.trigger_type.value} for {trigger.job_id}")
+                    try:
+                        result = await self.on_trigger(trigger)
+                        logger.info(f"[Monitor/L3] Agent response: {str(result)[:200]}")
+                    except Exception as e:
+                        logger.error(f"[Monitor/L3] Agent handler error: {e}")
+                else:
+                    logger.warning(f"[Monitor/L3] No trigger callback, ignoring: {trigger.trigger_type.value}")
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[Monitor/L3] Dispatcher error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Pure functions (no state, testable)
+# ---------------------------------------------------------------------------
+
+def _ema(prev: float, new: float, alpha: float) -> float:
+    """Exponential moving average."""
+    if prev == 0:
+        return new
+    return alpha * new + (1 - alpha) * prev
+
+
+def _classify_status(tracker: JobTracker) -> MonitoringStatus:
+    """Classify job status from tracker state. Pure function."""
+    if tracker.elapsed_hours < (WARMUP_MINUTES / 60) and not tracker.warmup_complete:
+        return MonitoringStatus.WARMING_UP
+
+    if (tracker.slo_headroom_pct > OVER_PROVISIONED_THRESHOLD and
+            tracker.elapsed_hours > tracker.slo_deadline_hours * OVER_PROVISIONED_MIN_ELAPSED):
+        return MonitoringStatus.OVER_PROVISIONED
+
+    if tracker.slo_headroom_pct > SLO_GREEN_THRESHOLD:
+        return MonitoringStatus.ON_TRACK
+
+    if tracker.slo_headroom_pct > SLO_YELLOW_THRESHOLD:
+        return MonitoringStatus.AT_RISK
+
+    return MonitoringStatus.FALLING_BEHIND
+
+
+def compute_slo_headroom(
+    slo_deadline_hours: float,
+    elapsed_hours: float,
+    tokens_remaining: int,
+    smoothed_tps: float,
+) -> float:
+    """Compute SLO headroom percentage. >0 means on track, <0 means behind."""
+    if smoothed_tps <= 0:
+        return 0.0
+    remaining_hours = tokens_remaining / smoothed_tps / 3600
+    time_left = slo_deadline_hours - elapsed_hours
+    return ((time_left - remaining_hours) / max(slo_deadline_hours, 0.01)) * 100

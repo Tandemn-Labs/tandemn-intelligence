@@ -1,0 +1,147 @@
+"""Tests for koi/monitor.py — three async loops, SLO computation, thresholds."""
+
+import pytest
+from datetime import datetime, timedelta
+
+from koi.schemas import (
+    JobTracker, MonitoringStatus, PlacementConfig, EngineConfig, MonitoringTrigger,
+)
+from koi.monitor import (
+    _ema, _classify_status, compute_slo_headroom,
+    MonitoringLoop, WARMUP_MINUTES,
+)
+from koi.tools.memory import AgenticMemory
+
+
+def _make_config():
+    return PlacementConfig(
+        gpu_type="L40S", instance_type="g6e.12xlarge",
+        num_gpus=8, num_instances=2, tp=4, pp=2, dp=1,
+        region="us-east-1",
+        engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=2),
+    )
+
+
+def _make_tracker(**overrides):
+    defaults = dict(
+        job_id="job-test", config=_make_config(),
+        slo_deadline_hours=8.0, total_tokens=7_500_000,
+        predicted_tps=2590.0, tokens_remaining=7_500_000,
+    )
+    defaults.update(overrides)
+    return JobTracker(**defaults)
+
+
+class TestEMA:
+    def test_first_value(self):
+        assert _ema(0, 100.0, 0.3) == 100.0
+
+    def test_smoothing(self):
+        val = _ema(100.0, 200.0, 0.3)
+        assert val == pytest.approx(130.0)
+
+    def test_low_alpha_slow(self):
+        val = _ema(100.0, 200.0, 0.1)
+        assert val == pytest.approx(110.0)
+
+
+class TestSLOHeadroom:
+    def test_on_track(self):
+        # 7.5M tokens, 2590 TPS → ~0.8h needed. SLO=8h, elapsed=0.5h
+        h = compute_slo_headroom(8.0, 0.5, 7_500_000, 2590.0)
+        assert h > 80  # tons of headroom
+
+    def test_falling_behind(self):
+        # Only 100 TPS, 7.5M tokens remaining, 6h elapsed, SLO=8h
+        h = compute_slo_headroom(8.0, 6.0, 7_500_000, 100.0)
+        assert h < 0  # behind schedule
+
+    def test_zero_tps(self):
+        h = compute_slo_headroom(8.0, 1.0, 5_000_000, 0.0)
+        assert h == 0.0
+
+    def test_just_met(self):
+        # Exactly enough TPS to finish in remaining time
+        # 3.6M tokens, 1000 TPS → 1h. SLO=8h, elapsed=7h → 1h left. Headroom ~0%
+        h = compute_slo_headroom(8.0, 7.0, 3_600_000, 1000.0)
+        assert abs(h) < 1.0
+
+
+class TestClassifyStatus:
+    def test_warmup(self):
+        tracker = _make_tracker(elapsed_hours=0.01, warmup_complete=False)
+        assert _classify_status(tracker) == MonitoringStatus.WARMING_UP
+
+    def test_warmup_complete(self):
+        tracker = _make_tracker(elapsed_hours=0.2, warmup_complete=True, slo_headroom_pct=80.0)
+        assert _classify_status(tracker) == MonitoringStatus.ON_TRACK
+
+    def test_on_track(self):
+        tracker = _make_tracker(elapsed_hours=1.0, warmup_complete=True, slo_headroom_pct=50.0)
+        assert _classify_status(tracker) == MonitoringStatus.ON_TRACK
+
+    def test_at_risk(self):
+        tracker = _make_tracker(elapsed_hours=5.0, warmup_complete=True, slo_headroom_pct=15.0)
+        assert _classify_status(tracker) == MonitoringStatus.AT_RISK
+
+    def test_falling_behind(self):
+        tracker = _make_tracker(elapsed_hours=6.0, warmup_complete=True, slo_headroom_pct=5.0)
+        assert _classify_status(tracker) == MonitoringStatus.FALLING_BEHIND
+
+    def test_over_provisioned(self):
+        # headroom > 70% AND elapsed > 20% of SLO
+        tracker = _make_tracker(elapsed_hours=2.0, warmup_complete=True, slo_headroom_pct=85.0)
+        assert _classify_status(tracker) == MonitoringStatus.OVER_PROVISIONED
+
+    def test_not_over_provisioned_too_early(self):
+        # headroom > 70% BUT elapsed < 20% of SLO → just ON_TRACK
+        tracker = _make_tracker(elapsed_hours=0.5, warmup_complete=True, slo_headroom_pct=85.0)
+        assert _classify_status(tracker) == MonitoringStatus.ON_TRACK
+
+
+class TestMonitoringLoopRegistration:
+    def test_register_job(self):
+        memory = AgenticMemory(db_path=":memory:")
+        from unittest.mock import MagicMock
+        monitor = MonitoringLoop(orca=MagicMock(), memory=memory)
+        monitor.register_job(
+            job_id="job-1", config=_make_config(),
+            slo_deadline_hours=8.0, total_tokens=7_500_000,
+            predicted_tps=2590.0, decision_id="dec-abc",
+        )
+        assert "job-1" in monitor.tracked_jobs
+        assert monitor.tracked_jobs["job-1"].decision_id == "dec-abc"
+
+    def test_unregister_job(self):
+        memory = AgenticMemory(db_path=":memory:")
+        from unittest.mock import MagicMock
+        monitor = MonitoringLoop(orca=MagicMock(), memory=memory)
+        monitor.register_job(
+            job_id="job-1", config=_make_config(),
+            slo_deadline_hours=8.0, total_tokens=7_500_000,
+            predicted_tps=2590.0,
+        )
+        monitor.unregister_job("job-1")
+        assert "job-1" not in monitor.tracked_jobs
+
+
+class TestSnapshotWriting:
+    def test_snapshot_writes_to_memory(self):
+        memory = AgenticMemory(db_path=":memory:")
+        # Record a decision first so the FK is valid
+        dec_id = memory.record_decision(
+            job_id="job-1", model_name="test",
+            instance_type="g6e.12xlarge", gpu_type="L40S",
+            tp=4, pp=2, dp=1, num_gpus=8,
+            predicted_tps=833.0, predicted_cost_per_hour=13.35,
+            slo_deadline_hours=8.0, objective="cheapest",
+            avg_input_tokens=1200, avg_output_tokens=300,
+        )
+        snap_id = memory.record_chain_snapshot(
+            decision_id=dec_id, job_id="job-1",
+            throughput_tps=800.0, tokens_completed=2_000_000,
+            elapsed_hours=0.5, slo_headroom_pct=85.0,
+        )
+        snaps = memory.query_chain_snapshots(dec_id)
+        assert len(snaps) == 1
+        assert snaps[0]["throughput_tps"] == 800.0
