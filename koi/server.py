@@ -285,4 +285,9 @@ async def list_jobs():
 
 if __name__ == "__main__":
     import uvicorn
+    # Configure logging so [Koi] messages show up
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+    )
     uvicorn.run(app, host="0.0.0.0", port=KOI_PORT)
