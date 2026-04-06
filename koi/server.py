@@ -14,7 +14,7 @@ Usage:
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from fastapi import FastAPI, HTTPException
@@ -255,6 +255,53 @@ async def job_complete(req: JobCompleteRequest):
     monitor.unregister_job(req.job_id)
 
     return {"status": "recorded", "job_id": req.job_id}
+
+
+class LaunchFailedRequest(BaseModel):
+    job_id: str
+    configs_tried: List[Dict[str, Any]] = []
+    failure_reasons: List[str] = []
+    total_time_seconds: float = 0.0
+
+
+@app.post("/job/launch-failed")
+async def job_launch_failed(req: LaunchFailedRequest):
+    """Called by Orca when ALL alternative configs failed to launch."""
+    memory: AgenticMemory = app.state.memory
+    monitor: MonitoringLoop = app.state.monitor
+
+    # Record each failed config in launch_attempts table
+    tracker = monitor.tracked_jobs.get(req.job_id)
+    decision_id = tracker.decision_id if tracker else None
+
+    for i, config in enumerate(req.configs_tried):
+        reason = req.failure_reasons[i] if i < len(req.failure_reasons) else "unknown"
+        memory.record_launch_attempt(
+            decision_id=decision_id or f"unknown-{req.job_id}",
+            job_id=req.job_id,
+            instance_type=config.get("instance_type", "unknown"),
+            gpu_type=config.get("gpu_type", "unknown"),
+            region=config.get("region", "unknown"),
+            market=config.get("market", "on_demand"),
+            count=1,
+            launched=False,
+            failure_reason=reason,
+        )
+
+    logger.info(
+        f"[Koi] Launch failed for {req.job_id}: "
+        f"{len(req.configs_tried)} configs tried in {req.total_time_seconds:.0f}s, all failed"
+    )
+
+    # Unregister from monitor
+    if tracker:
+        monitor.unregister_job(req.job_id)
+
+    return {
+        "status": "recorded",
+        "job_id": req.job_id,
+        "attempts_recorded": len(req.configs_tried),
+    }
 
 
 @app.get("/jobs")

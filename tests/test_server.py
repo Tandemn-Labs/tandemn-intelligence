@@ -138,6 +138,24 @@ class TestJobComplete:
         assert resp.json()["status"] == "unknown_job"
 
 
+class TestLaunchFailed:
+    @pytest.mark.asyncio
+    async def test_records_failures(self, client):
+        app.state.monitor.tracked_jobs = {}
+        resp = await client.post("/job/launch-failed", json={
+            "job_id": "job-fail1",
+            "configs_tried": [
+                {"gpu_type": "A100-80GB", "instance_type": "p4de.24xlarge", "region": "us-west-2"},
+                {"gpu_type": "L40S", "instance_type": "g6e.12xlarge", "region": "us-east-1"},
+            ],
+            "failure_reasons": ["InsufficientCapacity", "QuotaExceeded"],
+            "total_time_seconds": 180.0,
+        })
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["attempts_recorded"] == 2
+
+
 class TestListJobs:
     @pytest.mark.asyncio
     async def test_empty(self, client):
