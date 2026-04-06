@@ -935,6 +935,30 @@ CREATE TABLE exploration_momentum (
 
 **Why this matters for multi-tenancy:** In a shared cluster, Koi serves many users running different models. Each job that explores on spots generates learning data that benefits ALL future jobs with similar models. The exploration cost ($0.50 for 5 minutes on a spot A100) is amortized across hundreds of future decisions. The more jobs Koi handles, the faster it fills memory, the less it needs to explore, the better it gets.
 
+**Ranked fallback list + diversity for multi-tenancy:**
+
+Koi returns a ranked list of configs, not just one:
+
+```
+{
+  "config": { A100-80GB TP=8 PP=1 },        ← primary (cheapest total cost)
+  "alternatives": [
+    { L40S TP=4 PP=4 },                      ← fallback #1 (verified from memory)
+    { L40S TP=4 PP=2 },                      ← fallback #2 (PerfDB)
+    { L4 TP=4 PP=4, "exploration": true },   ← fallback #3 (EXPLORATION probe)
+  ]
+}
+```
+
+Orca tries `config` first. If launch fails (InsufficientCapacity, quota exhausted), tries `alternatives[0]`, then `[1]`. If all fail, calls `/job/launch-failed`.
+
+**Multi-tenancy problem:** If 10 users submit the same model, all get the same top-3 → thundering herd on A100. The exploration slot (#3) MUST be different per request — the agent randomizes it from untested configs. This ensures diversity: user A gets L4 TP=4 PP=4 as exploration, user B gets L40S TP=8 PP=2, user C gets A100-40GB TP=8 PP=1. Each explores a different corner of config space.
+
+**Orca changes needed (future):**
+- CLI: read `alternatives` from Koi response, retry on launch failure (~20 lines)
+- Server: launch endpoint returns failure reason (InsufficientCapacity vs OOM vs timeout)
+- Koi: populate `AgentDecision.alternatives` from cost table rows 2-4
+
 **Piggyback exploration — heterogeneous replicas from day one:**
 
 Even before SLO headroom gating, there's a cheaper form of exploration: when the agent decides to launch DP=N replicas, make N-1 the "safe" config and 1 the "probe."
