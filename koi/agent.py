@@ -51,7 +51,7 @@ DECISION FRAMEWORK (follow this order STRICTLY):
 3. CHECK PHYSICS — get_gpu_physics() and get_model_arch() to understand bottlenecks.
 4. If no data at all, use physics-based reasoning (roofline estimate).
 
-TRUST HIERARCHY: ground truth outcome > past decisions > PerfDB benchmarks > physics/roofline.
+TRUST HIERARCHY: ground truth outcome > PerfDB benchmarks > past decisions (unverified) > physics/roofline.
 
 KEY METRICS FOR BATCH:
 - throughput_tokens_per_sec is ALL THAT MATTERS for batch SLO. TPOT/TTFT are irrelevant.
