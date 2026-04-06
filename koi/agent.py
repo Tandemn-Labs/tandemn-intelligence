@@ -221,17 +221,21 @@ class KoiAgent:
 
         tool_calls = 0
         final_text = ""
+        last_response = None
         async for event in runner:
-            if hasattr(event, "type"):
-                if event.type == "tool_use":
-                    tool_calls += 1
-                    logger.info(f"[Koi] Tool call #{tool_calls}: {event.name}")
+            # event is a BetaMessage from each iteration
+            if hasattr(event, "content"):
+                last_response = event
+                for block in event.content:
+                    if hasattr(block, "type") and block.type == "tool_use":
+                        tool_calls += 1
+                        logger.info(f"[Koi] Tool call #{tool_calls}: {block.name}")
 
-        # Get the final response
-        response = await runner.get_final_response()
-        for block in response.content:
-            if hasattr(block, "text"):
-                final_text += block.text
+        # Extract text from the final response
+        if last_response and hasattr(last_response, "content"):
+            for block in last_response.content:
+                if hasattr(block, "text"):
+                    final_text += block.text
 
         elapsed = time.time() - t0
         logger.info(f"[Koi] Agent decided in {elapsed:.1f}s ({tool_calls} tool calls)")
@@ -261,13 +265,15 @@ class KoiAgent:
         )
 
         final_text = ""
+        last_response = None
         async for event in runner:
-            pass
+            if hasattr(event, "content"):
+                last_response = event
 
-        response = await runner.get_final_response()
-        for block in response.content:
-            if hasattr(block, "text"):
-                final_text += block.text
+        if last_response and hasattr(last_response, "content"):
+            for block in last_response.content:
+                if hasattr(block, "text"):
+                    final_text += block.text
 
         logger.info(f"[Koi] Trigger response: {final_text[:200]}")
         return final_text
