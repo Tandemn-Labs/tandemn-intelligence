@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 from koi.agent import KoiAgent
 from koi.monitor import MonitoringLoop
-from koi.schemas import JobRequest, MonitoringStatus
+from koi.schemas import EngineConfig, JobRequest, MonitoringStatus, PlacementConfig
 from koi.tools.memory import AgenticMemory
 from koi.tools.orca_api import OrcaClient
 from koi.tools.perfdb import PerfDB
@@ -208,18 +208,57 @@ async def decide(req: DecideRequest):
         why_this_config=decision.reasoning[:500],
     )
 
-    # Register in monitor
-    if job_request.total_tokens and job_request.slo_deadline_hours:
-        monitor.register_job(
-            job_id=decision.job_id,
-            config=decision.config,
-            slo_deadline_hours=job_request.slo_deadline_hours,
-            total_tokens=job_request.total_tokens,
-            predicted_tps=decision.predicted_tps,
-            decision_id=decision_id,
-        )
+    # NOTE: Do NOT register in monitor here. The job hasn't launched yet.
+    # Orca will call POST /job/started after successful launch.
 
-    return decision.model_dump(mode="json")
+    # Include decision_id in response so Orca can pass it back
+    result = decision.model_dump(mode="json")
+    result["_decision_id"] = decision_id
+    return result
+
+
+class JobStartedRequest(BaseModel):
+    job_id: str
+    decision_id: Optional[str] = None
+    gpu_type: str
+    instance_type: str
+    tp: int
+    pp: int
+    dp: int = 1
+    slo_deadline_hours: float
+    total_tokens: int
+    predicted_tps: float = 0.0
+
+
+@app.post("/job/started")
+async def job_started(req: JobStartedRequest):
+    """Called by Orca AFTER a job successfully launches. Registers in monitor."""
+    monitor: MonitoringLoop = app.state.monitor
+
+    config = PlacementConfig(
+        gpu_type=req.gpu_type,
+        instance_type=req.instance_type,
+        num_gpus=req.tp * req.pp * req.dp,
+        num_instances=max(1, (req.tp * req.pp * req.dp) // 8),
+        tp=req.tp, pp=req.pp, dp=req.dp,
+        region="unknown",
+        engine_config=EngineConfig(
+            tensor_parallel_size=req.tp,
+            pipeline_parallel_size=req.pp,
+        ),
+    )
+
+    monitor.register_job(
+        job_id=req.job_id,
+        config=config,
+        slo_deadline_hours=req.slo_deadline_hours,
+        total_tokens=req.total_tokens,
+        predicted_tps=req.predicted_tps,
+        decision_id=req.decision_id,
+    )
+
+    logger.info(f"[Koi] Job started: {req.job_id} on {req.gpu_type} TP={req.tp} PP={req.pp}")
+    return {"status": "registered", "job_id": req.job_id}
 
 
 @app.post("/job/complete")
