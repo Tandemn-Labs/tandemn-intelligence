@@ -762,7 +762,7 @@ There's no gradient, no loss function. But there IS a signal in the trajectory o
 | TP degree | TP=2 → TP=4 → TP=8 | "TP=8 saturated PCIe, momentum dies" |
 | PP degree | PP=1 → PP=2 → PP=4 | "PP=2 was fine, PP=4 added bubble overhead" |
 | DP (scale-out) | DP=1 → DP=2 → DP=4 | "linear scaling, keep going if quota allows" |
-| Quantization | fp16 → fp8 → int8 | "fp8 on H100 cut memory 50% with 1% quality loss" |
+| Quantization | User-specified (fp16 default). Koi does NOT auto-quantize. | Orca needs `--quantization fp8/int8` flag. Koi respects user's choice, uses it to filter PerfDB records. |
 | Market | on-demand → spot | "spot is 70% cheaper, 3/10 jobs get preempted" |
 
 The agent maintains a simple momentum table in memory:
