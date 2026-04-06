@@ -258,6 +258,21 @@ class KoiAgent:
 
         # Parse the decision from the agent's response
         decision = self._parse_decision(final_text, job_request, resource_map, tool_calls, elapsed)
+
+        # Populate alternatives from cost table (exclude the primary config)
+        primary = (decision.config.gpu_type, decision.config.tp, decision.config.pp, decision.config.dp)
+        alternatives = []
+        for row in getattr(self, "_last_cost_rows", []):
+            if not row["meets_slo"]:
+                continue
+            candidate = (row["gpu_type"], row["tp"], row["pp"], row["dp"])
+            if candidate == primary:
+                continue
+            alternatives.append(row)
+            if len(alternatives) >= 3:
+                break
+        decision.alternatives = alternatives
+
         return decision
 
     # ------------------------------------------------------------------
@@ -298,11 +313,12 @@ class KoiAgent:
     # Pre-computed cost table
     # ------------------------------------------------------------------
 
-    def _build_cost_table(self, req: JobRequest, rm: ResourceMap) -> str:
-        """Pre-compute total cost for known configs from memory + PerfDB."""
+    def _build_cost_table(self, req: JobRequest, rm: ResourceMap) -> tuple:
+        """Pre-compute total cost for known configs from memory + PerfDB.
+        Returns (formatted_text, structured_rows) where rows are sorted by total cost."""
         total_tokens = req.total_tokens or 0
         if total_tokens == 0:
-            return "COST TABLE: Cannot compute — total tokens unknown."
+            return "COST TABLE: Cannot compute — total tokens unknown.", []
 
         lines = ["PRE-COMPUTED COST TABLE (sorted by total cost, cheapest first):"]
         lines.append(f"  {'Source':<12} {'GPU':<12} {'Config':<18} {'TPS':>7} {'$/hr':>8} {'ETA(h)':>7} {'Total $':>9} {'SLO':>5}")
@@ -322,7 +338,11 @@ class KoiAgent:
             gpu = o.get("gpu_type", "?")
             tp, pp, dp = o.get("tp", 1), o.get("pp", 1), o.get("dp", 1)
             meets_slo = eta_h <= (req.slo_deadline_hours or 999)
-            rows.append((total_cost, "VERIFIED", gpu, f"TP={tp} PP={pp} DP={dp}", tps, cost_hr, eta_h, meets_slo))
+            resource = rm.get_resource(gpu)
+            rows.append({"total_cost": round(total_cost, 2), "source": "VERIFIED", "gpu_type": gpu,
+                         "instance_type": resource.instance_type if resource else f"unknown-{gpu.lower()}",
+                         "tp": tp, "pp": pp, "dp": dp, "predicted_tps": tps,
+                         "cost_per_hour": cost_hr, "eta_h": eta_h, "meets_slo": meets_slo})
 
         # 2. PerfDB records for this model — filtered to similar io_ratio
         if self.perfdb:
@@ -365,20 +385,28 @@ class KoiAgent:
                 eta_h = total_tokens / tps / 3600
                 total_cost = cost_hr * eta_h
                 meets_slo = eta_h <= (req.slo_deadline_hours or 999)
-                rows.append((total_cost, "PerfDB", gpu, f"TP={tp} PP={pp} DP={dp}", tps, cost_hr, eta_h, meets_slo))
+                rows.append({"total_cost": round(total_cost, 2), "source": "PerfDB", "gpu_type": gpu,
+                             "instance_type": resource.instance_type,
+                             "tp": tp, "pp": pp, "dp": dp, "predicted_tps": tps,
+                             "cost_per_hour": cost_hr, "eta_h": eta_h, "meets_slo": meets_slo})
 
         # Sort by total cost
-        rows.sort(key=lambda r: r[0])
+        rows.sort(key=lambda r: r["total_cost"])
 
-        for total_cost, source, gpu, config, tps, cost_hr, eta_h, meets_slo in rows[:15]:
-            slo_str = "✓" if meets_slo else "✗"
+        for row in rows[:15]:
+            slo_str = "✓" if row["meets_slo"] else "✗"
+            config_str = f"TP={row['tp']} PP={row['pp']} DP={row['dp']}"
             lines.append(
-                f"  {source:<12} {gpu:<12} {config:<18} {tps:>7.0f} {cost_hr:>7.2f} {eta_h:>7.2f} {total_cost:>8.2f} {slo_str:>5}"
+                f"  {row['source']:<12} {row['gpu_type']:<12} {config_str:<18} "
+                f"{row['predicted_tps']:>7.0f} {row['cost_per_hour']:>7.2f} "
+                f"{row['eta_h']:>7.2f} {row['total_cost']:>8.2f} {slo_str:>5}"
             )
 
         if not rows:
             lines.append("  (no data — use tools to query PerfDB and physics)")
 
+        # Store structured rows for alternatives
+        self._last_cost_rows = rows
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
