@@ -324,9 +324,18 @@ class KoiAgent:
             meets_slo = eta_h <= (req.slo_deadline_hours or 999)
             rows.append((total_cost, "VERIFIED", gpu, f"TP={tp} PP={pp} DP={dp}", tps, cost_hr, eta_h, meets_slo))
 
-        # 2. PerfDB records for this model
+        # 2. PerfDB records for this model — filtered to similar io_ratio
         if self.perfdb:
-            records = self.perfdb.query(model_name=req.model_name, limit=30)
+            job_io = req.prefill_decode_ratio
+            records = self.perfdb.query(
+                model_name=req.model_name,
+                io_ratio_min=max(0.1, job_io * 0.3),  # within ~3x of job's io_ratio
+                io_ratio_max=job_io * 3.0,
+                limit=30,
+            )
+            # Fallback: if no records at similar io_ratio, use all records
+            if not records:
+                records = self.perfdb.query(model_name=req.model_name, limit=30)
             seen = set()
             for r in records:
                 gpu = r.get("gpu_type", "?")
