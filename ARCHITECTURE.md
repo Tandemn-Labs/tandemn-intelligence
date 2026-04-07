@@ -262,12 +262,6 @@ distance = (
 
 **Confidence scaling:** Agent discounts proxy data based on distance. `dist=0.02` → 95% confidence in proxy benchmarks. `dist=0.15` → 70% confidence. `dist>0.30` → too different, use analytical roofline instead.
 
-**Future: PerfDB as a real database.** The CSV works for 300 records but won't scale. Plan:
-- SQLite or Postgres for structured queries
-- Same schema, indexed by (model_name, gpu_type, tp, pp, input_len, output_len)
-- Agent's `query_perfdb` tool runs SQL queries
-- Ingest pipeline from Orca's profiling runs
-
 ### Context 2: Agentic Memory
 
 **What:** A structured, persistent store of everything Koi has tried, observed, and learned.
@@ -463,15 +457,6 @@ Agent reasons: "H100 capacity is scarce during business hours in us-west-2.
 ```
 
 This is different from quota (which says "you CAN launch 16 H100 GPUs") vs availability (which says "but you probably WON'T get them right now"). Quota is static, availability is temporal and soft.
-
-**Future: Orca streams launch analytics to Koi.** Currently Koi would only know about its own launch attempts. But Orca sees ALL launches across all users — including non-Koi launches. Orca should expose an analytics endpoint:
-
-```
-GET /analytics/launch_success_rate?instance_type=p5.48xlarge&region=us-west-2&window=24h
-→ {"attempts": 14, "succeeded": 5, "rate": 0.36, "avg_time_to_launch": 180}
-```
-
-This turns Orca into a real-time availability oracle. Koi's agent uses this to discount configs on scarce instance types without wasting time on launch failures.
 
 **Why not use mem0 or ChromaDB?**
 
@@ -1160,12 +1145,13 @@ But if B takes 8 H100 GPUs, they're all gone. And A and C compete for A100s.
 **Launch availability analytics:**
 - [ ] Orca `GET /analytics/launch_success_rate` endpoint
 - [ ] Soft availability model per (instance_type, region, time_of_day)
+- [ ] Orca streams launch analytics to Koi — Orca sees ALL launches across all users. Expose: `GET /analytics/launch_success_rate?instance_type=p5.48xlarge&region=us-west-2&window=24h` → `{"attempts": 14, "succeeded": 5, "rate": 0.36, "avg_time_to_launch": 180}`. Turns Orca into a real-time availability oracle.
 
 **Agent framework swap:**
 - [ ] Evaluate LangGraph, OpenAI Agents SDK, OpenClaw for model-agnostic agent layer
 
 **PerfDB upgrade:**
-- [ ] Migrate from CSV to SQLite when >10K records
+- [ ] Migrate from CSV to SQLite/Postgres when >10K records. Same schema, indexed by (model_name, gpu_type, tp, pp, input_len, output_len). Agent's `query_perfdb` runs SQL. Ingest pipeline from Orca's profiling runs.
 
 </details>
 
