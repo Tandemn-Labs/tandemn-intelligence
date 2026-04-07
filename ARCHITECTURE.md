@@ -109,7 +109,7 @@ Koi v2 replaces this with a **single autonomous agent** that has tools. The agen
 agent = KoiAgent(
     model="claude-sonnet-4-6",
     tools=[query_perfdb, query_memory, get_resources, get_gpu_physics,
-           launch_chain, scale_chain, get_job_metrics, record_outcome],
+           get_model_arch, find_similar_models, scale_chain, get_job_metrics, record_outcome],
     system_prompt=KOI_SYSTEM_PROMPT,
 )
 
@@ -141,10 +141,11 @@ If the agent needs more data, it queries more. If the perfdb has an exact match 
 | `query_memory` | model, instance_type, status filters | Past job outcomes, failure reasons, learned rules | Every decision — check if we've tried this before |
 | `get_resources` | none | Live GPU quota per region: available vCPUs, instance types, pricing | Every decision — what can we actually launch? |
 | `get_gpu_physics` | gpu_type | Bandwidth, TFLOPS, VRAM, interconnect, roofline analysis | When reasoning about WHY a config is fast/slow |
-| `launch_chain` | job config (gpu, tp, pp, dp, instance_type) | job_id, status | After deciding on a config |
-| `scale_chain` | job_id, new config, count | replica_ids | During monitoring — add/remove capacity |
-| `get_job_metrics` | job_id | Live throughput, TPOT, GPU util, KV cache, queue depth | Monitoring loop — check if SLO on track |
-| `record_outcome` | job_id, outcome (success/fail), metrics, failure_reason | confirmation | After job completes — feed memory layer |
+| `scale_chain` | job_id (parent/group), gpu_type, tp, pp, count | status message | During monitoring — add/remove replicas. Triggers anti-windup freeze. |
+| `get_job_metrics` | job_id (parent/group) | Live throughput, GPU util, KV cache, chunk progress | During monitoring triggers — check live state before acting |
+| `record_outcome` | decision_id, job_id, status, tps, diagnosis, bottleneck | confirmation | Only on FAILED triggers. COMPLETED outcomes are recorded automatically by the `/job/complete` webhook. |
+
+**Note:** `launch_chain` is NOT yet wired as an agent tool — launching is handled by the CLI → Orca path. The agent can scale existing jobs but cannot launch new ones autonomously.
 
 ### PerfDB Retrieval: Agent with SQL Tools vs RAG
 
@@ -384,7 +385,10 @@ SLO headroom is computed using the **aggregate TPS across all chains** in the gr
 
 But **outcomes** are recorded per-chain when the job completes. Each chain gets its own outcome row so memory learns per-config: "L40S TP=4 → 800 TPS" and "A100 TP=8 → 1498 TPS" as separate data points. The cost table next time will have both as VERIFIED rows.
 
-**Current limitation:** The agent picks ONE config; fallback to different GPUs is mechanical (Orca tries alternatives in order). The agent can't proactively design heterogeneous replica mixes ("launch 2 cheap L40S + 1 fast A100"). Blended cost for mixed groups isn't computed. This is future work (piggyback exploration).
+**Current limitations:**
+- The agent picks ONE config; fallback to different GPUs is mechanical (Orca tries alternatives in order). The agent can't proactively design heterogeneous replica mixes. This is future work (piggyback exploration).
+- Scale-up replicas (added via `scale_chain_tool`) are NOT tracked by Koi — they have no `koi_webhook_info`, so no `/job/started` webhook fires. Koi monitors the original replicas only.
+- The CLI always calls `/decide` even if the user picks roofline or cancels. Phantom decisions accumulate in memory with no outcomes.
 
 **How the agent uses memory:**
 
@@ -514,21 +518,29 @@ ChromaDB is fine as an optional secondary store for natural-language lessons (e.
 │       remaining_tokens / smoothed_tps / 3600         │
 │    4. Compute SLO headroom:                          │
 │       (slo_deadline - elapsed - projected) / slo     │
-│    5. Classify status:                               │
-│       headroom > 30%  → ON_TRACK (green)             │
-│       headroom 10-30% → AT_RISK  (yellow)            │
-│       headroom < 10%  → FALLING_BEHIND (red)         │
+│    5. Classify status (HYSTERESIS — Schmitt trigger): │
+│       Enter FALLING_BEHIND: headroom < 10%           │
+│       Exit FALLING_BEHIND:  headroom > 20%           │
+│       ON_TRACK:             headroom > 30%           │
+│       Enter OVER_PROVISIONED: headroom > 70%         │
+│       Exit OVER_PROVISIONED:  headroom < 50%         │
+│       Dead bands prevent oscillation at thresholds.  │
 │                                                      │
 │  Trigger rules (NO LLM needed):                      │
 │    ON_TRACK → do nothing                             │
 │    AT_RISK  → log warning, continue watching         │
-│    FALLING_BEHIND → wake the agent                   │
-│    COMPLETED → wake agent for record_outcome()       │
+│    FALLING_BEHIND → wake agent (with anti-windup)    │
+│    OVER_PROVISIONED → wake agent (with anti-windup)  │
+│    COMPLETED → outcome recorded by /job/complete     │
 │    FAILED → wake agent for failure analysis          │
+│                                                      │
+│  Anti-windup: when agent takes a scaling action,     │
+│  triggers are suppressed for 5 min (action freeze).  │
+│  Prevents re-triggering while replicas spin up.      │
 │                                                      │
 └────────────────┬────────────────────────────────────┘
                  │
-                 │ FALLING_BEHIND or COMPLETED or FAILED
+                 │ FALLING_BEHIND or FAILED
                  ▼
 ┌─────────────────────────────────────────────────────┐
 │                    KOI AGENT                         │
@@ -622,10 +634,18 @@ Timeline (struggling job):
 **Orca↔Koi webhook flow (explicit, not inferred from polling):**
 
 ```
-Orca launches replica  →  POST /job/started {job_id, group_id, gpu_type, tp, pp, decision_id}
+vLLM model_ready phase →  POST /job/started {job_id, group_id, gpu_type, tp, pp, decision_id, adjusted_slo}
                           → Koi registers chain in monitor, starts polling
-Orca assembly done     →  POST /job/complete {job_id, status, metrics}
-                          → Koi records per-chain outcomes, unregisters group
+                          NOTE: fires on model_ready, NOT on sky.launch. SLO is adjusted
+                          for provisioning time (deploy → model_ready = ~8 min deducted).
+
+Replica dies mid-job   →  POST /job/replica-failed {job_id, group_id, reason}
+                          → Koi emits FAILED trigger, agent diagnoses
+
+Orca assembly done     →  POST /job/complete {job_id, status, metrics (aggregate TPS, cost)}
+                          → Koi records per-chain outcomes (uses Orca's real TPS for single-chain),
+                            unregisters group. This is the ONLY path for outcome recording.
+
 Orca all configs fail  →  POST /job/launch-failed {job_id, configs_tried, failure_reasons}
                           → Koi records in launch_attempts
 ```
@@ -1098,33 +1118,39 @@ But if B takes 8 H100 GPUs, they're all gone. And A and C compete for A100s.
 ### Phase 1: Core Agent + Monitoring (THIS VERSION)
 
 **Koi — done:**
-- [x] `koi/agent.py` — KoiAgent with 7 tools, pre-computed cost table, tool_runner loop
+- [x] `koi/agent.py` — KoiAgent with 9 tools (7 read + scale_chain + get_job_metrics), pre-computed cost table, tool_runner loop
 - [x] `koi/tools/perfdb.py` — PerfDB query tool (pandas over CSV, 687 columns → 20 key columns)
 - [x] `koi/tools/memory.py` — 3 tables: decisions (with lineage), outcomes (with diagnosis), launch_attempts
 - [x] `koi/tools/resources.py` — Live resource map from Orca (Shape A/B/C parsing, A100 normalization)
 - [x] `koi/tools/physics.py` — GPU specs + physics-vector similarity + HF Hub model fetch
 - [x] `koi/tools/orca_api.py` — Submit, scale, kill, per-replica metrics, chunk progress
-- [x] `koi/monitor.py` — 2 async loops (telemetry 10s + trigger dispatcher), group-level SLO
-- [x] `koi/server.py` — `/decide`, `/health`, `/jobs`, `/job/started`, `/job/complete`, `/job/launch-failed`
-- [x] `koi/schemas.py` — Pydantic models with group_id for job groups
-- [x] Warm-up detection (5 min warmup period, no triggers during warmup)
+- [x] `koi/monitor.py` — 2 async loops (telemetry 10s + trigger dispatcher), hysteresis deadband with anti-windup
+- [x] `koi/server.py` — `/decide`, `/health`, `/jobs`, `/job/started`, `/job/complete`, `/job/launch-failed`, `/job/replica-failed`
+- [x] `koi/schemas.py` — Pydantic models with group_id, anti-windup fields
+- [x] Warm-up detection (5 min warmup, no triggers during warmup)
 - [x] Per-chain outcomes for heterogeneous groups (separate learning signals per GPU config)
+- [x] Rich trigger prompts (model, config, predicted TPS, delta, group_id for tool calls)
+- [x] Single outcome recording path (Orca webhook only, no agent double-write)
+- [x] Hysteresis thresholds prevent oscillation at SLO boundaries
+- [x] Anti-windup freezes triggers during scaling actions
 
 **Orca (`koi-v2` branch) — done:**
 - [x] `GET /resources` endpoint + A100 40GB/80GB normalization
-- [x] `POST /job/started` webhook per replica (with group_id + decision_id)
-- [x] `POST /job/complete` webhook on assembly (parent job_id)
+- [x] `POST /job/started` webhook on `model_ready` phase (not sky.launch) with adjusted SLO
+- [x] `POST /job/complete` webhook on assembly (parent job_id, aggregate metrics)
+- [x] `POST /job/replica-failed` webhook when replica dies mid-job
 - [x] `koi_decision_id` field on BatchedRequest (flows CLI → server → webhook → Koi)
 - [x] Per-replica fallback in chunked path (each replica tries configs in order)
+- [x] `deploy_timestamp` in koi_webhook_info for SLO clock adjustment
 - [x] `call_koi` timeout 600s
 - [x] `koi_alternatives` passed from CLI to server
 
 **Not done yet:**
-- [ ] Scale UP: A/B test when FALLING_BEHIND
-- [ ] Scale DOWN: shed excess replicas when over-provisioned
+- [ ] Scale-up replicas tracked in Koi (need koi_webhook_info propagation in Orca scale endpoint)
 - [ ] Spot preemption recovery
 - [ ] Fast-path: skip LLM when memory has high-confidence answer for repeat workloads
 - [ ] Heterogeneous replica design: agent proactively designs mixed-GPU mixes (not just fallback)
+- [ ] `launch_chain` as agent tool (agent-initiated launches, not just CLI-driven)
 
 <details>
 <summary><strong>Future (NOT this version)</strong></summary>
