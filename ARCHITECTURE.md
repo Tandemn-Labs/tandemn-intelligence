@@ -766,7 +766,9 @@ SLO at risk (throughput below target)
 
 **Key insight from AlphaEvolve:** The A/B test is a real-world evaluation of two population members. Both get measured on the same fitness function (chunk completion throughput). The winner survives, the loser is culled. Double the learning data per intervention.
 
-### Opportunistic Exploration (Future — gated by SLO headroom)
+<details>
+<summary><strong>Opportunistic Exploration (Future — gated by SLO headroom)</strong></summary>
+
 
 *Inspired by [AdaEvolve](https://arxiv.org/html/2602.20133): when you're making progress, use the surplus to explore.*
 
@@ -953,6 +955,8 @@ Learning: L40S gets 833 TPS at $13.35/hr → $4.46/M tokens
 - Exploration budget not exhausted (max 2 exploratory chains per job)
 - The config hasn't been explored in the last 24h for this model class
 
+</details>
+
 ### Learning (Post-Job)
 
 ```
@@ -1039,7 +1043,8 @@ The agent needs to understand WHY configs perform the way they do. Raw benchmark
 
 ---
 
-## 8. Multi-Tenancy (Next Version)
+<details>
+<summary><strong>8. Multi-Tenancy (Future)</strong></summary>
 
 Single-user Koi picks the globally cheapest config. Multi-tenant Koi must solve a harder problem: **resource allocation across competing jobs on a shared cluster.**
 
@@ -1082,6 +1087,8 @@ But if B takes 8 H100 GPUs, they're all gone. And A and C compete for A100s.
 - "When cluster is >70% utilized, L40S jobs get 15% lower throughput (PCIe contention from co-located jobs)"
 - "H100 jobs should be short and high-priority — the NVLink fabric doesn't share well"
 - "L4 is good for background/low-priority work — cheapest and doesn't compete for A100/H100 quota"
+
+</details>
 
 ---
 
@@ -1134,7 +1141,8 @@ But if B takes 8 H100 GPUs, they're all gone. And A and C compete for A100s.
 - [ ] Fast-path: skip LLM when memory has high-confidence answer for repeat workloads
 - [ ] Heterogeneous replica design: agent proactively designs mixed-GPU mixes (not just fallback)
 
-### Future (NOT this version)
+<details>
+<summary><strong>Future (NOT this version)</strong></summary>
 
 **Multi-tenancy:**
 - [ ] Cluster state tracker (all jobs, all resources, all SLOs)
@@ -1159,9 +1167,12 @@ But if B takes 8 H100 GPUs, they're all gone. And A and C compete for A100s.
 **PerfDB upgrade:**
 - [ ] Migrate from CSV to SQLite when >10K records
 
+</details>
+
 ---
 
-## 11. Batch-Specific Details
+<details>
+<summary><strong>11. Batch-Specific Details (Future — Scale Down, Spot Recovery, Budget)</strong></summary>
 
 ### Scale DOWN, not just up (Phase 1)
 
@@ -1235,9 +1246,12 @@ if elapsed_minutes < 5 and throughput_variance > 0.15:
     status = "WARMING_UP"  # don't trigger agent
 ```
 
+</details>
+
 ---
 
-## 12. Open Questions
+<details>
+<summary><strong>12. Open Questions</strong></summary>
 
 1. **Claude Agent SDK for now, abstracted for swap.** Claude's tool use and retrieval quality is unmatched today — use it. But wrap the agent behind an `AgentLLM` interface so we can swap to open-source models (Llama, Qwen) or other SDKs later without rewriting the tools. The tools themselves are model-agnostic (SQL queries, HTTP calls) — only the reasoning layer cares which LLM is driving. Future: evaluate LangGraph (production-mature, model-agnostic, persistent state), OpenAI Agents SDK (supports 100+ models since v0.10), and OpenClaw (fast-growing OSS agent, but more consumer-facing — needs assessment for structured tool dispatch). Key criteria: tool use quality on structured data, latency, cost, and ability to run locally.
 
@@ -1271,3 +1285,5 @@ if elapsed_minutes < 5 and throughput_variance > 0.15:
    This trace is the demo. It shows memory recall, physics reasoning, exploration, and learning in one job. Saved to a log file per job for post-hoc analysis.
 
 6. **Exploration budget: user-configurable.** Default 10% of jobs can be exploratory. User can set `--explore-budget 0.2` (aggressive learning) or `--explore-budget 0` (no exploration, pure exploit). Exposed as a parameter in the `/decide` request, stored per-user in memory.
+
+</details>
