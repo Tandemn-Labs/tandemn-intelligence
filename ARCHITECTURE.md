@@ -1156,6 +1156,62 @@ But if B takes 8 H100 GPUs, they're all gone. And A and C compete for A100s.
 - [ ] Heterogeneous replica design: agent proactively designs mixed-GPU mixes (not just fallback)
 - [ ] `launch_chain` as agent tool (agent-initiated launches, not just CLI-driven)
 
+### Test Evidence (as of 2026-04-08)
+
+**6 real e2e tests + 1 simulation (mock Orca)** across Koi+Orca integration.
+
+#### Confirmed working (real infra)
+
+| Feature | Test | Evidence |
+|---------|------|----------|
+| Agent placement decision | Tests 3-6 | Agent picks config from PerfDB, 9 tool calls, ~30-50s latency |
+| Decision → memory | Tests 3-6 | `record_decision()` with confidence, data source, predictions |
+| Per-replica fallback | Test 5 | PP=4 failed capacity → PP=2 launched on L40S |
+| Child decision on fallback | Test 5 | Parent dec (PP=4) + child dec (PP=2, triggered_by=fallback) |
+| Webhook lifecycle | Tests 3-6 | `/job/started` fires on `model_ready`, SLO adjusted by deploy_timestamp |
+| Outcome recording | Tests 3, 5 | `/job/complete` → outcome with actual TPS, delta%, slo_met |
+| `KOI_EXCLUDE_GPUS` | Tests 5-6 | A100 excluded from tools, cost table, prompt |
+| Ranked alternatives | Test 5 | Primary + 3 alternatives passed to Orca, fallback used |
+| On-demand enforcement | Test 5 | `--on-demand` flag properly excludes spot candidates |
+| S3 model weights | Tests 5-6 | Bypasses HF Hub rate limits, 4-node parallel download |
+
+#### Confirmed working (simulation — mock Orca, no real GPUs)
+
+| Feature | Evidence |
+|---------|----------|
+| Monitoring: EMA + headroom | 4 replicas tracked, TPS wobble ±10%, headroom computed via `max(total_tokens)` |
+| Monitoring: hysteresis | FALLING_BEHIND enter at 10%, no oscillation at boundary |
+| Monitoring: anti-windup | 5-min freeze after scale_chain_tool, triggers suppressed |
+| Replica death → TPS zeroed | Kill r0/r1 → TPS=0 instantly, aggregate drops from 4800→2400 |
+| Replica death → FAILED trigger | `/job/replica-failed` webhook → agent wakes, diagnoses spot preemption |
+| Agent scales up on failure | Killed 2 → agent launched 3 replacements (r4, r5, r6) via `scale_chain_tool` |
+| Agent scales up on total wipe | Killed all 5 → agent launched 4 more (r7-r10), system recovered |
+| Trigger dedup | 1 trigger per group per 30s (was 6 triggers for 2 deaths before fix) |
+| Failure outcome in memory | 7 `replica_failed` outcomes with `infrastructure` category |
+| Scale-up decision tree | 1 user decision → 8 scale_up decisions, all with parent_decision_id linkage |
+| Dead replica cleanup | r0/r1 removed from tracked_jobs after 60s grace period |
+| Decision tree in memory | Full lineage: `dec-xxx (user) → 7 failures → 8 scale_ups` |
+
+#### Coded but needs real-infra verification
+
+| Feature | What's missing | Risk |
+|---------|---------------|------|
+| Watchdog heartbeat → `/job/replica-failed` | Real Orca watchdog hasn't fired since the fix. Sim used mock's instant death signal. Need to kill EC2 instance and verify 45s heartbeat timeout → webhook fires. | Medium — code follows existing watchdog pattern, but untested path |
+| `monitor_replica` chunk progress check | `sky.tail_logs()` clean exit hasn't been tested with new code. Need real spot preemption where SSH stream ends cleanly. | Medium — defensive check, worst case falls back to watchdog |
+| Scale endpoint `koi_webhook_info` | Orca `_do_add_replicas()` now passes webhook info, but no real Koi→Orca scale-up has been tested. Mock doesn't exercise this path. | High — if broken, scale-up replicas are invisible to Koi (exactly the bug we fixed) |
+| EMA decay (Layer 2) | Never triggered — Layer 1 (Orca phase check) or webhook zeroing always caught it first. Backup for network partition scenario. | Low — defense in depth |
+
+#### Known gaps (not yet implemented)
+
+| Gap | Priority | Observed behavior |
+|-----|----------|------------------|
+| **Adaptive replacement** | High | Sim: killed 7 L40S replicas, all 8 replacements were L40S. Agent never queried memory for failure patterns or tried different GPU/region. FAILED prompt doesn't instruct it to reconsider config. |
+| **Spot → on-demand fallback** | High | Architecture says "try same spot, fallback to on-demand." Agent doesn't distinguish market type when scaling. |
+| **Fast-path (skip LLM)** | Medium | Every `/decide` invokes the full agent (~30-50s, $0.05-0.10). Repeat workloads should hit memory cache and return instantly. |
+| **Heterogeneous replica mix** | Low | Agent can only pick ONE config. Can't design "2×L40S + 1×A10G" mixes. Phase 2. |
+| **A/B testing on surplus** | Low | When headroom >50%, surplus capacity is wasted. Should probe cheaper configs. Phase 2. |
+| **`launch_chain` as agent tool** | Low | Agent can scale existing jobs but can't initiate new launches. |
+
 <details>
 <summary><strong>Future (NOT this version)</strong></summary>
 
