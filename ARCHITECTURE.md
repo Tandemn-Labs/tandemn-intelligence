@@ -1244,6 +1244,141 @@ But if B takes 8 H100 GPUs, they're all gone. And A and C compete for A100s.
 ---
 
 <details>
+<summary><strong>Phase 2 Design Note: Bayesian Memory Layer</strong></summary>
+
+### The Problem with Point Estimates
+
+Today, Koi's memory stores raw outcomes: "Qwen3-32B on L40S TP=4 PP=2 got 1180 TPS." The agent reads these and *reasons* about them via LLM. This is expensive (~$0.05 per query), slow (~30s), and lossy — the LLM can't do proper statistics over 20 past outcomes.
+
+The fix: **memory becomes a posterior store, not a log store.** Instead of raw values, store distribution parameters (μ, σ², n) per config. Every job outcome is a Bayesian update. The agent receives calibrated uncertainty, not raw data.
+
+### Prior Art
+
+| Paper | Method | Limitation vs Koi |
+|-------|--------|-------------------|
+| CherryPick (NSDI '17) | GP + EI for cloud VM selection | Offline search, no live updating |
+| SCOOT (WWW '25, Ant Group) | GP + MOBO for vLLM tuning (TP, batch_size, etc.) | Offline, 9 vLLM knobs, not cross-job |
+| OtterTune (SIGMOD '17) | GP + knowledge transfer from similar workloads | Offline, DB not GPU |
+| Morphling (SoCC '21) | Meta-learning prior + few-shot for ML serving | Offline, no production updating |
+| COLA (arXiv '21) | Contextual bandits for autoscaling | Online, but instance count only |
+| AIConfigurator (NVIDIA '25) | Analytical kernel-level modeling | Not Bayesian, no learning |
+
+**The gap Koi fills:** No system uses online Bayesian updating of a GPU performance model where (1) the prior comes from a benchmark database, (2) every production job tightens the posterior, and (3) the agent makes decisions under calibrated uncertainty. CherryPick + OtterTune + COLA, synthesized and made online.
+
+### Three-Layer Bayesian Architecture
+
+```
+Layer 1: Per-config posterior (cross-job learning)
+  ┌─────────────────────────────────────────────────────────┐
+  │ Key: (model, GPU, TP, PP, io_ratio_bucket)              │
+  │ Value: Normal-Inverse-Gamma(μ, λ, α, β)                │
+  │                                                         │
+  │ Prior: seeded from PerfDB benchmarks                    │
+  │ Update: conjugate, closed-form, O(1) per observation    │
+  │ After n jobs: uncertainty shrinks as 1/√n               │
+  │                                                         │
+  │ Example:                                                │
+  │   First time:  P(TPS) = N(1200, 150²)  ← PerfDB prior  │
+  │   After 5 jobs: P(TPS) = N(1195, 65²)  ← tighter       │
+  │   After 20:    P(TPS) = N(1205, 35²)   ← very confident│
+  └─────────────────────────────────────────────────────────┘
+
+Layer 2: Within-job Kalman filter (real-time tracking)
+  ┌─────────────────────────────────────────────────────────┐
+  │ State: [tps, d_tps/dt]  (throughput + rate of change)   │
+  │                                                         │
+  │ Initial state: seeded from Layer 1 posterior             │
+  │ Transition: tps(t+1) = tps(t) + rate*dt                 │
+  │             rate(t+1) = rate(t) * 0.95 (decays to 0)    │
+  │ Measurement: Orca metrics every 10s                     │
+  │                                                         │
+  │ Handles all phases naturally:                           │
+  │   Warmup:      rate > 0  → "still ramping, don't alarm"│
+  │   Steady:      rate ≈ 0  → "trust the measurement"     │
+  │   Degradation: rate < 0  → "something's wrong"          │
+  │                                                         │
+  │ Replaces: static WARMUP_MINUTES, hardcoded thresholds   │
+  │ Anomaly = large innovation (measurement - prediction)   │
+  └─────────────────────────────────────────────────────────┘
+
+Layer 3: Hierarchical prior (transfer learning) [FUTURE]
+  ┌─────────────────────────────────────────────────────────┐
+  │ GPU family (L40S) has latent efficiency factor ε         │
+  │   └── Observing ANY L40S config updates ε               │
+  │   └── Which improves priors for ALL L40S configs         │
+  │                                                         │
+  │ Model family (Qwen3-*) has latent scaling factor         │
+  │   └── Observing 32B informs the prior for 72B           │
+  │                                                         │
+  │ This is where MCMC/variational inference is needed —     │
+  │ the hierarchical structure is analytically intractable.  │
+  │ But only needed at scale (hundreds of configs).          │
+  └─────────────────────────────────────────────────────────┘
+```
+
+### Where Parameters Come From
+
+| Parameter | Source | Example |
+|-----------|--------|---------|
+| Initial TPS estimate (μ₀) | PerfDB benchmark or agent's `predicted_tps` | 1200 TPS |
+| Initial uncertainty (σ₀²) | Variance across PerfDB records for same config | 150² if TPS ranges 1050-1350 |
+| Process noise (Q) | How much TPS varies within a job (Orca metrics variance) | (0.08 × μ)² |
+| Measurement noise (R) | Prometheus poll jitter (~5-10% of steady state) | (0.05 × μ)² |
+| Warmup rate prior | Physics: model_size_gb / GPU_bandwidth → load time | 0→1200 over 30s |
+| Launch success rate | Beta(α, β) conjugate prior, updated per attempt | Beta(47, 6) = 89% ± 4% |
+| Failure rate by market | Beta prior, updated per replica lifetime | spot: Beta(12, 88) = 12%/hr |
+
+### What Changes for the Agent
+
+Today:
+```
+Agent: "query_memory → 10 raw outcomes → reason about them → decide"
+Cost: ~$0.05, ~30s, lossy interpretation
+```
+
+Bayesian:
+```
+Agent receives: "Qwen3-32B on L40S TP=4 PP=2:
+  TPS = 1205 ± 35 (n=20, high confidence)
+  Spot failure rate us-east-1: 12%/hr (n=47)
+  On-demand launch success: 94% (n=31)
+  Warmup: 28s ± 5s (n=8)"
+
+Agent decides under uncertainty, doesn't compute.
+Cost: same LLM call, but better input → better decisions
+```
+
+### Schema Change (memory.py)
+
+New table alongside decisions/outcomes:
+```sql
+CREATE TABLE posteriors (
+    config_key    TEXT PRIMARY KEY,  -- "Qwen3-32B|L40S|4|2|high_io"
+    metric        TEXT NOT NULL,     -- "tps", "cost_per_hour", "warmup_seconds"
+    mu            REAL NOT NULL,     -- posterior mean
+    sigma_sq      REAL NOT NULL,     -- posterior variance
+    n             INTEGER NOT NULL,  -- observation count
+    lambda        REAL,              -- NIG precision parameter
+    alpha         REAL,              -- NIG shape
+    beta          REAL,              -- NIG scale
+    last_updated  TEXT DEFAULT (datetime('now'))
+);
+```
+
+The raw outcomes table stays (audit trail). The posteriors table is the agent's view.
+
+### Implementation Path
+
+1. **Phase 2a**: Conjugate per-config posteriors (Normal-Inverse-Gamma). Seed from PerfDB. Update on every outcome. Agent's `query_memory` tool returns posteriors instead of raw outcomes. ~200 lines.
+2. **Phase 2b**: Kalman filter replaces EMA + static warmup. Within-job tracking seeded from Layer 1. Anomaly detection replaces hardcoded thresholds. ~300 lines.
+3. **Phase 2c**: Thompson sampling for exploration — when choosing between configs, sample from posteriors and pick the sample-best. Natural exploration-exploitation balance. ~50 lines.
+4. **Phase 3**: Hierarchical model with MCMC/VI for cross-config transfer learning. Only needed at scale.
+
+</details>
+
+---
+
+<details>
 <summary><strong>11. Batch-Specific Details (Future — Scale Down, Spot Recovery, Budget)</strong></summary>
 
 ### Scale DOWN, not just up (Phase 1)
