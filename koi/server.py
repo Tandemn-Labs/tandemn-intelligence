@@ -227,12 +227,40 @@ class JobStartedRequest(BaseModel):
     slo_deadline_hours: float
     total_tokens: int
     predicted_tps: float = 0.0
+    is_fallback: bool = False           # True if Orca used a fallback config (not primary)
 
 
 @app.post("/job/started")
 async def job_started(req: JobStartedRequest):
     """Called by Orca AFTER a job successfully launches. Registers in monitor."""
     monitor: MonitoringLoop = app.state.monitor
+    memory: AgenticMemory = app.state.memory
+
+    # Detect fallback: if Orca used a different config than Koi's primary decision,
+    # create a child decision so the outcome links to the ACTUAL config, not the intended one.
+    actual_decision_id = req.decision_id
+    if req.is_fallback and req.decision_id:
+        original = memory.get_decision(req.decision_id)
+        if original:
+            actual_decision_id = memory.record_decision(
+                job_id=req.job_id,
+                model_name=original["model_name"],
+                instance_type=req.instance_type,
+                gpu_type=req.gpu_type,
+                tp=req.tp, pp=req.pp, dp=req.dp,
+                num_gpus=req.tp * req.pp * req.dp,
+                predicted_tps=0,
+                slo_deadline_hours=req.slo_deadline_hours,
+                objective=original.get("objective", "cheapest"),
+                avg_input_tokens=original.get("avg_input_tokens", 0),
+                avg_output_tokens=original.get("avg_output_tokens", 0),
+                num_requests=original.get("num_requests"),
+                triggered_by="fallback",
+                parent_decision_id=req.decision_id,
+                market="on_demand",
+            )
+            logger.info(f"[Koi] Fallback detected: {req.decision_id} → {actual_decision_id} "
+                       f"({req.gpu_type} TP={req.tp} PP={req.pp})")
 
     config = PlacementConfig(
         gpu_type=req.gpu_type,
@@ -253,13 +281,15 @@ async def job_started(req: JobStartedRequest):
         slo_deadline_hours=req.slo_deadline_hours,
         total_tokens=req.total_tokens,
         predicted_tps=req.predicted_tps,
-        decision_id=req.decision_id,
+        decision_id=actual_decision_id,
         group_id=req.group_id,
     )
 
     group_str = f" (group={req.group_id})" if req.group_id else ""
-    logger.info(f"[Koi] Job started: {req.job_id} on {req.gpu_type} TP={req.tp} PP={req.pp}{group_str}")
-    return {"status": "registered", "job_id": req.job_id, "group_id": req.group_id}
+    fallback_str = " [FALLBACK]" if req.is_fallback else ""
+    logger.info(f"[Koi] Job started: {req.job_id} on {req.gpu_type} TP={req.tp} PP={req.pp}{group_str}{fallback_str}")
+    return {"status": "registered", "job_id": req.job_id, "group_id": req.group_id,
+            "decision_id": actual_decision_id}
 
 
 @app.post("/job/complete")

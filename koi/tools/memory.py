@@ -228,6 +228,12 @@ class AgenticMemory:
     # Read operations
     # ------------------------------------------------------------------
 
+    def get_decision(self, decision_id: str) -> Optional[Dict[str, Any]]:
+        """Look up a single decision by ID."""
+        conn = self._conn()
+        row = conn.execute("SELECT * FROM decisions WHERE decision_id = ?", (decision_id,)).fetchone()
+        return dict(row) if row else None
+
     def query_decisions(
         self, model_name: Optional[str] = None,
         gpu_type: Optional[str] = None,
