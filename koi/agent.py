@@ -136,10 +136,14 @@ class KoiAgent:
             limit: int = 15,
         ) -> str:
             """Query the performance database for benchmark records. Filter by model, GPU type, TP/PP, io_ratio range. Returns throughput, cost, and physics features."""
+            # If agent queries a GPU type that's excluded, return empty
+            if gpu_type and gpu_type in exclude_gpus:
+                return f"GPU type {gpu_type} is excluded from consideration."
             from koi.tools.perfdb import query_perfdb as _qp
-            return _qp(perfdb, model_name=model_name, gpu_type=gpu_type,
+            result = _qp(perfdb, model_name=model_name, gpu_type=gpu_type,
                        tp=tp, pp=pp, io_ratio_min=io_ratio_min, io_ratio_max=io_ratio_max,
-                       sort_by=sort_by, limit=limit)
+                       sort_by=sort_by, limit=limit,
+                       exclude_gpus=exclude_gpus)
 
         @beta_async_tool
         async def query_memory_tool(
@@ -462,6 +466,7 @@ class KoiAgent:
         total = req.total_tokens
         required_tps = req.required_tps
         io_ratio = req.prefill_decode_ratio
+        exclude_gpus = set(g.strip() for g in os.environ.get("KOI_EXCLUDE_GPUS", "").split(",") if g.strip())
 
         resources_text = get_resources(rm)
 
@@ -483,6 +488,7 @@ class KoiAgent:
             "",
             cost_table,
             "",
+            f"EXCLUDED GPU TYPES (do not use): {', '.join(exclude_gpus)}" if exclude_gpus else "",
             "Use your tools to query PerfDB, memory, and physics to VERIFY the cost table above.",
             "The cost table is pre-computed — pick the cheapest total_cost row that meets SLO, then verify it.",
             "",

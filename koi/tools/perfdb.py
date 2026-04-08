@@ -228,6 +228,7 @@ def query_perfdb(
     io_ratio_max: Optional[float] = None,
     sort_by: str = "throughput_tps",
     limit: int = 20,
+    exclude_gpus: Optional[set] = None,
 ) -> str:
     """Query PerfDB. Returns formatted table of matching benchmark records."""
     records = perfdb.query(
@@ -235,6 +236,9 @@ def query_perfdb(
         io_ratio_min=io_ratio_min, io_ratio_max=io_ratio_max,
         sort_by=sort_by, limit=limit,
     )
+    # Filter out excluded GPU types
+    if exclude_gpus:
+        records = [r for r in records if r.get("gpu_type") not in exclude_gpus]
 
     if not records:
         filters = []
