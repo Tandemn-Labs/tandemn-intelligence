@@ -20,20 +20,21 @@ DTYPE_BYTES: Dict[str, float] = {
     "fp8": 1.0, "int8": 1.0, "int4": 0.5,
 }
 
-# GPU specs — FP16 TFLOPS are tensor core WITHOUT sparsity (conservative).
+# GPU specs — FP16 TFLOPS are dense tensor core WITHOUT sparsity.
+# Memory is total VRAM (not "usable after reserved").
 # Sources: NVIDIA datasheets (nvidia.com/data-center/*)
 GPU_SPECS: Dict[str, Dict[str, float]] = {
-    "H100_SXM": {"bandwidth_gbps": 3350, "fp16_tflops": 989,  "mem_gb": 79.0, "interconnect": "NVLink", "generation": "Hopper", "fp8_native": True},
-    "H100":     {"bandwidth_gbps": 3350, "fp16_tflops": 989,  "mem_gb": 79.0, "interconnect": "NVLink", "generation": "Hopper", "fp8_native": True},
-    "H200":     {"bandwidth_gbps": 4800, "fp16_tflops": 989,  "mem_gb": 140.0, "interconnect": "NVLink", "generation": "Hopper", "fp8_native": True},
-    "A100-80GB":{"bandwidth_gbps": 2000, "fp16_tflops": 312,  "mem_gb": 79.0, "interconnect": "NVLink", "generation": "Ampere", "fp8_native": False},
-    "A100-40GB":{"bandwidth_gbps": 2000, "fp16_tflops": 312,  "mem_gb": 39.0, "interconnect": "NVLink", "generation": "Ampere", "fp8_native": False},
-    "A100":     {"bandwidth_gbps": 2000, "fp16_tflops": 312,  "mem_gb": 79.0, "interconnect": "NVLink", "generation": "Ampere", "fp8_native": False},
-    "L40S":     {"bandwidth_gbps":  864, "fp16_tflops": 362,  "mem_gb": 45.5, "interconnect": "PCIe", "generation": "Ada", "fp8_native": True},   # 733 with sparsity
-    "A10G":     {"bandwidth_gbps":  600, "fp16_tflops":  70,  "mem_gb": 23.0, "interconnect": "PCIe", "generation": "Ampere", "fp8_native": False}, # 140 with sparsity
-    "L4":       {"bandwidth_gbps":  300, "fp16_tflops": 242,  "mem_gb": 23.0, "interconnect": "PCIe", "generation": "Ada", "fp8_native": True},    # FP16 tensor core
-    "B200":     {"bandwidth_gbps": 8000, "fp16_tflops": 2250, "mem_gb": 192.0, "interconnect": "NVLink", "generation": "Blackwell", "fp8_native": True},
-    "GB200":    {"bandwidth_gbps": 8000, "fp16_tflops": 2250, "mem_gb": 192.0, "interconnect": "NVLink", "generation": "Blackwell", "fp8_native": True},
+    "H100_SXM":  {"bandwidth_gbps": 3350, "fp16_tflops": 989,  "mem_gb": 80.0, "interconnect": "NVLink", "generation": "Hopper", "fp8_native": True},
+    "H100":      {"bandwidth_gbps": 2000, "fp16_tflops": 756,  "mem_gb": 80.0, "interconnect": "PCIe",   "generation": "Hopper", "fp8_native": True},   # PCIe, NOT SXM
+    "H200":      {"bandwidth_gbps": 4800, "fp16_tflops": 1979, "mem_gb": 141.0, "interconnect": "NVLink", "generation": "Hopper", "fp8_native": True},
+    "A100-80GB": {"bandwidth_gbps": 2039, "fp16_tflops": 312,  "mem_gb": 80.0, "interconnect": "NVLink", "generation": "Ampere", "fp8_native": False},
+    "A100-40GB": {"bandwidth_gbps": 1555, "fp16_tflops": 312,  "mem_gb": 40.0, "interconnect": "NVLink", "generation": "Ampere", "fp8_native": False},
+    "A100":      {"bandwidth_gbps": 2039, "fp16_tflops": 312,  "mem_gb": 80.0, "interconnect": "NVLink", "generation": "Ampere", "fp8_native": False},  # defaults to 80GB SXM
+    "L40S":      {"bandwidth_gbps":  864, "fp16_tflops": 362,  "mem_gb": 48.0, "interconnect": "PCIe",   "generation": "Ada",    "fp8_native": True},   # 733 with sparsity
+    "A10G":      {"bandwidth_gbps":  600, "fp16_tflops": 125,  "mem_gb": 24.0, "interconnect": "PCIe",   "generation": "Ampere", "fp8_native": False},
+    "L4":        {"bandwidth_gbps":  300, "fp16_tflops": 121,  "mem_gb": 24.0, "interconnect": "PCIe",   "generation": "Ada",    "fp8_native": True},
+    "B200":      {"bandwidth_gbps": 8000, "fp16_tflops": 2250, "mem_gb": 192.0, "interconnect": "NVLink", "generation": "Blackwell", "fp8_native": True},
+    "GB200":     {"bandwidth_gbps": 8000, "fp16_tflops": 2250, "mem_gb": 192.0, "interconnect": "NVLink", "generation": "Blackwell", "fp8_native": True},
 }
 
 ARCH_FAMILIES: Dict[str, list] = {

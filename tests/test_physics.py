@@ -9,11 +9,18 @@ from koi.tools.physics import (
 
 
 class TestGPUSpecs:
-    def test_h100_specs(self):
+    def test_h100_pcie_specs(self):
+        """H100 (PCIe) has lower bandwidth/TFLOPS than SXM."""
         s = GPU_SPECS["H100"]
+        assert s["bandwidth_gbps"] == 2000
+        assert s["fp16_tflops"] == 756
+        assert s["mem_gb"] == 80.0
+
+    def test_h100_sxm_specs(self):
+        s = GPU_SPECS["H100_SXM"]
         assert s["bandwidth_gbps"] == 3350
         assert s["fp16_tflops"] == 989
-        assert s["mem_gb"] == 79.0
+        assert s["mem_gb"] == 80.0
 
     def test_l40s_corrected(self):
         """L40S FP16 should be 362 (no sparsity), not 733."""
@@ -22,33 +29,37 @@ class TestGPUSpecs:
         assert s["bandwidth_gbps"] == 864
 
     def test_a10g_corrected(self):
-        """A10G FP16 tensor core is 70 TFLOPS."""
+        """A10G FP16 tensor core is 125 TFLOPS."""
         s = GPU_SPECS["A10G"]
-        assert s["fp16_tflops"] == 70
+        assert s["fp16_tflops"] == 125
+        assert s["mem_gb"] == 24.0
 
     def test_l4_corrected(self):
-        """L4 FP16 tensor core is 242 TFLOPS."""
+        """L4 FP16 dense tensor core is 121 TFLOPS (242 with sparsity)."""
         s = GPU_SPECS["L4"]
-        assert s["fp16_tflops"] == 242
+        assert s["fp16_tflops"] == 121
+        assert s["mem_gb"] == 24.0
 
     def test_a100_40gb_vs_80gb(self):
-        assert GPU_SPECS["A100-40GB"]["mem_gb"] == 39.0
-        assert GPU_SPECS["A100-80GB"]["mem_gb"] == 79.0
-        assert GPU_SPECS["A100-40GB"]["bandwidth_gbps"] == GPU_SPECS["A100-80GB"]["bandwidth_gbps"]
+        assert GPU_SPECS["A100-40GB"]["mem_gb"] == 40.0
+        assert GPU_SPECS["A100-80GB"]["mem_gb"] == 80.0
+        # A100-40GB has lower bandwidth than 80GB SXM
+        assert GPU_SPECS["A100-40GB"]["bandwidth_gbps"] == 1555
+        assert GPU_SPECS["A100-80GB"]["bandwidth_gbps"] == 2039
 
 
 class TestLookup:
     def test_exact_match(self):
         s = lookup_gpu_spec("L40S")
-        assert s["mem_gb"] == 45.5
+        assert s["mem_gb"] == 48.0
 
     def test_case_insensitive(self):
         s = lookup_gpu_spec("h100")
-        assert s["fp16_tflops"] == 989
+        assert s["fp16_tflops"] == 756  # PCIe, not SXM
 
     def test_a100_80gb_specific(self):
         s = lookup_gpu_spec("A100-80GB")
-        assert s["mem_gb"] == 79.0
+        assert s["mem_gb"] == 80.0
 
     def test_unknown_fallback(self):
         s = lookup_gpu_spec("UNKNOWN_GPU_XYZ")
@@ -133,7 +144,7 @@ class TestToolFunctions:
     def test_get_gpu_physics(self):
         result = get_gpu_physics("A100-80GB")
         assert "80" in result
-        assert "2000" in result
+        assert "2039" in result
 
     def test_get_gpu_physics_with_model(self):
         result = get_gpu_physics("L40S", model_name="Qwen/Qwen2.5-72B-Instruct")

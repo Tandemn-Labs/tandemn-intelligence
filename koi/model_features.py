@@ -52,18 +52,8 @@ ARCH_FAMILIES: Dict[str, list] = {
     "starcoder": ["starcoder", "codegen"],
 }
 
-# GPU specs needed for compute_config_features()
-_GPU_SPECS: Dict[str, Dict[str, float]] = {
-    "H100_SXM": {"bandwidth_gbps": 3350, "fp16_tflops": 989,  "mem_gb": 79.0},
-    "H100":     {"bandwidth_gbps": 3350, "fp16_tflops": 989,  "mem_gb": 79.0},
-    "H200":     {"bandwidth_gbps": 4800, "fp16_tflops": 989,  "mem_gb": 140.0},
-    "A100":     {"bandwidth_gbps": 2000, "fp16_tflops": 312,  "mem_gb": 79.0},
-    "L40S":     {"bandwidth_gbps":  864, "fp16_tflops": 733,  "mem_gb": 45.5},
-    "A10G":     {"bandwidth_gbps":  600, "fp16_tflops": 125,  "mem_gb": 23.0},
-    "L4":       {"bandwidth_gbps":  300, "fp16_tflops": 121,  "mem_gb": 23.0},
-    "B200":     {"bandwidth_gbps": 8000, "fp16_tflops": 2250, "mem_gb": 192.0},
-    "GB200":    {"bandwidth_gbps": 8000, "fp16_tflops": 2250, "mem_gb": 192.0},
-}
+# GPU specs — imported from physics.py (single source of truth)
+from koi.tools.physics import GPU_SPECS as _GPU_SPECS
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +184,7 @@ def compute_config_features(
     vram_gb = gpu_memory_gb_override or gpu_spec["mem_gb"]
 
     num_gpus_total = tp * pp * dp
-    weight_gb_per_gpu = model.model_size_gb / max(tp, 1)
+    weight_gb_per_gpu = model.model_size_gb / max(tp * pp, 1)
     vram_headroom_gb = max(0.0, vram_gb - weight_gb_per_gpu)
     vram_headroom = vram_headroom_gb / max(vram_gb, 1)
 
@@ -389,7 +379,7 @@ _KNOWN_MODELS: Dict[str, Dict] = {
     ),
     "mistralai/Mistral-7B-Instruct-v0.3": dict(
         num_params_billions=7.2, num_layers=32, hidden_dim=4096,
-        num_attention_heads=32, num_kv_heads=8, vocab_size=32000,
+        num_attention_heads=32, num_kv_heads=8, vocab_size=32768,
         is_moe=False, num_experts=0, active_experts=0, architecture_family="mistral",
     ),
     "microsoft/Phi-4": dict(

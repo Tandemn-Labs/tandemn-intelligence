@@ -160,18 +160,8 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     ],
 }
 
-# GPU specs for physics feature computation (shared with model_features.py)
-_GPU_SPECS: Dict[str, Dict[str, float]] = {
-    "H100_SXM": {"bandwidth_gbps": 3350, "fp16_tflops": 989,  "mem_gb": 79.0},
-    "H100":     {"bandwidth_gbps": 3350, "fp16_tflops": 989,  "mem_gb": 79.0},
-    "H200":     {"bandwidth_gbps": 4800, "fp16_tflops": 989,  "mem_gb": 140.0},
-    "A100":     {"bandwidth_gbps": 2000, "fp16_tflops": 312,  "mem_gb": 79.0},
-    "L40S":     {"bandwidth_gbps":  864, "fp16_tflops": 733,  "mem_gb": 45.5},
-    "A10G":     {"bandwidth_gbps":  600, "fp16_tflops": 125,  "mem_gb": 23.0},
-    "L4":       {"bandwidth_gbps":  300, "fp16_tflops": 121,  "mem_gb": 23.0},
-    "B200":     {"bandwidth_gbps": 8000, "fp16_tflops": 2250, "mem_gb": 192.0},
-    "GB200":    {"bandwidth_gbps": 8000, "fp16_tflops": 2250, "mem_gb": 192.0},
-}
+# GPU specs — imported from physics.py (single source of truth)
+from koi.tools.physics import GPU_SPECS as _GPU_SPECS
 
 _DTYPE_BYTES: Dict[str, float] = {
     "fp32": 4.0, "fp16": 2.0, "bf16": 2.0,
@@ -316,7 +306,8 @@ class PerfRAG:
         quant = str(rec.get("quantization", "fp16") or "fp16").lower()
         dtype_bytes = _DTYPE_BYTES.get(quant, 2.0)
         model_size_gb = params_b * 1e9 * dtype_bytes / 1e9
-        weight_per_gpu_gb = model_size_gb / max(tp, 1)
+        pp = float(rec.get("pp", 1) or 1)
+        weight_per_gpu_gb = model_size_gb / max(tp * pp, 1)
 
         rec["_dtype_bytes"] = dtype_bytes
         rec["_model_size_gb"] = model_size_gb
@@ -441,7 +432,7 @@ class PerfRAG:
         dtype_bytes = _DTYPE_BYTES.get(dtype, 2.0)
         model_size_gb = num_params_billions * 1e9 * dtype_bytes / 1e9
         vram_gb = gpu_spec["mem_gb"]
-        weight_per_gpu = model_size_gb / max(tp, 1)
+        weight_per_gpu = model_size_gb / max(tp * pp, 1)
         vram_headroom = max(0.0, (vram_gb - weight_per_gpu) / max(vram_gb, 1))
         bw_per_param = (gpu_spec["bandwidth_gbps"] * tp) / max(num_params_billions, 0.1)
         flops_per_param = (gpu_spec["fp16_tflops"] * tp) / max(num_params_billions, 0.1)
