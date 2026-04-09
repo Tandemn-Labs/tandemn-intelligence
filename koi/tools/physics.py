@@ -93,13 +93,13 @@ _KNOWN_MODELS: Dict[str, Dict] = {
         architecture_family="qwen",
     ),
     "Qwen/Qwen3-235B-A22B": dict(
-        num_params_billions=235, num_layers=94, hidden_dim=7168,
+        num_params_billions=235, num_layers=94, hidden_dim=4096,
         num_attention_heads=64, num_kv_heads=4, vocab_size=151936,
         is_moe=True, num_experts=128, active_experts=8, architecture_family="qwen",
     ),
     "deepseek-ai/DeepSeek-R1-Distill-Llama-70B": dict(
         num_params_billions=70, num_layers=80, hidden_dim=8192,
-        num_attention_heads=64, num_kv_heads=8, vocab_size=32000,
+        num_attention_heads=64, num_kv_heads=8, vocab_size=128256,
         architecture_family="llama",
     ),
     "meta-llama/Llama-3-70B": dict(
