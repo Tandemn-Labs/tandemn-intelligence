@@ -250,6 +250,7 @@ class KoiAgent:
                         avg_output_tokens=parent["avg_output_tokens"] if parent else 0,
                         triggered_by="scale_up" if count > 0 else "scale_down",
                         parent_decision_id=parent_dec,
+                        market=parent.get("market", "on_demand") if parent else "on_demand",
                     )
                     # Store so /job/started can link new replicas to this decision
                     if monitor and count > 0:
