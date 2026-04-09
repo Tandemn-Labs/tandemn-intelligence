@@ -387,7 +387,7 @@ But **outcomes** are recorded per-chain when the job completes. Each chain gets 
 
 **Current limitations:**
 - The agent picks ONE config; fallback to different GPUs is mechanical (Orca tries alternatives in order). The agent can't proactively design heterogeneous replica mixes. This is future work (piggyback exploration).
-- Scale-up replicas (added via `scale_chain_tool`) are NOT tracked by Koi — they have no `koi_webhook_info`, so no `/job/started` webhook fires. Koi monitors the original replicas only.
+- ~~Scale-up replicas NOT tracked by Koi~~ — **FIXED** (2026-04-08): Orca scale endpoint now passes `koi_webhook_info` to new replicas. `/job/started` fires for scale-up replicas. Koi monitors all replicas.
 - The CLI always calls `/decide` even if the user picks roofline or cancels. Phantom decisions accumulate in memory with no outcomes.
 
 **How the agent uses memory:**
@@ -1150,6 +1150,11 @@ But if B takes 8 H100 GPUs, they're all gone. And A and C compete for A100s.
 - [x] Trigger deduplication for grouped jobs (30s cooldown per group per status — fixed 2026-04-08)
 - [x] Failure outcomes recorded in memory (auto-record in /job/replica-failed webhook — fixed 2026-04-08)
 - [x] Scale-up/down decisions recorded in memory (triggered_by=scale_up/scale_down — fixed 2026-04-08)
+- [x] Event-based anti-windup (unfreeze on /job/started, 20 min safety max — fixed 2026-04-08)
+- [x] on_demand propagation in scale-up (inherits market from parent decision — fixed 2026-04-08)
+- [x] Scale-down self-fighting prevention (intentional kills don't trigger FAILED — fixed 2026-04-08)
+- [x] Targeted kill tool for degraded replicas (kill_replica_tool by ID — fixed 2026-04-08)
+- [x] Total wipeout race investigated — NOT a real issue (job is "generating" not "launching", finally block doesn't apply)
 - [ ] Adaptive replacement: agent queries failure history before choosing replacement config (same GPU keeps dying → try different GPU/region/market)
 - [ ] Spot preemption recovery (on-demand fallback when spot repeatedly fails)
 - [ ] Fast-path: skip LLM when memory has high-confidence answer for repeat workloads

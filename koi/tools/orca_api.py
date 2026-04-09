@@ -271,10 +271,11 @@ async def async_scale_chain(
     job_id: str,
     gpu_type: str, tp: int, pp: int,
     count: int,
+    on_demand: bool = False,
 ) -> str:
     """Scale a running job. Positive count = add replicas. Negative = kill excess."""
     if count > 0:
-        result = await orca.scale_job(job_id, gpu_type, tp, pp, count)
+        result = await orca.scale_job(job_id, gpu_type, tp, pp, count, on_demand=on_demand)
         return f"Scaled up: {count} replicas added. {result}"
     elif count < 0:
         replicas_data = await orca.get_replicas(job_id)

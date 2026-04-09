@@ -268,14 +268,18 @@ class KoiAgent:
                     except Exception:
                         pass
 
+                # Inherit market preference from parent decision
+                use_on_demand = parent.get("market", "on_demand") == "on_demand" if parent else False
+
                 from koi.tools.orca_api import async_scale_chain
-                result = await async_scale_chain(orca, job_id, gpu_type, tp, pp, count)
+                result = await async_scale_chain(orca, job_id, gpu_type, tp, pp, count,
+                                                  on_demand=use_on_demand)
                 # Anti-windup: freeze triggers for this job while scaling action takes effect
                 if monitor:
                     for tracker in monitor.tracked_jobs.values():
                         if tracker.group_id == job_id or tracker.job_id == job_id:
                             tracker.action_in_progress = True
-                            tracker.action_freeze_until = time.time() + 300  # 5 min freeze
+                            tracker.action_freeze_until = time.time() + 1200  # 20 min max, /job/started unfreezes early
                 return result
 
             @beta_async_tool

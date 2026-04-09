@@ -236,8 +236,8 @@ async def job_started(req: JobStartedRequest):
     monitor: MonitoringLoop = app.state.monitor
     memory: AgenticMemory = app.state.memory
 
-    # Link scale-up replicas to their pending decision
-    if not req.decision_id and hasattr(monitor, '_pending_scale_decision'):
+    # Link scale-up replicas to their pending decision (overrides Orca's original decision_id)
+    if hasattr(monitor, '_pending_scale_decision'):
         pending = getattr(monitor, '_pending_scale_decision', None)
         if pending and pending.get("group_id") == req.group_id:
             req.decision_id = pending["decision_id"]
@@ -290,6 +290,14 @@ async def job_started(req: JobStartedRequest):
         decision_id=actual_decision_id,
         group_id=req.group_id,
     )
+
+    # Unfreeze anti-windup for all trackers in this group (new replica is ready)
+    if req.group_id:
+        for tracker in monitor.tracked_jobs.values():
+            if tracker.group_id == req.group_id and tracker.action_in_progress:
+                tracker.action_in_progress = False
+                tracker.action_freeze_until = None
+                logger.info(f"[Koi] Anti-windup unfrozen for {tracker.job_id} (new replica {req.job_id} ready)")
 
     group_str = f" (group={req.group_id})" if req.group_id else ""
     fallback_str = " [FALLBACK]" if req.is_fallback else ""
