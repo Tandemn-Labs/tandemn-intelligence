@@ -5,12 +5,13 @@ Wraps all HTTP calls to Orca: submit jobs, scale, kill, fetch metrics.
 Agent tools delegate to OrcaClient methods.
 """
 
-import logging
 from typing import Any, Dict, List, Optional
 
 import aiohttp
 
-logger = logging.getLogger("koi.orca_api")
+from koi.logging_config import get_logger
+
+logger = get_logger("koi.orca_api")
 
 
 class OrcaClient:
@@ -96,7 +97,7 @@ class OrcaClient:
         ) as resp:
             data = await resp.json()
             if resp.status >= 400:
-                logger.error(f"Submit failed ({resp.status}): {data}")
+                logger.error("submit_failed", status=resp.status, response=str(data)[:200])
             return data
 
     # ------------------------------------------------------------------
@@ -186,7 +187,7 @@ class OrcaClient:
         ) as resp:
             data = await resp.json()
             if resp.status >= 400:
-                logger.error(f"Scale failed ({resp.status}): {data}")
+                logger.error("scale_failed", status=resp.status, response=str(data)[:200])
             return data
 
     async def kill_replicas(self, job_id: str, replica_ids: List[str]) -> Dict[str, Any]:
@@ -200,7 +201,7 @@ class OrcaClient:
         ) as resp:
             data = await resp.json()
             if resp.status >= 400:
-                logger.error(f"Kill failed ({resp.status}): {data}")
+                logger.error("kill_failed", status=resp.status, response=str(data)[:200])
             return data
 
     async def swap_replicas(
@@ -229,7 +230,7 @@ class OrcaClient:
         ) as resp:
             data = await resp.json()
             if resp.status >= 400:
-                logger.error(f"Swap failed ({resp.status}): {data}")
+                logger.error("swap_failed", status=resp.status, response=str(data)[:200])
             return data
 
 

@@ -8,18 +8,18 @@ These are independent asyncio.Tasks. They do NOT share a timer.
 """
 
 import asyncio
-import logging
 import os
 import time
 from datetime import datetime
 from typing import Callable, Coroutine, Dict, List, Optional
 
+from koi.logging_config import get_logger, bind_context, clear_context
 from koi.schemas import (
     JobTracker, MonitoringStatus, MonitoringTrigger, PlacementConfig,
 )
 from koi.tools.orca_api import OrcaClient
 
-logger = logging.getLogger("koi.monitor")
+logger = get_logger("koi.monitor")
 
 # Thresholds
 WARMUP_MINUTES = float(os.environ.get("KOI_WARMUP_MINUTES", "5.0"))
@@ -87,12 +87,12 @@ class MonitoringLoop:
             tokens_remaining=total_tokens,
         )
         self.tracked_jobs[job_id] = tracker
-        group_str = f", group={group_id}" if group_id else ""
-        logger.info(f"[Monitor] Registered job {job_id} (SLO={slo_deadline_hours}h, {total_tokens:,} tokens{group_str})")
+        logger.info("job_registered", job_id=job_id, slo_hours=slo_deadline_hours,
+                     total_tokens=total_tokens, group_id=group_id)
 
     def unregister_job(self, job_id: str):
         self.tracked_jobs.pop(job_id, None)
-        logger.info(f"[Monitor] Unregistered job {job_id}")
+        logger.info("job_unregistered", job_id=job_id)
 
     def get_group_chains(self, group_id: str) -> Dict[str, JobTracker]:
         """Get all tracked chains that belong to a job group."""
@@ -103,7 +103,7 @@ class MonitoringLoop:
         chains = self.get_group_chains(group_id)
         for jid in chains:
             self.tracked_jobs.pop(jid, None)
-        logger.info(f"[Monitor] Unregistered group {group_id} ({len(chains)} chains)")
+        logger.info("group_unregistered", group_id=group_id, chains=len(chains))
         return list(chains.values())
 
     # ------------------------------------------------------------------
@@ -118,7 +118,7 @@ class MonitoringLoop:
             asyncio.create_task(self._telemetry_loop(), name="telemetry"),
             asyncio.create_task(self._trigger_dispatcher(), name="triggers"),
         ]
-        logger.info(f"[Monitor] Started 2 async loops (telemetry={self.telemetry_interval}s, triggers=event-driven)")
+        logger.info("loops_started", telemetry_interval=self.telemetry_interval)
 
     async def stop(self):
         """Cancel all loops."""
@@ -128,7 +128,7 @@ class MonitoringLoop:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
-        logger.info("[Monitor] Stopped all loops")
+        logger.info("loops_stopped")
 
     # ------------------------------------------------------------------
     # Loop 1: Telemetry polling (10s, pure code, no LLM)
@@ -139,11 +139,18 @@ class MonitoringLoop:
         while self._running:
             try:
                 for job_id in list(self.tracked_jobs.keys()):
-                    await self._poll_job(job_id)
+                    try:
+                        await asyncio.wait_for(self._poll_job(job_id), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        tracker = self.tracked_jobs.get(job_id)
+                        if tracker:
+                            tracker.consecutive_fetch_failures += 1
+                            logger.warning("poll_job_timeout", job_id=job_id,
+                                           failures=tracker.consecutive_fetch_failures)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[Monitor/L1] Telemetry error: {e}")
+                logger.error("telemetry_error", error=str(e))
             # Clean up dead/completed trackers after grace period
             now = time.time()
             for jid in list(self.tracked_jobs.keys()):
@@ -152,7 +159,7 @@ class MonitoringLoop:
                     dead_since = t.last_positive_tps_at or (now - 120)
                     if now - dead_since > 60:
                         self.tracked_jobs.pop(jid, None)
-                        logger.info(f"[Monitor/L1] Cleaned up dead tracker: {jid}")
+                        logger.info("tracker_cleaned_up", job_id=jid)
             await asyncio.sleep(self.telemetry_interval)
 
     async def _poll_job(self, job_id: str):
@@ -180,15 +187,17 @@ class MonitoringLoop:
                         if job_id in self._koi_initiated_kills:
                             tracker.status = MonitoringStatus.COMPLETED  # clean exit
                             self._koi_initiated_kills.discard(job_id)
-                            logger.info(f"[Monitor/L1] {job_id}: intentional kill, cleaning up")
+                            logger.info("intentional_kill_cleanup", job_id=job_id)
                         else:
                             tracker.status = MonitoringStatus.FAILED
-                            logger.warning(f"[Monitor/L1] {job_id}: Orca reports phase={r['phase']}, zeroing TPS")
+                            logger.warning("replica_dead", job_id=job_id, phase=r["phase"])
                             await self._emit_trigger(job_id, MonitoringStatus.FAILED,
                                                      f"Orca reports replica {r['phase']}")
                         return
-            except Exception:
-                pass  # fallback to EMA decay below
+            except Exception as e:
+                tracker.consecutive_fetch_failures += 1
+                logger.warning("replica_check_failed", job_id=job_id, error=str(e),
+                               failures=tracker.consecutive_fetch_failures)
 
         # Fetch metrics from Orca
         try:
@@ -199,8 +208,14 @@ class MonitoringLoop:
                 metrics = await self.orca.get_job_metrics(orca_job_id)
             progress = await self.orca.get_chunk_progress(orca_job_id)
         except Exception as e:
-            logger.warning(f"[Monitor/L1] Failed to fetch metrics for {job_id}: {e}")
+            tracker.consecutive_fetch_failures += 1
+            logger.warning("metrics_fetch_failed", job_id=job_id, error=str(e),
+                           failures=tracker.consecutive_fetch_failures)
             return
+
+        # Metrics fetched successfully — reset failure counter
+        tracker.consecutive_fetch_failures = 0
+        tracker.last_metrics_update = time.time()
 
         # Update throughput with EMA
         tps = metrics.get("avg_generation_throughput_toks_per_s", 0)
@@ -245,7 +260,7 @@ class MonitoringLoop:
         all_done = progress.get("all_done", False)
         if all_done or (total_chunks > 0 and (completed_chunks + failed_chunks) >= total_chunks):
             tracker.status = MonitoringStatus.COMPLETED
-            logger.info(f"[Monitor/L1] {job_id}: all chunks completed, awaiting /job/complete webhook")
+            logger.info("chunks_completed", job_id=job_id)
             return
 
         # Check Orca job status (use parent job_id for grouped chains)
@@ -256,8 +271,10 @@ class MonitoringLoop:
                 await self._emit_trigger(job_id, MonitoringStatus.FAILED,
                                          f"Orca reports status={job_status.get('status')}")
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            tracker.consecutive_fetch_failures += 1
+            logger.warning("job_status_check_failed", job_id=job_id, error=str(e),
+                           failures=tracker.consecutive_fetch_failures)
 
         # Classify status — for grouped chains, use aggregate TPS for SLO check
         if tracker.group_id:
@@ -281,7 +298,7 @@ class MonitoringLoop:
         # Handle warmup transition
         if not tracker.warmup_complete and new_status != MonitoringStatus.WARMING_UP:
             tracker.warmup_complete = True
-            logger.info(f"[Monitor/L1] {job_id}: warmup complete, TPS={tracker.smoothed_tps:.0f}")
+            logger.info("warmup_complete", job_id=job_id, tps=round(tracker.smoothed_tps))
 
         # Emit triggers on state transitions (anti-windup: skip if action in progress)
         if new_status != prev_status:
@@ -289,7 +306,7 @@ class MonitoringLoop:
                       tracker.action_freeze_until and
                       time.time() < tracker.action_freeze_until)
             if frozen:
-                logger.debug(f"[Monitor/L1] {job_id}: anti-windup active, skipping trigger")
+                logger.debug("anti_windup_skip", job_id=job_id)
             elif new_status == MonitoringStatus.FALLING_BEHIND:
                 await self._emit_trigger(job_id, MonitoringStatus.FALLING_BEHIND,
                                          f"Headroom={tracker.slo_headroom_pct:.1f}%, TPS={tracker.smoothed_tps:.0f}")
@@ -307,7 +324,7 @@ class MonitoringLoop:
             key = f"{tracker.group_id}:{status.value}"
             last = self._group_trigger_cooldown.get(key, 0)
             if time.time() - last < 30:
-                logger.debug(f"[Monitor/L1] Dedup: skipping {status.value} for {job_id} (group cooldown)")
+                logger.debug("trigger_dedup", job_id=job_id, status=status.value)
                 return
             self._group_trigger_cooldown[key] = time.time()
         trigger = MonitoringTrigger(
@@ -317,7 +334,7 @@ class MonitoringLoop:
             diagnosis_hint=hint,
         )
         await self._trigger_queue.put(trigger)
-        logger.info(f"[Monitor/L1] Trigger: {status.value} for {job_id} — {hint}")
+        logger.info("trigger_emitted", job_id=job_id, status=status.value, hint=hint)
 
     # ------------------------------------------------------------------
     # Loop 2: Trigger dispatcher (event-driven, fires agent)
@@ -331,20 +348,22 @@ class MonitoringLoop:
                     self._trigger_queue.get(), timeout=5.0
                 )
                 if self.on_trigger:
-                    logger.info(f"[Monitor/L3] Dispatching {trigger.trigger_type.value} for {trigger.job_id}")
+                    logger.info("trigger_dispatching", job_id=trigger.job_id,
+                                trigger_type=trigger.trigger_type.value)
                     try:
                         result = await self.on_trigger(trigger)
-                        logger.info(f"[Monitor/L3] Agent response: {str(result)[:200]}")
+                        logger.info("trigger_handled", job_id=trigger.job_id,
+                                    response=str(result)[:200])
                     except Exception as e:
-                        logger.error(f"[Monitor/L3] Agent handler error: {e}")
+                        logger.error("trigger_handler_error", job_id=trigger.job_id, error=str(e))
                 else:
-                    logger.warning(f"[Monitor/L3] No trigger callback, ignoring: {trigger.trigger_type.value}")
+                    logger.warning("no_trigger_callback", trigger_type=trigger.trigger_type.value)
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[Monitor/L3] Dispatcher error: {e}")
+                logger.error("dispatcher_error", error=str(e))
 
 
 # ---------------------------------------------------------------------------

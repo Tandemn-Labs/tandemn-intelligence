@@ -6,13 +6,15 @@ The agent queries PerfDB, memory, resources, and physics to make placement
 decisions, then launches via Orca and monitors via the monitoring loop.
 """
 
-import logging
+import asyncio
 import os
 import time
 from typing import Any, Dict, List, Optional
 
+import httpx
 from anthropic import AsyncAnthropic, beta_async_tool
 
+from koi.logging_config import get_logger
 from koi.schemas import (
     AgentDecision, DataSource, EngineConfig, JobRequest,
     MonitoringStatus, MonitoringTrigger, PlacementConfig, ResourceMap,
@@ -26,7 +28,10 @@ from koi.tools.physics import (
 )
 from koi.tools.resources import get_resources, parse_orca_resources
 
-logger = logging.getLogger("koi.agent")
+logger = get_logger("koi.agent")
+
+DECIDE_TIMEOUT = float(os.environ.get("KOI_DECIDE_TIMEOUT", "300"))    # 5 min
+TRIGGER_TIMEOUT = float(os.environ.get("KOI_TRIGGER_TIMEOUT", "180"))  # 3 min
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +117,7 @@ class KoiAgent:
         self.monitor = None  # set by server.py after monitor is created
         self._client = AsyncAnthropic(
             api_key=api_key or os.environ.get("ANTHROPIC_API_KEY", ""),
+            timeout=httpx.Timeout(timeout=120.0, connect=5.0),
         )
 
     # ------------------------------------------------------------------
@@ -145,6 +151,7 @@ class KoiAgent:
                        tp=tp, pp=pp, io_ratio_min=io_ratio_min, io_ratio_max=io_ratio_max,
                        sort_by=sort_by, limit=limit,
                        exclude_gpus=exclude_gpus)
+            return result
 
         @beta_async_tool
         async def query_memory_tool(
@@ -289,8 +296,9 @@ class KoiAgent:
                                   if r.get("phase") not in ("dead", "killed", "completed", "failed")]
                         to_kill = active[:abs(count)]
                         monitor._koi_initiated_kills.update(to_kill)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("replica_list_failed_for_scale_down",
+                                       job_id=job_id, error=str(e))
 
                 from koi.tools.orca_api import async_scale_chain
                 result = await async_scale_chain(orca, job_id, gpu_type, tp, pp, count,
@@ -345,9 +353,9 @@ class KoiAgent:
         prompt = self._build_decide_prompt(job_request, resource_map)
         tools = self._build_tools(resource_map=resource_map)
 
-        logger.info(f"[Koi] Agent deciding for {job_request.model_name} ({job_request.job_id})")
+        logger.info("agent_deciding", model=job_request.model_name, job_id=job_request.job_id)
 
-        # Run the agentic loop
+        # Run the agentic loop with wall-clock timeout
         runner = self._client.beta.messages.tool_runner(
             model=self.model,
             max_tokens=4096,
@@ -357,26 +365,17 @@ class KoiAgent:
             max_iterations=10,
         )
 
-        tool_calls = 0
-        final_text = ""
-        last_response = None
-        async for event in runner:
-            # event is a BetaMessage from each iteration
-            if hasattr(event, "content"):
-                last_response = event
-                for block in event.content:
-                    if hasattr(block, "type") and block.type == "tool_use":
-                        tool_calls += 1
-                        logger.info(f"[Koi] Tool call #{tool_calls}: {block.name}")
-
-        # Extract text from the final response
-        if last_response and hasattr(last_response, "content"):
-            for block in last_response.content:
-                if hasattr(block, "text"):
-                    final_text += block.text
+        try:
+            tool_calls, final_text = await asyncio.wait_for(
+                self._consume_runner(runner, "decide"), timeout=DECIDE_TIMEOUT)
+        except asyncio.TimeoutError:
+            elapsed = time.time() - t0
+            logger.error("decide_timeout", model=job_request.model_name,
+                         timeout=DECIDE_TIMEOUT, elapsed_s=round(elapsed, 1))
+            return self._fallback_decision(job_request, resource_map, elapsed)
 
         elapsed = time.time() - t0
-        logger.info(f"[Koi] Agent decided in {elapsed:.1f}s ({tool_calls} tool calls)")
+        logger.info("agent_decided", elapsed_s=round(elapsed, 1), tool_calls=tool_calls)
 
         # Parse the decision from the agent's response
         decision = self._parse_decision(final_text, job_request, resource_map, tool_calls, elapsed)
@@ -406,7 +405,7 @@ class KoiAgent:
         prompt = self._build_trigger_prompt(trigger)
         tools = self._build_tools(monitor=self.monitor)
 
-        logger.info(f"[Koi] Agent handling {trigger.trigger_type.value} for {trigger.job_id}")
+        logger.info("trigger_handling", trigger_type=trigger.trigger_type.value, job_id=trigger.job_id)
 
         runner = self._client.beta.messages.tool_runner(
             model=self.model,
@@ -417,19 +416,79 @@ class KoiAgent:
             max_iterations=5,
         )
 
+        try:
+            _, final_text = await asyncio.wait_for(
+                self._consume_runner(runner, "trigger"), timeout=TRIGGER_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error("trigger_timeout", job_id=trigger.job_id,
+                         trigger_type=trigger.trigger_type.value, timeout=TRIGGER_TIMEOUT)
+            return f"[TIMEOUT] Agent did not respond within {TRIGGER_TIMEOUT}s"
+
+        logger.info("trigger_response", response=final_text[:200])
+        return final_text
+
+    # ------------------------------------------------------------------
+    # Runner helpers
+    # ------------------------------------------------------------------
+
+    async def _consume_runner(self, runner, label: str) -> tuple:
+        """Consume all events from tool_runner. Returns (tool_calls, final_text)."""
+        tool_calls = 0
         final_text = ""
         last_response = None
         async for event in runner:
             if hasattr(event, "content"):
                 last_response = event
-
+                for block in event.content:
+                    if hasattr(block, "type") and block.type == "tool_use":
+                        tool_calls += 1
+                        logger.info("tool_call", label=label, call_number=tool_calls,
+                                    tool=block.name)
         if last_response and hasattr(last_response, "content"):
             for block in last_response.content:
                 if hasattr(block, "text"):
                     final_text += block.text
+        return tool_calls, final_text
 
-        logger.info(f"[Koi] Trigger response: {final_text[:200]}")
-        return final_text
+    def _fallback_decision(self, req: JobRequest, rm: ResourceMap, elapsed: float) -> AgentDecision:
+        """Emergency fallback when agent times out. Picks cheapest SLO-meeting config."""
+        rows = getattr(self, "_last_cost_rows", [])
+        viable = [r for r in rows if r.get("meets_slo")]
+        if viable:
+            best = viable[0]
+            config = PlacementConfig(
+                gpu_type=best["gpu_type"], instance_type=best.get("instance_type", "unknown"),
+                num_gpus=best["tp"] * best["pp"] * best.get("dp", 1),
+                num_instances=max(1, (best["tp"] * best["pp"] * best.get("dp", 1)) // 8),
+                tp=best["tp"], pp=best["pp"], dp=best.get("dp", 1),
+                region=rm.region,
+                engine_config=EngineConfig(
+                    tensor_parallel_size=best["tp"], pipeline_parallel_size=best["pp"]),
+            )
+            return AgentDecision(
+                job_id=req.job_id or "unknown",
+                model_name=req.model_name,
+                config=config,
+                predicted_tps=best.get("tps", 0),
+                predicted_cost_per_hour=best.get("cost_per_hour", 0),
+                predicted_total_cost=best.get("total_cost", 0),
+                reasoning=f"[TIMEOUT FALLBACK] Agent timed out after {elapsed:.0f}s. "
+                          f"Auto-selected cheapest SLO-meeting config.",
+                confidence=0.3,
+                data_source=DataSource.ANALYTICAL,
+                latency_seconds=elapsed,
+            )
+        # Absolute fallback — no viable rows
+        return AgentDecision(
+            job_id=req.job_id or "unknown", model_name=req.model_name,
+            config=PlacementConfig(
+                gpu_type=rm.resources[0].gpu_type if rm.resources else "L40S",
+                instance_type=rm.resources[0].instance_type if rm.resources else "unknown",
+                num_gpus=4, num_instances=1, tp=4, pp=1, dp=1, region=rm.region,
+                engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=1)),
+            predicted_tps=0, reasoning=f"[TIMEOUT FALLBACK] No viable configs. Elapsed {elapsed:.0f}s.",
+            confidence=0.1, data_source=DataSource.ANALYTICAL, latency_seconds=elapsed,
+        )
 
     # ------------------------------------------------------------------
     # Pre-computed cost table

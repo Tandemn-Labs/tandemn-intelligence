@@ -11,26 +11,28 @@ Usage:
   ANTHROPIC_API_KEY=sk-ant-... python -m koi.server
 """
 
-import logging
 import os
 import re
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 import aiohttp
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from koi.agent import KoiAgent
+from koi.logging_config import setup_logging, get_logger, bind_context, clear_context
 from koi.monitor import MonitoringLoop
+from koi.resource_ledger import ResourceLedger
 from koi.schemas import EngineConfig, JobRequest, MonitoringStatus, MonitoringTrigger, PlacementConfig
 from koi.tools.memory import AgenticMemory
 from koi.tools.orca_api import OrcaClient
 from koi.tools.perfdb import PerfDB
 from koi.tools.resources import parse_orca_resources
 
-logger = logging.getLogger("koi.server")
+logger = get_logger("koi.server")
 
 KOI_PORT = int(os.environ.get("KOI_PORT", "8090"))
 
@@ -56,7 +58,8 @@ class JobCompleteRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Init components
+    setup_logging()
+
     perfdb_path = os.environ.get("KOI_PERFDB_PATH", "./perfdb/perfdb_all.csv")
     memory_path = os.environ.get("KOI_MEMORY_PATH", "./data/koi_memory.db")
     orca_url = os.environ.get("ORCA_URL", "")
@@ -66,24 +69,27 @@ async def lifespan(app: FastAPI):
     # PerfDB
     try:
         app.state.perfdb = PerfDB(perfdb_path)
-        logger.info(f"[Koi] PerfDB loaded: {app.state.perfdb.record_count} records, "
-                     f"models={app.state.perfdb.models}, gpus={app.state.perfdb.gpu_types}")
+        logger.info("perfdb_loaded", records=app.state.perfdb.record_count,
+                     models=app.state.perfdb.models, gpus=app.state.perfdb.gpu_types)
     except Exception as e:
-        logger.warning(f"[Koi] PerfDB load failed: {e}. Running without benchmark data.")
+        logger.warning("perfdb_load_failed", error=str(e))
         app.state.perfdb = None
 
     # Memory
     app.state.memory = AgenticMemory(db_path=memory_path)
-    logger.info(f"[Koi] Memory: {app.state.memory.decision_count()} decisions, "
-                f"{app.state.memory.outcome_count()} outcomes")
+    logger.info("memory_loaded", decisions=app.state.memory.decision_count(),
+                outcomes=app.state.memory.outcome_count())
+
+    # Resource ledger (pending GPU reservations)
+    app.state.ledger = ResourceLedger()
 
     # Orca client
     app.state.session = aiohttp.ClientSession()
     app.state.orca = OrcaClient(orca_url, session=app.state.session) if orca_url else None
     if orca_url:
-        logger.info(f"[Koi] Orca client: {orca_url}")
+        logger.info("orca_client_ready", url=orca_url)
     else:
-        logger.info("[Koi] No ORCA_URL set — running without Orca connection")
+        logger.info("orca_not_configured")
 
     # Agent
     app.state.agent = KoiAgent(
@@ -93,27 +99,26 @@ async def lifespan(app: FastAPI):
         api_key=api_key,
         model=model,
     )
-    logger.info(f"[Koi] Agent ready (model={model})")
+    logger.info("agent_ready", model=model)
 
     # Monitor
     app.state.monitor = MonitoringLoop(
         orca=app.state.orca,
         on_trigger=app.state.agent.handle_trigger,
     )
-    app.state.agent.monitor = app.state.monitor  # for anti-windup in scale_chain_tool
+    app.state.agent.monitor = app.state.monitor
     if app.state.orca:
         await app.state.monitor.start()
-        logger.info("[Koi] Monitor started (2 async loops)")
+        logger.info("monitor_started")
     else:
-        logger.info("[Koi] Monitor not started — no Orca connection")
+        logger.info("monitor_not_started", reason="no_orca_connection")
 
     yield
 
-    # Cleanup
     await app.state.monitor.stop()
     if app.state.session and not app.state.session.closed:
         await app.state.session.close()
-    logger.info("[Koi] Shutdown complete")
+    logger.info("shutdown_complete")
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +134,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    rid = uuid.uuid4().hex[:12]
+    bind_context(request_id=rid)
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-Id"] = rid
+        return response
+    finally:
+        clear_context()
 
 
 # ---------------------------------------------------------------------------
@@ -192,17 +209,21 @@ async def decide(req: DecideRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid job_request: {e}")
 
-    # Parse resource map
+    # Parse resource map and subtract pending reservations
     try:
         resource_map = parse_orca_resources(req.resource_map)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    resource_map = app.state.ledger.apply_to_resource_map(resource_map)
 
     # Run agent
+    import asyncio as _asyncio
     try:
         decision = await agent.decide(job_request, resource_map)
+    except _asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Agent decision timed out")
     except Exception as e:
-        logger.error(f"[Koi] Agent error: {e}")
+        logger.error("agent_error", error=str(e))
         raise HTTPException(status_code=500, detail=f"Agent error: {e}")
 
     # Record decision in memory
@@ -225,6 +246,14 @@ async def decide(req: DecideRequest):
         avg_output_tokens=job_request.avg_output_tokens,
         num_requests=job_request.num_requests,
         triggered_by="user",
+    )
+
+    # Reserve GPUs in ledger (pending until /job/started confirms)
+    app.state.ledger.reserve(
+        decision_id=decision_id,
+        gpu_type=decision.config.gpu_type,
+        num_gpus=decision.config.num_gpus,
+        region=resource_map.region,
     )
 
     # NOTE: Do NOT register in monitor here. The job hasn't launched yet.
@@ -257,6 +286,10 @@ async def job_started(req: JobStartedRequest):
     monitor: MonitoringLoop = app.state.monitor
     memory: AgenticMemory = app.state.memory
 
+    # Release pending reservation — Orca confirmed, its next GET /resources reflects it
+    if req.decision_id:
+        app.state.ledger.release(req.decision_id)
+
     # Link scale-up replicas to their pending decision (overrides Orca's original decision_id)
     if hasattr(monitor, '_pending_scale_decision'):
         pending = getattr(monitor, '_pending_scale_decision', None)
@@ -286,8 +319,9 @@ async def job_started(req: JobStartedRequest):
                 parent_decision_id=req.decision_id,
                 market="on_demand",
             )
-            logger.info(f"[Koi] Fallback detected: {req.decision_id} → {actual_decision_id} "
-                       f"({req.gpu_type} TP={req.tp} PP={req.pp})")
+            logger.info("fallback_detected", original_decision=req.decision_id,
+                       actual_decision=actual_decision_id, gpu_type=req.gpu_type,
+                       tp=req.tp, pp=req.pp)
 
     config = PlacementConfig(
         gpu_type=req.gpu_type,
@@ -318,15 +352,14 @@ async def job_started(req: JobStartedRequest):
             if tracker.group_id == req.group_id and tracker.action_in_progress:
                 tracker.action_in_progress = False
                 tracker.action_freeze_until = None
-                logger.info(f"[Koi] Anti-windup unfrozen for {tracker.job_id} (new replica {req.job_id} ready)")
+                logger.info("anti_windup_unfrozen", tracker_job=tracker.job_id, new_replica=req.job_id)
 
     # Update availability prior (success observation)
     market = "on_demand" if req.is_fallback else "spot"
     memory.update_availability(gpu_type=req.gpu_type, region="unknown", market=market, launched=True)
 
-    group_str = f" (group={req.group_id})" if req.group_id else ""
-    fallback_str = " [FALLBACK]" if req.is_fallback else ""
-    logger.info(f"[Koi] Job started: {req.job_id} on {req.gpu_type} TP={req.tp} PP={req.pp}{group_str}{fallback_str}")
+    logger.info("job_started", job_id=req.job_id, gpu_type=req.gpu_type,
+                tp=req.tp, pp=req.pp, group_id=req.group_id, is_fallback=req.is_fallback)
     return {"status": "registered", "job_id": req.job_id, "group_id": req.group_id,
             "decision_id": actual_decision_id}
 
@@ -360,7 +393,7 @@ async def job_complete(req: JobCompleteRequest):
                 slo_met=req.status == "succeeded",
                 slo_headroom_pct=tracker.slo_headroom_pct,
             )
-            logger.info(f"[Koi] Outcome recorded: {outcome_id} for {req.job_id} ({req.status})")
+            logger.info("outcome_recorded", outcome_id=outcome_id, job_id=req.job_id, status=req.status)
 
         monitor.unregister_job(req.job_id)
         return {"status": "recorded", "job_id": req.job_id}
@@ -393,8 +426,8 @@ async def job_complete(req: JobCompleteRequest):
             )
             outcomes_recorded += 1
 
-        logger.info(f"[Koi] Group completed: {req.job_id} — {outcomes_recorded} chain outcomes, "
-                    f"aggregate TPS={total_tps:.0f}, {req.status}")
+        logger.info("group_completed", job_id=req.job_id, outcomes=outcomes_recorded,
+                    aggregate_tps=round(total_tps), status=req.status)
 
         # Unregister all chains in the group
         monitor.unregister_group(req.job_id)
@@ -406,7 +439,7 @@ async def job_complete(req: JobCompleteRequest):
             "aggregate_tps": round(total_tps, 1),
         }
 
-    logger.warning(f"[Koi] Job complete webhook for unknown job: {req.job_id}")
+    logger.warning("job_complete_unknown", job_id=req.job_id)
     return {"status": "unknown_job", "job_id": req.job_id}
 
 
@@ -423,7 +456,7 @@ async def replica_failed(req: ReplicaFailedRequest):
     monitor: MonitoringLoop = app.state.monitor
     tracker = monitor.tracked_jobs.get(req.job_id)
     if not tracker:
-        logger.warning(f"[Koi] Replica-failed for unknown chain: {req.job_id}")
+        logger.warning("replica_failed_unknown", job_id=req.job_id)
         return {"status": "unknown", "job_id": req.job_id}
 
     # Check if this was an intentional kill (from scale_chain_tool)
@@ -433,7 +466,7 @@ async def replica_failed(req: ReplicaFailedRequest):
         tracker.smoothed_tps = 0
         if req.job_id not in tracker.dead_replicas:
             tracker.dead_replicas.append(req.job_id)
-        logger.info(f"[Koi] Intentional kill acknowledged: {req.job_id}")
+        logger.info("intentional_kill_ack", job_id=req.job_id)
         return {"status": "intentional_kill", "job_id": req.job_id}
 
     tracker.status = MonitoringStatus.FAILED
@@ -465,7 +498,8 @@ async def replica_failed(req: ReplicaFailedRequest):
         diagnosis_hint=f"Replica died: {req.reason[:200]}",
     )
     await monitor._trigger_queue.put(trigger)
-    logger.info(f"[Koi] Replica failed: {req.job_id} — {req.reason[:100]}")
+    logger.info("replica_failed", job_id=req.job_id, group_id=req.group_id,
+                reason=req.reason[:100])
     return {"status": "trigger_emitted", "job_id": req.job_id}
 
 
@@ -503,7 +537,8 @@ async def config_attempted(req: ConfigAttemptRequest):
         gpu_type=req.gpu_type, region=req.region, market=req.market, launched=req.launched,
     )
     status = "success" if req.launched else "failed"
-    logger.info(f"[Koi] Config attempt: {req.gpu_type} {req.market} in {req.region} → {status}")
+    logger.info("config_attempt", gpu_type=req.gpu_type, market=req.market,
+                region=req.region, launched=req.launched)
     return {"status": "recorded", "job_id": req.job_id, "launched": req.launched}
 
 
@@ -541,10 +576,12 @@ async def job_launch_failed(req: LaunchFailedRequest):
         )
         memory.update_availability(gpu_type=gpu, region=rgn, market=mkt, launched=False)
 
-    logger.info(
-        f"[Koi] Launch failed for {req.job_id}: "
-        f"{len(req.configs_tried)} configs tried in {req.total_time_seconds:.0f}s, all failed"
-    )
+    logger.info("launch_failed", job_id=req.job_id, configs_tried=len(req.configs_tried),
+                total_time_s=round(req.total_time_seconds))
+
+    # Release pending reservation (never launched)
+    if decision_id:
+        app.state.ledger.release(decision_id)
 
     # Unregister from monitor
     if tracker:
@@ -579,15 +616,22 @@ async def list_jobs():
     return {"tracked_jobs": len(jobs), "jobs": jobs}
 
 
+@app.get("/resources")
+async def get_live_resources():
+    """Live resource map: total, active (from Orca), pending (from ledger), available."""
+    ledger: ResourceLedger = app.state.ledger
+    return {
+        "pending_reservations": ledger.summary(),
+        "pending_gpus": ledger.get_pending_by_type(),
+        "pending_count": ledger.pending_count,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
-    # Configure logging so [Koi] messages show up
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-    )
+    setup_logging()
     uvicorn.run(app, host="0.0.0.0", port=KOI_PORT)
