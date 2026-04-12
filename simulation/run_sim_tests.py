@@ -1412,13 +1412,23 @@ def run_tier4(api_key: str):
                         assert new_rid in tracked_ids, \
                             f"New replica {new_rid} not in tracked jobs: {tracked_ids}"
 
-                    def t_aggregate_tps_improved():
-                        agg_tps = sum(j.get("smoothed_tps", 0) for j in tracked
+                    check("new replica is tracked by Koi monitor", t_new_replica_tracked)
+
+                    # Wait for warmup ramp (new replica needs ~30s to reach full TPS)
+                    agg_tps = 0
+                    for _wait in range(6):  # up to 30s more
+                        time.sleep(5)
+                        jobs2 = requests.get(f"{KOI_URL}/jobs", timeout=5).json()
+                        tracked2 = jobs2.get("jobs", [])
+                        agg_tps = sum(j.get("smoothed_tps", 0) for j in tracked2
                                       if j.get("status") != "failed")
+                        if agg_tps > 1200:
+                            break
+
+                    def t_aggregate_tps_improved():
                         assert agg_tps > 1200, \
                             f"Aggregate TPS {agg_tps:.0f} should be > 1200 (2 replicas)"
 
-                    check("new replica is tracked by Koi monitor", t_new_replica_tracked)
                     check("aggregate TPS improved after scale-up", t_aggregate_tps_improved)
                 else:
                     skip("new replica is tracked by Koi monitor", "mock_orca didn't create a running replica")
