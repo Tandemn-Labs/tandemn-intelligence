@@ -167,6 +167,45 @@ async def _notify_koi_complete(job: SimJob):
         logger.warning(f"[Sim] Failed to notify Koi of completion: {e}")
 
 
+async def _notify_koi_launching(job: SimJob, replica: SimReplica):
+    """POST /job/launching to Koi (replica provisioned, pre-model_ready visibility)."""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(f"{SIM.koi_url}/job/launching", json={
+                "job_id": replica.replica_id,
+                "group_id": job.job_id,
+                "gpu_type": replica.gpu_type,
+                "instance_type": replica.instance_type,
+                "tp": replica.tp,
+                "pp": replica.pp,
+                "region": replica.region,
+                "market": replica.market,
+            }, timeout=5)
+        logger.info(f"[Sim] Notified Koi: replica {replica.replica_id} launching")
+    except Exception as e:
+        logger.warning(f"[Sim] Failed to notify Koi of replica launching: {e}")
+
+
+async def _notify_koi_config_attempted(job: SimJob, replica: SimReplica, launched: bool,
+                                        failure_reason: str = ""):
+    """POST /job/config-attempted to Koi."""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(f"{SIM.koi_url}/job/config-attempted", json={
+                "job_id": job.job_id,
+                "decision_id": job.decision_id,
+                "instance_type": replica.instance_type,
+                "gpu_type": replica.gpu_type,
+                "region": replica.region,
+                "market": replica.market,
+                "launched": launched,
+                "failure_reason": failure_reason,
+                "attempt_index": replica.config_index,
+            }, timeout=5)
+    except Exception:
+        pass
+
+
 async def _notify_koi_replica_started(job: SimJob, replica: SimReplica):
     """POST /job/started to Koi (replica ready)."""
     elapsed_since_deploy = time.time() - job.deploy_timestamp
@@ -185,7 +224,7 @@ async def _notify_koi_replica_started(job: SimJob, replica: SimReplica):
                 "dp": 1,
                 "slo_deadline_hours": adjusted_slo,
                 "total_tokens": total_tokens,
-                "predicted_tps": 0.0,
+                "predicted_tps": replica.base_tps,
                 "is_fallback": replica.config_index > 0,
             }, timeout=5)
             logger.info(f"[Sim] Notified Koi: replica {replica.replica_id} started (resp={resp.status_code})")
@@ -390,15 +429,25 @@ async def scale_job(job_id: str, req: ScaleRequest):
 
 async def _delayed_replica_ready(job: SimJob, replica_ids: List[str], delay: float = 15.0):
     """Simulate provisioning + model loading delay, then mark running and notify Koi."""
-    await asyncio.sleep(delay)
+    # Phase 1: provisioned (fire /job/launching + /job/config-attempted)
+    await asyncio.sleep(3)
     for rid in replica_ids:
         replica = job.replicas.get(rid)
         if replica and replica.phase == "launching":
+            replica.phase = "provisioned"
+            await _notify_koi_launching(job, replica)
+            await _notify_koi_config_attempted(job, replica, launched=True)
+
+    # Phase 2: model loading → running (fire /job/started)
+    await asyncio.sleep(max(0, delay - 3))
+    for rid in replica_ids:
+        replica = job.replicas.get(rid)
+        if replica and replica.phase == "provisioned":
             replica.phase = "running"
             replica.base_tps = 1200.0  # default TPS for new replica
             replica.started_at = time.time()
             replica.last_heartbeat = time.time()
-            logger.info(f"[Sim] Replica {rid} now running (TPS={replica.tps})")
+            logger.info(f"[Sim] Replica {rid} now running (TPS={replica.base_tps})")
             await _notify_koi_replica_started(job, replica)
 
 
@@ -646,12 +695,20 @@ async def init_scenario(
         logger.warning(f"[Sim] Could not reach Koi at {koi_url}/decide: {e}")
         logger.info("[Sim] Continuing without Koi decision — replicas will register without decision_id")
 
-    # Step 2: Simulate launch delay, then notify Koi that replicas are ready
-    await asyncio.sleep(2)
+    # Step 2: Simulate provisioning → notify /job/launching + /job/config-attempted
+    await asyncio.sleep(1)
+    for rid, replica in job.replicas.items():
+        replica.phase = "provisioned"
+        await _notify_koi_launching(job, replica)
+        await _notify_koi_config_attempted(job, replica, launched=True)
+        await asyncio.sleep(0.3)
+
+    # Step 3: Model loaded → notify /job/started
+    await asyncio.sleep(1)
     for rid, replica in job.replicas.items():
         replica.phase = "running"
         await _notify_koi_replica_started(job, replica)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
     logger.info(f"[Sim] All {num_replicas} replicas registered with Koi. Chunks advancing.")
 
