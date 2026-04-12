@@ -62,6 +62,7 @@ class MonitoringLoop:
         self._running = False
         self._group_trigger_cooldown: Dict[str, float] = {}  # "group_id:status" → last_emit_time
         self._koi_initiated_kills: set = set()  # replica IDs killed by scale_chain_tool
+        self._pending_launches: Dict[str, dict] = {}  # replica_id → launch info (pre-model_ready)
 
     # ------------------------------------------------------------------
     # Job registration

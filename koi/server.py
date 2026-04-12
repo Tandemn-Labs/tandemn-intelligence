@@ -13,6 +13,7 @@ Usage:
 
 import os
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
@@ -280,11 +281,45 @@ class JobStartedRequest(BaseModel):
     is_fallback: bool = False           # True if Orca used a fallback config (not primary)
 
 
+class JobLaunchingRequest(BaseModel):
+    job_id: str
+    group_id: Optional[str] = None
+    gpu_type: str = "unknown"
+    instance_type: str = "unknown"
+    tp: int = 1
+    pp: int = 1
+    region: str = "unknown"
+    market: str = "on_demand"
+
+
+@app.post("/job/launching")
+async def job_launching(req: JobLaunchingRequest):
+    """Called by Orca when a replica is provisioned but not yet serving.
+
+    Gives Koi early visibility into GPU spend before model_ready.
+    """
+    monitor: MonitoringLoop = app.state.monitor
+    monitor._pending_launches[req.job_id] = {
+        "group_id": req.group_id,
+        "gpu_type": req.gpu_type,
+        "instance_type": req.instance_type,
+        "tp": req.tp, "pp": req.pp,
+        "region": req.region, "market": req.market,
+        "launched_at": time.time(),
+    }
+    logger.info("job_launching", job_id=req.job_id, group_id=req.group_id,
+                gpu_type=req.gpu_type, instance_type=req.instance_type)
+    return {"status": "tracked", "job_id": req.job_id}
+
+
 @app.post("/job/started")
 async def job_started(req: JobStartedRequest):
     """Called by Orca AFTER a job successfully launches. Registers in monitor."""
     monitor: MonitoringLoop = app.state.monitor
     memory: AgenticMemory = app.state.memory
+
+    # Clear pending launch tracking — replica reached model_ready
+    monitor._pending_launches.pop(req.job_id, None)
 
     # Release pending reservation — Orca confirmed, its next GET /resources reflects it
     if req.decision_id:
@@ -613,7 +648,23 @@ async def list_jobs():
             "tokens_completed": tracker.tokens_completed,
             "tokens_remaining": tracker.tokens_remaining,
         })
-    return {"tracked_jobs": len(jobs), "jobs": jobs}
+    # Include pending launches (provisioned but not yet serving)
+    for job_id, info in monitor._pending_launches.items():
+        if job_id not in monitor.tracked_jobs:  # avoid duplicates
+            jobs.append({
+                "job_id": job_id,
+                "status": "launching",
+                "gpu_type": info.get("gpu_type", "unknown"),
+                "tp": info.get("tp", 1),
+                "pp": info.get("pp", 1),
+                "dp": 1,
+                "smoothed_tps": 0,
+                "slo_headroom_pct": 0,
+                "elapsed_hours": round((time.time() - info.get("launched_at", time.time())) / 3600, 2),
+                "tokens_completed": 0,
+                "tokens_remaining": 0,
+            })
+    return {"tracked_jobs": len(monitor.tracked_jobs), "pending_launches": len(monitor._pending_launches), "jobs": jobs}
 
 
 @app.get("/resources")

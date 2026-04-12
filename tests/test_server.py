@@ -47,6 +47,7 @@ async def client():
     app.state.agent.handle_trigger = AsyncMock(return_value="ok")
     app.state.monitor = MagicMock()
     app.state.monitor.tracked_jobs = {}
+    app.state.monitor._pending_launches = {}
     app.state.monitor.register_job = MagicMock()
     app.state.monitor.get_group_chains = MagicMock(return_value={})
     app.state.monitor.unregister_group = MagicMock(return_value=[])
@@ -186,10 +187,47 @@ class TestClassifyFailure:
         assert _classify_failure("") == "unknown"
 
 
+class TestJobLaunching:
+    @pytest.mark.asyncio
+    async def test_launching_tracked(self, client):
+        """POST /job/launching stores in _pending_launches."""
+        resp = await client.post("/job/launching", json={
+            "job_id": "r0",
+            "group_id": "parent-job",
+            "gpu_type": "L40S",
+            "instance_type": "g6e.12xlarge",
+            "tp": 4, "pp": 1,
+            "region": "us-east-1",
+            "market": "on_demand",
+        })
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "tracked"
+        assert "r0" in app.state.monitor._pending_launches
+
+    @pytest.mark.asyncio
+    async def test_launching_visible_in_jobs(self, client):
+        """Pending launches appear in /jobs with status=launching."""
+        import time
+        app.state.monitor._pending_launches = {
+            "r0": {"group_id": "parent", "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge", "tp": 4, "pp": 1,
+                    "region": "us-east-1", "market": "on_demand",
+                    "launched_at": time.time()},
+        }
+        resp = await client.get("/jobs")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["pending_launches"] == 1
+        launching = [j for j in data["jobs"] if j["status"] == "launching"]
+        assert len(launching) == 1
+        assert launching[0]["gpu_type"] == "L40S"
+
+
 class TestListJobs:
     @pytest.mark.asyncio
     async def test_empty(self, client):
         app.state.monitor.tracked_jobs = {}
+        app.state.monitor._pending_launches = {}
         resp = await client.get("/jobs")
         assert resp.status_code == 200
         assert resp.json()["tracked_jobs"] == 0
