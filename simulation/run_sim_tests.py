@@ -1330,6 +1330,14 @@ def _get_sim_replicas():
     return None, {}, {}
 
 
+def _get_sim_job_state():
+    """Get (group_id, info) for the primary mock_orca job."""
+    state = requests.get(f"{ORCA_URL}/sim/state", timeout=5).json()
+    for job_id, info in state.items():
+        return job_id, info
+    return None, {}
+
+
 def _register_replicas_with_koi(group_id, replica_ids, total_tokens, slo, predicted_tps=1200):
     """Register replicas with Koi via /job/started."""
     for rid in replica_ids:
@@ -1444,6 +1452,8 @@ def run_tier4(api_key: str):
             _register_replicas_with_koi(group_id, running.keys(),
                                         total_tokens=6_000_000, slo=0.15)
             time.sleep(8)  # let monitor poll and compute headroom
+            _, baseline_info = _get_sim_job_state()
+            baseline_agg_tps = baseline_info.get("aggregate_tps", 0)
 
             # Diagnostic: check Koi sees the replica and its headroom
             jobs = requests.get(f"{KOI_URL}/jobs", timeout=5).json()
@@ -1490,7 +1500,9 @@ def run_tier4(api_key: str):
                         break
 
                 if new_rid:
-                    # Register the new replica with Koi
+                    # mock_orca in this harness points at a dummy Koi URL, so
+                    # we must register the scale-up replica with the real Koi
+                    # test server ourselves.
                     print(f"    new replica {new_rid} running, registering with Koi...")
                     post(f"{KOI_URL}/job/started", {
                         "job_id": new_rid, "group_id": group_id,
@@ -1511,20 +1523,21 @@ def run_tier4(api_key: str):
 
                     check("new replica is tracked by Koi monitor", t_new_replica_tracked)
 
-                    # Wait for warmup ramp (new replica needs ~30s to reach full TPS)
+                    # Wait for warmup ramp and measure raw aggregate TPS from mock_orca.
+                    # Koi's /jobs endpoint exposes EMA-smoothed TPS, which is useful
+                    # for control but too laggy for a sharp integration assertion.
                     agg_tps = 0
+                    improvement_target = max(baseline_agg_tps + 400, baseline_agg_tps * 1.5)
                     for _wait in range(6):  # up to 30s more
                         time.sleep(5)
-                        jobs2 = requests.get(f"{KOI_URL}/jobs", timeout=5).json()
-                        tracked2 = jobs2.get("jobs", [])
-                        agg_tps = sum(j.get("smoothed_tps", 0) for j in tracked2
-                                      if j.get("status") != "failed")
-                        if agg_tps > 1200:
+                        _, sim_info = _get_sim_job_state()
+                        agg_tps = sim_info.get("aggregate_tps", 0)
+                        if agg_tps >= improvement_target:
                             break
 
                     def t_aggregate_tps_improved():
-                        assert agg_tps > 1200, \
-                            f"Aggregate TPS {agg_tps:.0f} should be > 1200 (2 replicas)"
+                        assert agg_tps >= improvement_target, \
+                            f"Aggregate TPS {agg_tps:.0f} should materially improve over baseline {baseline_agg_tps:.0f}"
 
                     check("aggregate TPS improved after scale-up", t_aggregate_tps_improved)
                 else:
