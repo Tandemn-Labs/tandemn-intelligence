@@ -345,6 +345,7 @@ async def job_started(req: JobStartedRequest):
                 tp=req.tp, pp=req.pp, dp=req.dp,
                 num_gpus=req.tp * req.pp * req.dp,
                 predicted_tps=0,
+                predicted_cost_per_hour=original.get("predicted_cost_per_hour", 0.0) or 0.0,
                 slo_deadline_hours=req.slo_deadline_hours,
                 objective=original.get("objective", "cheapest"),
                 avg_input_tokens=original.get("avg_input_tokens", 0),

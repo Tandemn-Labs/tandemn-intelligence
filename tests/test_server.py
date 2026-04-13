@@ -373,6 +373,76 @@ class TestJobStarted:
         assert summary["effective_observations"] == 1
         assert summary["availability_pct"] > 50.0
 
+    @pytest.mark.asyncio
+    async def test_started_fallback_creates_child_decision(self, client):
+        """Fallback launches should create a child decision for the actual config."""
+        original_decision_id = app.state.memory.record_decision(
+            job_id="parent-job",
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=6.85,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            num_requests=5000,
+            market="spot",
+        )
+        app.state.ledger.reserve(original_decision_id, "L40S", 4, region="unknown")
+
+        resp = await client.post("/job/started", json={
+            "job_id": "r1",
+            "decision_id": original_decision_id,
+            "group_id": "parent-job",
+            "gpu_type": "A100-80GB",
+            "instance_type": "p4de.24xlarge",
+            "tp": 8,
+            "pp": 1,
+            "dp": 1,
+            "slo_deadline_hours": 8.0,
+            "total_tokens": 8_000_000,
+            "predicted_tps": 0.0,
+            "is_fallback": True,
+        })
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "registered"
+        assert body["decision_id"] != original_decision_id
+        assert app.state.ledger.pending_count == 0
+
+        kwargs = app.state.monitor.register_job.call_args.kwargs
+        assert kwargs["job_id"] == "r1"
+        assert kwargs["decision_id"] == body["decision_id"]
+        assert kwargs["config"].gpu_type == "A100-80GB"
+        assert kwargs["config"].instance_type == "p4de.24xlarge"
+        assert kwargs["config"].tp == 8
+
+        decisions = app.state.memory.query_decisions(model_name="Qwen/Qwen2.5-72B-Instruct")
+        child = next(d for d in decisions if d["decision_id"] == body["decision_id"])
+        assert child["parent_decision_id"] == original_decision_id
+        assert child["triggered_by"] == "fallback"
+        assert child["gpu_type"] == "A100-80GB"
+        assert child["instance_type"] == "p4de.24xlarge"
+        assert child["market"] == "on_demand"
+
+        on_demand = app.state.memory.get_failure_summary(
+            "A100-80GB", region="unknown", market="on_demand",
+        )
+        spot = app.state.memory.get_failure_summary(
+            "A100-80GB", region="unknown", market="spot",
+        )
+        assert on_demand["effective_observations"] == 1
+        assert on_demand["availability_pct"] > 50.0
+        assert spot["effective_observations"] == 0
+        assert spot["availability_pct"] == pytest.approx(50.0)
+
 
 class TestListJobs:
     @pytest.mark.asyncio
