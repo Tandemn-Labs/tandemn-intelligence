@@ -161,6 +161,53 @@ class TestLaunchFailed:
         body = resp.json()
         assert body["attempts_recorded"] == 2
 
+    @pytest.mark.asyncio
+    async def test_releases_ledger_and_unregisters_job(self, client):
+        """All-failed launches should release reservations and unregister the job."""
+        app.state.ledger.reserve("dec-launchfail", "L40S", 8, region="us-east-1")
+        app.state.monitor.tracked_jobs = {
+            "job-fail2": MagicMock(decision_id="dec-launchfail"),
+        }
+        app.state.monitor.unregister_job = MagicMock()
+
+        resp = await client.post("/job/launch-failed", json={
+            "job_id": "job-fail2",
+            "configs_tried": [
+                {
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "region": "us-east-1",
+                    "market": "spot",
+                },
+                {
+                    "gpu_type": "A100-80GB",
+                    "instance_type": "p4de.24xlarge",
+                    "region": "us-west-2",
+                    "market": "on_demand",
+                },
+            ],
+            "failure_reasons": ["InsufficientCapacity", "QuotaExceeded"],
+            "total_time_seconds": 240.0,
+        })
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "recorded"
+        assert body["attempts_recorded"] == 2
+        assert app.state.ledger.pending_count == 0
+        app.state.monitor.unregister_job.assert_called_once_with("job-fail2")
+
+        spot = app.state.memory.get_failure_summary(
+            "L40S", region="us-east-1", market="spot",
+        )
+        on_demand = app.state.memory.get_failure_summary(
+            "A100-80GB", region="us-west-2", market="on_demand",
+        )
+        assert spot["effective_observations"] == 1
+        assert spot["availability_pct"] < 50.0
+        assert on_demand["effective_observations"] == 1
+        assert on_demand["availability_pct"] < 50.0
+
 
 class TestReplicaFailed:
     @pytest.mark.asyncio
