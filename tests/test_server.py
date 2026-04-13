@@ -34,12 +34,15 @@ def _mock_decision(job_id="job-test123"):
 @pytest_asyncio.fixture
 async def client():
     """Set up app state manually to avoid needing real API keys."""
+    import asyncio
+
     memory = AgenticMemory(db_path=":memory:")
 
     app.state.perfdb = MagicMock()
     app.state.perfdb.record_count = 307
     app.state.memory = memory
     app.state.ledger = ResourceLedger()
+    app.state.decide_lock = asyncio.Lock()
     app.state.orca = None
     app.state.agent = MagicMock()
     app.state.agent.model = "claude-sonnet-4-6"
@@ -108,6 +111,69 @@ class TestDecide:
             "resource_map": {"instances": [], "quotas": []},
         })
         assert resp.status_code == 422
+
+
+class TestDecideConcurrency:
+    @pytest.mark.asyncio
+    async def test_parallel_decide_requests_do_not_double_book(self, client):
+        """Concurrent /decide calls should not see the same 8 GPUs as free."""
+        import asyncio
+
+        seen_available = []
+
+        async def decide_once(job_request, resource_map):
+            resource = resource_map.get_resource("L40S")
+            seen_available.append(resource.available_gpus if resource else None)
+            await asyncio.sleep(0.05)
+            if not resource or resource.available_gpus < 8:
+                raise RuntimeError("insufficient adjusted resources")
+            return _mock_decision(job_id=f"job-{len(seen_available)}")
+
+        app.state.agent.decide = decide_once
+
+        payload = {
+            "job_request": {
+                "model_name": "Qwen/Qwen2.5-72B-Instruct",
+                "task_type": "batch",
+                "avg_input_tokens": 953,
+                "avg_output_tokens": 1024,
+                "num_requests": 5000,
+                "slo_deadline_hours": 8.0,
+                "objective": "cheapest",
+            },
+            "resource_map": {
+                "instances": [
+                    {
+                        "instance_type": "g6e.12xlarge",
+                        "gpu_type": "L40S",
+                        "gpus_per_instance": 4,
+                        "vcpus": 48,
+                        "quota_family": "G",
+                        "gpu_memory_gb": 48.0,
+                        "cost_per_instance_hour_usd": 10.49,
+                    },
+                ],
+                "quotas": [
+                    {
+                        "family": "G",
+                        "region": "us-east-1",
+                        "market": "on_demand",
+                        "baseline_vcpus": 96,
+                        "used_vcpus": 0,
+                    },
+                ],
+            },
+        }
+
+        resp1, resp2 = await asyncio.gather(
+            client.post("/decide", json=payload),
+            client.post("/decide", json=payload),
+        )
+
+        status_codes = sorted([resp1.status_code, resp2.status_code])
+        assert status_codes == [200, 500]
+        assert seen_available == [8, 0]
+        assert app.state.ledger.pending_count == 1
 
 
 class TestJobComplete:

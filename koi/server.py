@@ -11,6 +11,7 @@ Usage:
   ANTHROPIC_API_KEY=sk-ant-... python -m koi.server
 """
 
+import asyncio
 import os
 import re
 import time
@@ -83,6 +84,7 @@ async def lifespan(app: FastAPI):
 
     # Resource ledger (pending GPU reservations)
     app.state.ledger = ResourceLedger()
+    app.state.decide_lock = asyncio.Lock()
 
     # Orca client
     app.state.session = aiohttp.ClientSession()
@@ -191,7 +193,6 @@ async def health():
 async def decide(req: DecideRequest):
     """Run the Koi agent to make a placement decision."""
     agent: KoiAgent = app.state.agent
-    monitor: MonitoringLoop = app.state.monitor
 
     # Parse job request
     try:
@@ -215,47 +216,54 @@ async def decide(req: DecideRequest):
         resource_map = parse_orca_resources(req.resource_map)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
-    resource_map = app.state.ledger.apply_to_resource_map(resource_map)
+    decide_lock = getattr(app.state, "decide_lock", None)
+    if decide_lock is None:
+        decide_lock = asyncio.Lock()
+        app.state.decide_lock = decide_lock
 
-    # Run agent
-    import asyncio as _asyncio
-    try:
-        decision = await agent.decide(job_request, resource_map)
-    except _asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Agent decision timed out")
-    except Exception as e:
-        logger.error("agent_error", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Agent error: {e}")
+    # Serialize resource-adjusted decisions so concurrent requests cannot
+    # subtract from the same pre-reservation snapshot and double-book GPUs.
+    async with decide_lock:
+        resource_map = app.state.ledger.apply_to_resource_map(resource_map)
 
-    # Record decision in memory
-    decision_id = app.state.memory.record_decision(
-        job_id=decision.job_id,
-        model_name=decision.model_name,
-        instance_type=decision.config.instance_type,
-        gpu_type=decision.config.gpu_type,
-        tp=decision.config.tp, pp=decision.config.pp, dp=decision.config.dp,
-        num_gpus=decision.config.num_gpus,
-        predicted_tps=decision.predicted_tps,
-        predicted_cost_per_hour=decision.predicted_cost_per_hour,
-        predicted_total_cost=decision.predicted_total_cost,
-        predicted_runtime_hours=decision.predicted_runtime_hours,
-        prediction_confidence=decision.confidence,
-        prediction_source=decision.data_source.value,
-        slo_deadline_hours=job_request.slo_deadline_hours or 0,
-        objective=job_request.objective.value,
-        avg_input_tokens=job_request.avg_input_tokens,
-        avg_output_tokens=job_request.avg_output_tokens,
-        num_requests=job_request.num_requests,
-        triggered_by="user",
-    )
+        # Run agent
+        try:
+            decision = await agent.decide(job_request, resource_map)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Agent decision timed out")
+        except Exception as e:
+            logger.error("agent_error", error=str(e))
+            raise HTTPException(status_code=500, detail=f"Agent error: {e}")
 
-    # Reserve GPUs in ledger (pending until /job/started confirms)
-    app.state.ledger.reserve(
-        decision_id=decision_id,
-        gpu_type=decision.config.gpu_type,
-        num_gpus=decision.config.num_gpus,
-        region=resource_map.region,
-    )
+        # Record decision in memory
+        decision_id = app.state.memory.record_decision(
+            job_id=decision.job_id,
+            model_name=decision.model_name,
+            instance_type=decision.config.instance_type,
+            gpu_type=decision.config.gpu_type,
+            tp=decision.config.tp, pp=decision.config.pp, dp=decision.config.dp,
+            num_gpus=decision.config.num_gpus,
+            predicted_tps=decision.predicted_tps,
+            predicted_cost_per_hour=decision.predicted_cost_per_hour,
+            predicted_total_cost=decision.predicted_total_cost,
+            predicted_runtime_hours=decision.predicted_runtime_hours,
+            prediction_confidence=decision.confidence,
+            prediction_source=decision.data_source.value,
+            slo_deadline_hours=job_request.slo_deadline_hours or 0,
+            objective=job_request.objective.value,
+            avg_input_tokens=job_request.avg_input_tokens,
+            avg_output_tokens=job_request.avg_output_tokens,
+            num_requests=job_request.num_requests,
+            triggered_by="user",
+        )
+
+        # Reserve GPUs in ledger (pending until /job/started confirms)
+        app.state.ledger.reserve(
+            decision_id=decision_id,
+            gpu_type=decision.config.gpu_type,
+            num_gpus=decision.config.num_gpus,
+            region=resource_map.region,
+        )
 
     # NOTE: Do NOT register in monitor here. The job hasn't launched yet.
     # Orca will call POST /job/started after successful launch.
