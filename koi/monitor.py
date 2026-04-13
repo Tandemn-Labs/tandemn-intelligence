@@ -194,6 +194,40 @@ class MonitoringLoop:
         self._tasks = []
         logger.info("loops_stopped")
 
+    def restore_runtime_state(self) -> dict:
+        """Load persisted monitor state from the runtime store."""
+        if not self.runtime_state:
+            return {
+                "tracked_jobs": 0,
+                "pending_launches": 0,
+                "pending_scale_groups": 0,
+            }
+
+        restored_trackers: Dict[str, JobTracker] = {}
+        for job_id, entry in self.runtime_state.load_tracked_jobs().items():
+            tracker = JobTracker.model_validate(entry["tracker"])
+            # Do not preserve in-flight freeze state across process restart.
+            tracker.action_in_progress = False
+            tracker.action_freeze_until = None
+            tracker.consecutive_fetch_failures = 0
+            restored_trackers[job_id] = tracker
+
+        self.tracked_jobs = restored_trackers
+        self._pending_launches = {
+            job_id: entry["launch"]
+            for job_id, entry in self.runtime_state.load_pending_launches().items()
+        }
+        self._pending_scale_decisions = self.runtime_state.load_pending_scale_decisions()
+
+        summary = {
+            "tracked_jobs": len(self.tracked_jobs),
+            "pending_launches": len(self._pending_launches),
+            "pending_scale_groups": len(self._pending_scale_decisions),
+        }
+        if any(summary.values()):
+            logger.info("monitor_restored", **summary)
+        return summary
+
     # ------------------------------------------------------------------
     # Loop 1: Telemetry polling (10s, pure code, no LLM)
     # ------------------------------------------------------------------

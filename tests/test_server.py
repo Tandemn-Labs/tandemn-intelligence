@@ -1,5 +1,6 @@
 """Tests for koi/server.py — FastAPI endpoints."""
 
+import os
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -754,6 +755,88 @@ class TestJobStarted:
 
         assert "parent-job" not in app.state.monitor._pending_scale_decisions
         assert app.state.monitor._pending_scale_decisions["other-job"][0]["decision_id"] == "dec-other"
+
+
+class TestStartupRestore:
+    @pytest.mark.asyncio
+    async def test_lifespan_restores_runtime_state(self, tmp_path):
+        from koi.runtime_state import RuntimeStateStore
+        from koi.server import lifespan
+
+        runtime_path = tmp_path / "runtime.sqlite"
+        memory_path = tmp_path / "memory.sqlite"
+        store = RuntimeStateStore(str(runtime_path))
+
+        tracker = _mock_decision(job_id="restored-job")
+        tracker_state = {
+            "job_id": "restored-job",
+            "decision_id": "dec-restored",
+            "group_id": "grp-restored",
+            "config": tracker.config.model_dump(mode="json"),
+            "slo_deadline_hours": 8.0,
+            "total_tokens": 6000000,
+            "predicted_tps": 833.0,
+            "started_at": "2026-04-13T00:00:00",
+            "tokens_completed": 1000,
+            "tokens_remaining": 5999000,
+            "elapsed_hours": 0.5,
+            "smoothed_tps": 800.0,
+            "projected_eta_hours": 2.0,
+            "slo_headroom_pct": 50.0,
+            "status": "on_track",
+            "warmup_complete": True,
+            "gpu_cache_usage": 0.0,
+            "gpu_sm_util": 0.0,
+            "gpu_mem_bw_util": 0.0,
+            "last_positive_tps_at": None,
+            "action_in_progress": True,
+            "action_freeze_until": 999999.0,
+            "consecutive_fetch_failures": 3,
+            "last_metrics_update": None,
+            "replica_ids": [],
+            "dead_replicas": [],
+        }
+        store.upsert_tracked_job("restored-job", tracker_state)
+        store.upsert_pending_launch("replica-restore", {
+            "group_id": "grp-restored",
+            "gpu_type": "L40S",
+            "instance_type": "g6e.12xlarge",
+            "region": "us-west-2",
+            "market": "spot",
+            "launched_at": 123.4,
+        })
+        store.replace_pending_scale_group("grp-restored", [
+            {"decision_id": "dec-scale", "remaining": 1},
+        ])
+        store.upsert_ledger_reservation(
+            "dec-ledger",
+            {
+                "gpu_type": "L40S",
+                "num_gpus": 4,
+                "cloud": "aws",
+                "region": "us-west-2",
+                "tenant_id": "default",
+                "instance_type": "g6e.12xlarge",
+                "decision_id": "dec-ledger",
+                "created_at": 123.4,
+            },
+            expires_at=9999999999.0,
+        )
+
+        env = {
+            "KOI_TEST_FAKE_DECIDE": "1",
+            "KOI_RUNTIME_STATE_PATH": str(runtime_path),
+            "KOI_MEMORY_PATH": str(memory_path),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            async with lifespan(app):
+                assert "restored-job" in app.state.monitor.tracked_jobs
+                restored = app.state.monitor.tracked_jobs["restored-job"]
+                assert restored.action_in_progress is False
+                assert restored.action_freeze_until is None
+                assert app.state.monitor._pending_launches["replica-restore"]["market"] == "spot"
+                assert app.state.monitor._pending_scale_decisions["grp-restored"][0]["decision_id"] == "dec-scale"
+                assert app.state.ledger.pending_count == 1
 
 
 class TestHappyPath:

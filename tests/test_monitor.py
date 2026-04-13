@@ -282,3 +282,45 @@ class TestMonitoringLoopPersistence:
         assert persisted["smoothed_tps"] == pytest.approx(1000.0)
         assert persisted["tokens_completed"] == 5000
         assert persisted["gpu_cache_usage"] == 25.0
+
+    def test_restore_runtime_state_rebuilds_monitor_and_clears_freeze(self, tmp_path):
+        db_path = str(tmp_path / "runtime.sqlite")
+        store = RuntimeStateStore(db_path)
+
+        tracker = _make_tracker(
+            job_id="job-restore",
+            decision_id="dec-restore",
+            group_id="grp-restore",
+            action_in_progress=True,
+            action_freeze_until=999999.0,
+            warmup_complete=True,
+            smoothed_tps=850.0,
+        )
+        store.upsert_tracked_job("job-restore", tracker.model_dump(mode="json"))
+        store.upsert_pending_launch("replica-restore", {
+            "group_id": "grp-restore",
+            "gpu_type": "L40S",
+            "instance_type": "g6e.12xlarge",
+            "region": "us-west-2",
+            "market": "spot",
+        })
+        store.replace_pending_scale_group("grp-restore", [
+            {"decision_id": "dec-scale", "remaining": 2},
+        ])
+
+        restored = MonitoringLoop(
+            orca=MagicMock(),
+            runtime_state=RuntimeStateStore(db_path),
+        )
+        summary = restored.restore_runtime_state()
+
+        assert summary == {
+            "tracked_jobs": 1,
+            "pending_launches": 1,
+            "pending_scale_groups": 1,
+        }
+        assert "job-restore" in restored.tracked_jobs
+        assert restored.tracked_jobs["job-restore"].action_in_progress is False
+        assert restored.tracked_jobs["job-restore"].action_freeze_until is None
+        assert restored._pending_launches["replica-restore"]["market"] == "spot"
+        assert restored._pending_scale_decisions["grp-restore"][0]["decision_id"] == "dec-scale"

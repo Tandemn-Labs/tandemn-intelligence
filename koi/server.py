@@ -136,6 +136,7 @@ async def lifespan(app: FastAPI):
 
     perfdb_path = os.environ.get("KOI_PERFDB_PATH", "./perfdb/perfdb_all.csv")
     memory_path = os.environ.get("KOI_MEMORY_PATH", "./data/koi_memory.db")
+    runtime_state_path = os.environ.get("KOI_RUNTIME_STATE_PATH", "./data/koi_runtime.db")
     orca_url = os.environ.get("ORCA_URL", "")
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     model = os.environ.get("KOI_LLM_MODEL", "claude-sonnet-4-6")
@@ -155,7 +156,7 @@ async def lifespan(app: FastAPI):
                 outcomes=app.state.memory.outcome_count())
 
     # Resource ledger (pending GPU reservations)
-    app.state.runtime_state = RuntimeStateStore()
+    app.state.runtime_state = RuntimeStateStore(runtime_state_path)
     app.state.ledger = ResourceLedger(runtime_state=app.state.runtime_state)
     app.state.decide_lock = asyncio.Lock()
 
@@ -190,6 +191,17 @@ async def lifespan(app: FastAPI):
         runtime_state=app.state.runtime_state,
     )
     app.state.agent.monitor = app.state.monitor
+
+    restored_ledger = app.state.ledger.restore()
+    restored_monitor = app.state.monitor.restore_runtime_state()
+    logger.info(
+        "runtime_state_restored",
+        ledger_reservations=restored_ledger,
+        tracked_jobs=restored_monitor["tracked_jobs"],
+        pending_launches=restored_monitor["pending_launches"],
+        pending_scale_groups=restored_monitor["pending_scale_groups"],
+    )
+
     if app.state.orca:
         await app.state.monitor.start()
         logger.info("monitor_started")
