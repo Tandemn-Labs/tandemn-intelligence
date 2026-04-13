@@ -311,6 +311,50 @@ class TestJobLaunching:
         assert launching[0]["gpu_type"] == "L40S"
 
 
+class TestConfigAttempted:
+    @pytest.mark.asyncio
+    async def test_config_attempted_separates_spot_and_on_demand_priors(self, client):
+        """Spot failures and on-demand successes should update different priors."""
+        spot_resp = await client.post("/job/config-attempted", json={
+            "job_id": "job-market",
+            "decision_id": "dec-market",
+            "instance_type": "g6e.12xlarge",
+            "gpu_type": "L40S",
+            "region": "us-east-1",
+            "market": "spot",
+            "launched": False,
+            "failure_reason": "InsufficientCapacity",
+            "attempt_index": 0,
+        })
+        assert spot_resp.status_code == 200
+        assert spot_resp.json()["launched"] is False
+
+        on_demand_resp = await client.post("/job/config-attempted", json={
+            "job_id": "job-market",
+            "decision_id": "dec-market",
+            "instance_type": "g6e.12xlarge",
+            "gpu_type": "L40S",
+            "region": "us-east-1",
+            "market": "on_demand",
+            "launched": True,
+            "time_to_launch": 45.0,
+            "attempt_index": 1,
+        })
+        assert on_demand_resp.status_code == 200
+        assert on_demand_resp.json()["launched"] is True
+
+        spot = app.state.memory.get_failure_summary(
+            "L40S", region="us-east-1", market="spot",
+        )
+        on_demand = app.state.memory.get_failure_summary(
+            "L40S", region="us-east-1", market="on_demand",
+        )
+        assert spot["effective_observations"] == 1
+        assert spot["availability_pct"] < 50.0
+        assert on_demand["effective_observations"] == 1
+        assert on_demand["availability_pct"] > 50.0
+
+
 class TestJobStarted:
     @pytest.mark.asyncio
     async def test_started_clears_pending_and_registers_job(self, client):
