@@ -535,6 +535,95 @@ class TestJobStarted:
         assert spot["availability_pct"] == pytest.approx(50.0)
 
 
+class TestHappyPath:
+    @pytest.mark.asyncio
+    async def test_decide_started_complete_flow(self, client):
+        """Decision, start, and complete should preserve one clean learning record."""
+        def register_job_side_effect(**kwargs):
+            app.state.monitor.tracked_jobs[kwargs["job_id"]] = MagicMock(
+                decision_id=kwargs["decision_id"],
+                group_id=None,
+                elapsed_hours=2.5,
+                slo_headroom_pct=70.0,
+            )
+
+        app.state.monitor.register_job.side_effect = register_job_side_effect
+
+        decide_resp = await client.post("/decide", json={
+            "job_request": {
+                "model_name": "Qwen/Qwen2.5-72B-Instruct",
+                "task_type": "batch",
+                "avg_input_tokens": 953,
+                "avg_output_tokens": 1024,
+                "num_requests": 5000,
+                "slo_deadline_hours": 8.0,
+                "objective": "cheapest",
+            },
+            "resource_map": {
+                "instances": [
+                    {
+                        "instance_type": "g6e.12xlarge",
+                        "gpu_type": "L40S",
+                        "gpus_per_instance": 4,
+                        "vcpus": 48,
+                        "quota_family": "G",
+                        "gpu_memory_gb": 48.0,
+                        "cost_per_instance_hour_usd": 10.49,
+                    },
+                ],
+                "quotas": [
+                    {
+                        "family": "G",
+                        "region": "us-east-1",
+                        "market": "on_demand",
+                        "baseline_vcpus": 192,
+                        "used_vcpus": 0,
+                    },
+                ],
+            },
+        })
+        assert decide_resp.status_code == 200
+        decide_body = decide_resp.json()
+        decision_id = decide_body["_decision_id"]
+        assert app.state.ledger.pending_count == 1
+        assert app.state.memory.decision_count() == 1
+
+        started_resp = await client.post("/job/started", json={
+            "job_id": decide_body["job_id"],
+            "decision_id": decision_id,
+            "gpu_type": decide_body["config"]["gpu_type"],
+            "instance_type": decide_body["config"]["instance_type"],
+            "tp": decide_body["config"]["tp"],
+            "pp": decide_body["config"]["pp"],
+            "dp": decide_body["config"]["dp"],
+            "slo_deadline_hours": 8.0,
+            "total_tokens": 6_000_000,
+            "predicted_tps": decide_body["predicted_tps"],
+        })
+        assert started_resp.status_code == 200
+        assert started_resp.json()["decision_id"] == decision_id
+        assert app.state.ledger.pending_count == 0
+        assert decide_body["job_id"] in app.state.monitor.tracked_jobs
+
+        complete_resp = await client.post("/job/complete", json={
+            "job_id": decide_body["job_id"],
+            "status": "succeeded",
+            "metrics": {
+                "avg_generation_throughput_toks_per_s": 1500.0,
+                "cost_per_hour": 10.49,
+            },
+        })
+        assert complete_resp.status_code == 200
+        assert complete_resp.json()["status"] == "recorded"
+        assert app.state.memory.outcome_count() == 1
+
+        outcomes = app.state.memory.query_outcomes(status="succeeded")
+        assert len(outcomes) == 1
+        assert outcomes[0]["decision_id"] == decision_id
+        assert outcomes[0]["actual_tps"] == 1500.0
+        assert outcomes[0]["actual_cost_per_hour"] == 10.49
+
+
 class TestListJobs:
     @pytest.mark.asyncio
     async def test_empty(self, client):
