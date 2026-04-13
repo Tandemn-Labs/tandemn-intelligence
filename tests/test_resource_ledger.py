@@ -1,5 +1,6 @@
 """Tests for koi/resource_ledger.py."""
 
+import time
 from datetime import datetime
 
 from koi.resource_ledger import ResourceLedger
@@ -100,3 +101,33 @@ def test_restore_drops_expired_persisted_reservations(tmp_path):
     assert ledger.restore() == 0
     assert ledger.pending_count == 0
     assert RuntimeStateStore(str(db_path)).load_ledger_reservations() == {}
+
+
+def test_touch_extends_lease_and_persists_refresh_time(tmp_path):
+    db_path = tmp_path / "runtime.sqlite"
+
+    store1 = RuntimeStateStore(str(db_path))
+    ledger1 = ResourceLedger(runtime_state=store1, pending_ttl=0.10)
+    ledger1.reserve(
+        "dec-touch",
+        "L40S",
+        4,
+        region="us-west-2",
+        cloud="aws",
+        instance_type="g6e.12xlarge",
+    )
+    time.sleep(0.03)
+    assert ledger1.touch("dec-touch") is True
+
+    persisted = RuntimeStateStore(str(db_path)).load_ledger_reservations()["dec-touch"]
+    assert persisted["reservation"]["last_refresh_at"] >= persisted["reservation"]["created_at"]
+    assert persisted["expires_at"] >= persisted["reservation"]["last_refresh_at"]
+
+    time.sleep(0.03)
+    store2 = RuntimeStateStore(str(db_path))
+    ledger2 = ResourceLedger(runtime_state=store2, pending_ttl=0.10)
+    assert ledger2.restore() == 1
+    assert ledger2.pending_count == 1
+
+    time.sleep(0.11)
+    assert ledger2.pending_count == 0

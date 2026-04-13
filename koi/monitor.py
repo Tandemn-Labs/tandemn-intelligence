@@ -134,9 +134,12 @@ class MonitoringLoop:
                 self.persist_job(tracker_job_id)
 
     def track_pending_launch(self, job_id: str, launch_info: dict) -> None:
-        self._pending_launches[job_id] = launch_info
+        merged = dict(self._pending_launches.get(job_id, {}))
+        merged.update(launch_info)
+        merged.setdefault("launched_at", time.time())
+        self._pending_launches[job_id] = merged
         if self.runtime_state:
-            self.runtime_state.upsert_pending_launch(job_id, launch_info)
+            self.runtime_state.upsert_pending_launch(job_id, merged)
 
     def get_pending_launch(self, job_id: str) -> dict:
         return self._pending_launches.get(job_id, {})
@@ -146,6 +149,18 @@ class MonitoringLoop:
         if launch and self.runtime_state:
             self.runtime_state.delete_pending_launch(job_id)
         return launch
+
+    def clear_pending_launches_for_group(self, group_id: str) -> int:
+        removed_job_ids = [
+            job_id
+            for job_id, launch in self._pending_launches.items()
+            if launch.get("group_id") == group_id
+        ]
+        for job_id in removed_job_ids:
+            self._pending_launches.pop(job_id, None)
+            if self.runtime_state:
+                self.runtime_state.delete_pending_launch(job_id)
+        return len(removed_job_ids)
 
     def enqueue_pending_scale_decision(self, group_id: str, decision: dict) -> None:
         queue = self._pending_scale_decisions.setdefault(group_id, [])

@@ -9,6 +9,7 @@ Keyed by (cloud, region, gpu_type) for multi-cloud readiness.
 Carries tenant_id for multi-tenant readiness.
 """
 
+import os
 import threading
 import time
 from dataclasses import asdict
@@ -20,7 +21,7 @@ from koi.runtime_state import RuntimeStateStore
 
 logger = get_logger("koi.resource_ledger")
 
-PENDING_TTL_SECONDS = 600.0  # 10 min — auto-expire if Orca never confirms
+PENDING_TTL_SECONDS = float(os.environ.get("KOI_PENDING_TTL_SECONDS", "600"))  # auto-expire if Orca never confirms
 
 
 @dataclass
@@ -33,6 +34,7 @@ class GPUAllocation:
     instance_type: str = "unknown"
     decision_id: str = ""
     created_at: float = field(default_factory=time.time)
+    last_refresh_at: float = field(default_factory=time.time)
 
 
 class ResourceLedger:
@@ -74,7 +76,7 @@ class ResourceLedger:
                 self._runtime_state.upsert_ledger_reservation(
                     decision_id=decision_id,
                     reservation=asdict(alloc),
-                    expires_at=alloc.created_at + self._ttl,
+                    expires_at=alloc.last_refresh_at + self._ttl,
                 )
         logger.info("gpu_reserved", decision_id=decision_id, gpu_type=gpu_type,
                      num_gpus=num_gpus, region=region)
@@ -89,6 +91,24 @@ class ResourceLedger:
             logger.info("gpu_released", decision_id=decision_id, gpu_type=alloc.gpu_type,
                          num_gpus=alloc.num_gpus)
         return alloc
+
+    def touch(self, decision_id: str) -> bool:
+        """Refresh a pending reservation while Orca is still launching."""
+        with self._lock:
+            self._expire_stale()
+            alloc = self._pending.get(decision_id)
+            if not alloc:
+                return False
+            alloc.last_refresh_at = time.time()
+            if self._runtime_state:
+                self._runtime_state.upsert_ledger_reservation(
+                    decision_id=decision_id,
+                    reservation=asdict(alloc),
+                    expires_at=alloc.last_refresh_at + self._ttl,
+                )
+        logger.info("gpu_lease_refreshed", decision_id=decision_id, gpu_type=alloc.gpu_type,
+                    num_gpus=alloc.num_gpus, region=alloc.region)
+        return True
 
     def restore(self) -> int:
         """Rebuild pending reservations from persistent runtime state."""
@@ -167,6 +187,7 @@ class ResourceLedger:
                     "region": alloc.region,
                     "tenant_id": alloc.tenant_id,
                     "age_seconds": round(time.time() - alloc.created_at),
+                    "last_refresh_age_seconds": round(time.time() - alloc.last_refresh_at),
                 }
                 for alloc in self._pending.values()
             ]
@@ -174,15 +195,18 @@ class ResourceLedger:
     @property
     def pending_count(self) -> int:
         with self._lock:
+            self._expire_stale()
             return len(self._pending)
 
     def _expire_stale(self):
         """Remove pending reservations older than TTL. Must hold lock."""
         cutoff = time.time() - self._ttl
-        expired = [k for k, v in self._pending.items() if v.created_at < cutoff]
+        expired = [k for k, v in self._pending.items() if v.last_refresh_at < cutoff]
         for k in expired:
             alloc = self._pending.pop(k)
             if self._runtime_state:
                 self._runtime_state.delete_ledger_reservation(k)
             logger.warning("pending_expired", decision_id=k, gpu_type=alloc.gpu_type,
-                           num_gpus=alloc.num_gpus, age_seconds=round(time.time() - alloc.created_at))
+                           num_gpus=alloc.num_gpus,
+                           age_seconds=round(time.time() - alloc.created_at),
+                           last_refresh_age_seconds=round(time.time() - alloc.last_refresh_at))

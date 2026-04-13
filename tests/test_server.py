@@ -56,13 +56,25 @@ async def client():
     monitor._pending_scale_decisions = {}
 
     def _track_pending_launch(job_id, launch_info):
-        monitor._pending_launches[job_id] = launch_info
+        merged = dict(monitor._pending_launches.get(job_id, {}))
+        merged.update(launch_info)
+        monitor._pending_launches[job_id] = merged
 
     def _get_pending_launch(job_id):
         return monitor._pending_launches.get(job_id, {})
 
     def _clear_pending_launch(job_id):
         return monitor._pending_launches.pop(job_id, None)
+
+    def _clear_pending_launches_for_group(group_id):
+        removed = [
+            job_id
+            for job_id, launch in list(monitor._pending_launches.items())
+            if launch.get("group_id") == group_id
+        ]
+        for job_id in removed:
+            monitor._pending_launches.pop(job_id, None)
+        return len(removed)
 
     def _consume_pending_scale_decision(group_id):
         queue = monitor._pending_scale_decisions.get(group_id, [])
@@ -79,6 +91,7 @@ async def client():
     monitor.track_pending_launch = MagicMock(side_effect=_track_pending_launch)
     monitor.get_pending_launch = MagicMock(side_effect=_get_pending_launch)
     monitor.clear_pending_launch = MagicMock(side_effect=_clear_pending_launch)
+    monitor.clear_pending_launches_for_group = MagicMock(side_effect=_clear_pending_launches_for_group)
     monitor.consume_pending_scale_decision = MagicMock(side_effect=_consume_pending_scale_decision)
     monitor.persist_job = MagicMock()
     monitor.register_job = MagicMock()
@@ -344,6 +357,47 @@ class TestLaunchFailed:
         assert resp.json()["attempts_recorded"] == 1
         assert app.state.ledger.pending_count == 0
 
+    @pytest.mark.asyncio
+    async def test_clears_pending_launches_for_group(self, client):
+        """All-failed chunked launches should clear any pending launch rows for the group."""
+        app.state.monitor._pending_launches = {
+            "replica-r0": {
+                "group_id": "job-fail-group",
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+            },
+            "replica-r1": {
+                "group_id": "job-fail-group",
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+            },
+            "replica-other": {
+                "group_id": "other-job",
+                "gpu_type": "A100-80GB",
+                "instance_type": "p4de.24xlarge",
+            },
+        }
+
+        resp = await client.post("/job/launch-failed", json={
+            "job_id": "job-fail-group",
+            "configs_tried": [
+                {
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "region": "us-east-1",
+                    "market": "spot",
+                },
+            ],
+            "failure_reasons": ["InsufficientCapacity"],
+            "total_time_seconds": 45.0,
+        })
+
+        assert resp.status_code == 200
+        assert "replica-r0" not in app.state.monitor._pending_launches
+        assert "replica-r1" not in app.state.monitor._pending_launches
+        assert "replica-other" in app.state.monitor._pending_launches
+        app.state.monitor.clear_pending_launches_for_group.assert_called_once_with("job-fail-group")
+
 
 class TestReplicaFailed:
     @pytest.mark.asyncio
@@ -525,6 +579,7 @@ class TestJobLaunching:
         """POST /job/launching stores in _pending_launches."""
         resp = await client.post("/job/launching", json={
             "job_id": "r0",
+            "decision_id": "dec-r0",
             "group_id": "parent-job",
             "gpu_type": "L40S",
             "instance_type": "g6e.12xlarge",
@@ -535,6 +590,10 @@ class TestJobLaunching:
         assert resp.status_code == 200
         assert resp.json()["status"] == "tracked"
         assert "r0" in app.state.monitor._pending_launches
+        launch = app.state.monitor._pending_launches["r0"]
+        assert launch["decision_id"] == "dec-r0"
+        assert launch["launch_phase"] == "waiting_model_ready"
+        assert launch["launch_message"] == "Replica provisioned, waiting for model_ready"
 
     @pytest.mark.asyncio
     async def test_launching_visible_in_jobs(self, client):
@@ -544,7 +603,11 @@ class TestJobLaunching:
             "r0": {"group_id": "parent", "gpu_type": "L40S",
                     "instance_type": "g6e.12xlarge", "tp": 4, "pp": 1,
                     "region": "us-east-1", "market": "on_demand",
-                    "launched_at": time.time()},
+                    "launch_phase": "provisioning",
+                    "launch_message": "Still provisioning",
+                    "attempt_index": 1,
+                    "launched_at": time.time(),
+                    "last_heartbeat_at": time.time()},
         }
         resp = await client.get("/jobs")
         assert resp.status_code == 200
@@ -553,6 +616,55 @@ class TestJobLaunching:
         launching = [j for j in data["jobs"] if j["status"] == "launching"]
         assert len(launching) == 1
         assert launching[0]["gpu_type"] == "L40S"
+        assert launching[0]["launch_phase"] == "provisioning"
+        assert launching[0]["launch_message"] == "Still provisioning"
+        assert launching[0]["attempt_index"] == 1
+
+    @pytest.mark.asyncio
+    async def test_launch_heartbeat_refreshes_lease_and_phase(self, client):
+        """Heartbeats should refresh the reservation lease and merge launch progress."""
+        app.state.ledger.reserve("dec-heartbeat", "L40S", 4, region="us-east-1")
+        app.state.ledger.touch = MagicMock(return_value=True)
+        app.state.monitor._pending_launches = {
+            "r-heartbeat": {
+                "group_id": "parent-job",
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+                "tp": 4,
+                "pp": 1,
+                "region": "us-east-1",
+                "market": "spot",
+                "launched_at": 123.0,
+            },
+        }
+
+        resp = await client.post("/job/launch-heartbeat", json={
+            "job_id": "r-heartbeat",
+            "decision_id": "dec-heartbeat",
+            "group_id": "parent-job",
+            "gpu_type": "L40S",
+            "instance_type": "g6e.12xlarge",
+            "tp": 4,
+            "pp": 1,
+            "region": "us-east-1",
+            "market": "spot",
+            "attempt_index": 2,
+            "phase": "provisioning",
+            "message": "still searching for capacity",
+            "timestamp": 456.0,
+        })
+
+        assert resp.status_code == 200
+        assert resp.json()["lease_refreshed"] is True
+        app.state.ledger.touch.assert_called_once_with("dec-heartbeat")
+
+        launch = app.state.monitor._pending_launches["r-heartbeat"]
+        assert launch["decision_id"] == "dec-heartbeat"
+        assert launch["launch_phase"] == "provisioning"
+        assert launch["launch_message"] == "still searching for capacity"
+        assert launch["attempt_index"] == 2
+        assert launch["last_heartbeat_at"] == 456.0
+        assert launch["launched_at"] == 123.0
 
 
 class TestConfigAttempted:

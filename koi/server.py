@@ -386,6 +386,7 @@ class JobStartedRequest(BaseModel):
 
 class JobLaunchingRequest(BaseModel):
     job_id: str
+    decision_id: Optional[str] = None
     group_id: Optional[str] = None
     gpu_type: str = "unknown"
     instance_type: str = "unknown"
@@ -393,6 +394,23 @@ class JobLaunchingRequest(BaseModel):
     pp: int = 1
     region: str = "unknown"
     market: str = "on_demand"
+    attempt_index: int = 0
+
+
+class JobLaunchHeartbeatRequest(BaseModel):
+    job_id: str
+    decision_id: Optional[str] = None
+    group_id: Optional[str] = None
+    gpu_type: str = "unknown"
+    instance_type: str = "unknown"
+    tp: int = 1
+    pp: int = 1
+    region: str = "unknown"
+    market: str = "on_demand"
+    attempt_index: int = 0
+    phase: str
+    message: str = ""
+    timestamp: Optional[float] = None
 
 
 @app.post("/job/launching")
@@ -402,17 +420,52 @@ async def job_launching(req: JobLaunchingRequest):
     Gives Koi early visibility into GPU spend before model_ready.
     """
     monitor: MonitoringLoop = app.state.monitor
+    now = time.time()
+    if req.decision_id:
+        app.state.ledger.touch(req.decision_id)
     monitor.track_pending_launch(req.job_id, {
+        "decision_id": req.decision_id,
         "group_id": req.group_id,
         "gpu_type": req.gpu_type,
         "instance_type": req.instance_type,
         "tp": req.tp, "pp": req.pp,
         "region": req.region, "market": req.market,
-        "launched_at": time.time(),
+        "attempt_index": req.attempt_index,
+        "launch_phase": "waiting_model_ready",
+        "launch_message": "Replica provisioned, waiting for model_ready",
+        "launched_at": now,
+        "last_heartbeat_at": now,
     })
     logger.info("job_launching", job_id=req.job_id, group_id=req.group_id,
                 gpu_type=req.gpu_type, instance_type=req.instance_type)
     return {"status": "tracked", "job_id": req.job_id}
+
+
+@app.post("/job/launch-heartbeat")
+async def job_launch_heartbeat(req: JobLaunchHeartbeatRequest):
+    """Called by Orca while a replica is still searching/provisioning/bootstrapping."""
+    monitor: MonitoringLoop = app.state.monitor
+    heartbeat_at = req.timestamp or time.time()
+    refreshed = False
+    if req.decision_id:
+        refreshed = app.state.ledger.touch(req.decision_id)
+    monitor.track_pending_launch(req.job_id, {
+        "decision_id": req.decision_id,
+        "group_id": req.group_id,
+        "gpu_type": req.gpu_type,
+        "instance_type": req.instance_type,
+        "tp": req.tp,
+        "pp": req.pp,
+        "region": req.region,
+        "market": req.market,
+        "attempt_index": req.attempt_index,
+        "launch_phase": req.phase,
+        "launch_message": req.message,
+        "last_heartbeat_at": heartbeat_at,
+    })
+    logger.info("job_launch_heartbeat", job_id=req.job_id, group_id=req.group_id,
+                phase=req.phase, attempt_index=req.attempt_index, refreshed=refreshed)
+    return {"status": "tracked", "job_id": req.job_id, "lease_refreshed": refreshed}
 
 
 @app.post("/job/started")
@@ -757,6 +810,10 @@ async def job_launch_failed(req: LaunchFailedRequest):
     if decision_id:
         app.state.ledger.release(decision_id)
 
+    monitor.clear_pending_launch(req.job_id)
+    if hasattr(monitor, "clear_pending_launches_for_group"):
+        monitor.clear_pending_launches_for_group(req.job_id)
+
     # Unregister from monitor
     if tracker:
         monitor.unregister_job(req.job_id)
@@ -790,9 +847,13 @@ async def list_jobs():
     # Include pending launches (provisioned but not yet serving)
     for job_id, info in monitor._pending_launches.items():
         if job_id not in monitor.tracked_jobs:  # avoid duplicates
+            last_heartbeat_at = info.get("last_heartbeat_at", info.get("launched_at", time.time()))
             jobs.append({
                 "job_id": job_id,
                 "status": "launching",
+                "launch_phase": info.get("launch_phase", "launching"),
+                "launch_message": info.get("launch_message", ""),
+                "attempt_index": info.get("attempt_index", 0),
                 "gpu_type": info.get("gpu_type", "unknown"),
                 "tp": info.get("tp", 1),
                 "pp": info.get("pp", 1),
@@ -800,6 +861,7 @@ async def list_jobs():
                 "smoothed_tps": 0,
                 "slo_headroom_pct": 0,
                 "elapsed_hours": round((time.time() - info.get("launched_at", time.time())) / 3600, 2),
+                "last_heartbeat_seconds_ago": round(time.time() - last_heartbeat_at, 1),
                 "tokens_completed": 0,
                 "tokens_remaining": 0,
             })
