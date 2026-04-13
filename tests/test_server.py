@@ -690,6 +690,124 @@ class TestHappyPath:
         assert outcomes[0]["actual_cost_per_hour"] == 10.49
 
 
+class TestGroupedCompletion:
+    @pytest.mark.asyncio
+    async def test_group_complete_records_per_chain_outcomes(self, client):
+        """Grouped completion should record one clean outcome per live chain."""
+        from koi.schemas import JobTracker
+
+        dec1 = app.state.memory.record_decision(
+            job_id="parent-job",
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1100.0,
+            predicted_cost_per_hour=6.85,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+        )
+        dec2 = app.state.memory.record_decision(
+            job_id="parent-job",
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1150.0,
+            predicted_cost_per_hour=6.85,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+        )
+
+        tracker1 = JobTracker(
+            job_id="r0",
+            config=PlacementConfig(
+                gpu_type="L40S",
+                instance_type="g6e.12xlarge",
+                num_gpus=4,
+                num_instances=1,
+                tp=4,
+                pp=1,
+                dp=1,
+                region="us-east-1",
+                engine_config=EngineConfig(
+                    tensor_parallel_size=4,
+                    pipeline_parallel_size=1,
+                ),
+            ),
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
+            predicted_tps=1100.0,
+        )
+        tracker1.decision_id = dec1
+        tracker1.group_id = "parent-job"
+        tracker1.smoothed_tps = 1200.0
+        tracker1.elapsed_hours = 2.0
+        tracker1.slo_headroom_pct = 35.0
+
+        tracker2 = JobTracker(
+            job_id="r1",
+            config=PlacementConfig(
+                gpu_type="L40S",
+                instance_type="g6e.12xlarge",
+                num_gpus=4,
+                num_instances=1,
+                tp=4,
+                pp=1,
+                dp=1,
+                region="us-east-1",
+                engine_config=EngineConfig(
+                    tensor_parallel_size=4,
+                    pipeline_parallel_size=1,
+                ),
+            ),
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
+            predicted_tps=1150.0,
+        )
+        tracker2.decision_id = dec2
+        tracker2.group_id = "parent-job"
+        tracker2.smoothed_tps = 1400.0
+        tracker2.elapsed_hours = 2.5
+        tracker2.slo_headroom_pct = 42.0
+
+        app.state.monitor.get_group_chains = MagicMock(return_value={
+            "r0": tracker1,
+            "r1": tracker2,
+        })
+        app.state.monitor.unregister_group = MagicMock(return_value=["r0", "r1"])
+
+        resp = await client.post("/job/complete", json={
+            "job_id": "parent-job",
+            "status": "succeeded",
+            "metrics": {"throughput_tokens_per_sec": 2600.0},
+        })
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "recorded"
+        assert body["chains_closed"] == 2
+        assert body["outcomes_recorded"] == 2
+        assert body["aggregate_tps"] == 2600.0
+        app.state.monitor.unregister_group.assert_called_once_with("parent-job")
+
+        outcomes = app.state.memory.query_outcomes(status="succeeded")
+        group_outcomes = [o for o in outcomes if o["job_id"] == "parent-job"]
+        assert len(group_outcomes) == 2
+        assert {o["decision_id"] for o in group_outcomes} == {dec1, dec2}
+        assert {o["actual_tps"] for o in group_outcomes} == {1200.0, 1400.0}
+
+
 class TestListJobs:
     @pytest.mark.asyncio
     async def test_empty(self, client):
