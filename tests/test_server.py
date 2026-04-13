@@ -5,6 +5,7 @@ import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from httpx import AsyncClient, ASGITransport
+from contextlib import asynccontextmanager
 
 from koi.schemas import (
     AgentDecision, PlacementConfig, EngineConfig, DataSource, MonitoringStatus,
@@ -89,6 +90,16 @@ async def client():
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+
+@asynccontextmanager
+async def _lifespan_client():
+    from koi.server import lifespan
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with lifespan(app):
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            yield c
 
 
 class TestHealth:
@@ -837,6 +848,146 @@ class TestStartupRestore:
                 assert app.state.monitor._pending_launches["replica-restore"]["market"] == "spot"
                 assert app.state.monitor._pending_scale_decisions["grp-restored"][0]["decision_id"] == "dec-scale"
                 assert app.state.ledger.pending_count == 1
+
+
+class TestRestartPersistenceFlows:
+    @pytest.mark.asyncio
+    async def test_decide_launching_started_state_survives_restarts(self, tmp_path):
+        runtime_path = tmp_path / "runtime.sqlite"
+        memory_path = tmp_path / "memory.sqlite"
+        env = {
+            "KOI_TEST_FAKE_DECIDE": "1",
+            "KOI_RUNTIME_STATE_PATH": str(runtime_path),
+            "KOI_MEMORY_PATH": str(memory_path),
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            async with _lifespan_client() as c1:
+                decide_resp = await c1.post("/decide", json={
+                    "job_request": {
+                        "model_name": "Qwen/Qwen2.5-72B-Instruct",
+                        "task_type": "batch",
+                        "avg_input_tokens": 953,
+                        "avg_output_tokens": 1024,
+                        "num_requests": 5000,
+                        "slo_deadline_hours": 8.0,
+                        "objective": "cheapest",
+                    },
+                    "resource_map": {
+                        "instances": [
+                            {
+                                "instance_type": "g6e.12xlarge",
+                                "gpu_type": "L40S",
+                                "gpus_per_instance": 4,
+                                "vcpus": 48,
+                                "quota_family": "G",
+                                "gpu_memory_gb": 48.0,
+                                "cost_per_instance_hour_usd": 10.49,
+                                "region": "us-west-2",
+                            },
+                        ],
+                        "quotas": [
+                            {
+                                "family": "G",
+                                "region": "us-west-2",
+                                "market": "on_demand",
+                                "baseline_vcpus": 192,
+                                "used_vcpus": 0,
+                            },
+                        ],
+                    },
+                })
+                assert decide_resp.status_code == 200
+                decision_id = decide_resp.json()["_decision_id"]
+                assert app.state.ledger.pending_count == 1
+
+                launching_resp = await c1.post("/job/launching", json={
+                    "job_id": "replica-r0",
+                    "group_id": "group-1",
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "tp": 4,
+                    "pp": 1,
+                    "region": "us-west-2",
+                    "market": "on_demand",
+                })
+                assert launching_resp.status_code == 200
+                assert "replica-r0" in app.state.monitor._pending_launches
+
+            async with _lifespan_client() as c2:
+                assert app.state.ledger.pending_count == 1
+                assert "replica-r0" in app.state.monitor._pending_launches
+                assert app.state.monitor.tracked_jobs == {}
+
+                started_resp = await c2.post("/job/started", json={
+                    "job_id": "replica-r0",
+                    "decision_id": decision_id,
+                    "group_id": "group-1",
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "region": "us-west-2",
+                    "market": "on_demand",
+                    "tp": 4,
+                    "pp": 1,
+                    "dp": 1,
+                    "slo_deadline_hours": 8.0,
+                    "total_tokens": 6_000_000,
+                    "predicted_tps": 1200.0,
+                })
+                assert started_resp.status_code == 200
+                assert app.state.ledger.pending_count == 0
+                assert "replica-r0" not in app.state.monitor._pending_launches
+                assert "replica-r0" in app.state.monitor.tracked_jobs
+
+            async with _lifespan_client() as c3:
+                assert app.state.ledger.pending_count == 0
+                assert app.state.monitor._pending_launches == {}
+                assert "replica-r0" in app.state.monitor.tracked_jobs
+                restored = app.state.monitor.tracked_jobs["replica-r0"]
+                assert restored.decision_id == decision_id
+                assert restored.config.region == "us-west-2"
+
+    @pytest.mark.asyncio
+    async def test_pending_scale_queue_survives_restart_and_is_consumed(self, tmp_path):
+        runtime_path = tmp_path / "runtime.sqlite"
+        memory_path = tmp_path / "memory.sqlite"
+        env = {
+            "KOI_TEST_FAKE_DECIDE": "1",
+            "KOI_RUNTIME_STATE_PATH": str(runtime_path),
+            "KOI_MEMORY_PATH": str(memory_path),
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            async with _lifespan_client():
+                app.state.monitor.enqueue_pending_scale_decision("group-1", {
+                    "decision_id": "dec-scale",
+                    "remaining": 1,
+                })
+                assert app.state.monitor._pending_scale_decisions["group-1"][0]["decision_id"] == "dec-scale"
+
+            async with _lifespan_client() as c2:
+                assert app.state.monitor._pending_scale_decisions["group-1"][0]["decision_id"] == "dec-scale"
+                started_resp = await c2.post("/job/started", json={
+                    "job_id": "replica-r1",
+                    "decision_id": "dec-parent",
+                    "group_id": "group-1",
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "region": "us-west-2",
+                    "market": "on_demand",
+                    "tp": 4,
+                    "pp": 1,
+                    "dp": 1,
+                    "slo_deadline_hours": 8.0,
+                    "total_tokens": 6_000_000,
+                    "predicted_tps": 1200.0,
+                })
+                assert started_resp.status_code == 200
+                assert started_resp.json()["decision_id"] == "dec-scale"
+                assert "group-1" not in app.state.monitor._pending_scale_decisions
+
+            async with _lifespan_client():
+                assert app.state.monitor._pending_scale_decisions == {}
 
 
 class TestHappyPath:
