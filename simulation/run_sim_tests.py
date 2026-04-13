@@ -530,7 +530,7 @@ def run_tier1():
 
     def t_apply_subtracts_from_resource_map():
         ledger = ResourceLedger()
-        ledger.reserve("dec-1", "L40S", 8)
+        ledger.reserve("dec-1", "L40S", 8, region="us-east-1")
         rm = ResourceMap(
             vpc_id="test", region="us-east-1",
             resources=[
@@ -544,6 +544,28 @@ def run_tier1():
         res = adjusted.get_resource("L40S")
         assert res.allocated_gpus == 8, f"expected allocated=8, got {res.allocated_gpus}"
         assert res.available_gpus == 72, f"expected available=72, got {res.available_gpus}"
+
+    def t_apply_only_hits_matching_region():
+        ledger = ResourceLedger()
+        ledger.reserve("dec-1", "L40S", 4, region="us-east-1")
+        rm = ResourceMap(
+            vpc_id="test", region="multi-region",
+            resources=[
+                GPUResource(gpu_type="L40S", instance_type="g6e.12xlarge",
+                            gpus_per_instance=4, total_gpus=8, allocated_gpus=0,
+                            cost_per_instance_hour_usd=10.49, gpu_memory_gb=48.0,
+                            region="us-east-1", interconnect="PCIe"),
+                GPUResource(gpu_type="L40S", instance_type="g6e.12xlarge",
+                            gpus_per_instance=4, total_gpus=8, allocated_gpus=0,
+                            cost_per_instance_hour_usd=10.49, gpu_memory_gb=48.0,
+                            region="us-west-2", interconnect="PCIe"),
+            ],
+        )
+        adjusted = ledger.apply_to_resource_map(rm)
+        east = next(r for r in adjusted.resources if r.region == "us-east-1")
+        west = next(r for r in adjusted.resources if r.region == "us-west-2")
+        assert east.allocated_gpus == 4, f"east should see pending GPUs, got {east.allocated_gpus}"
+        assert west.allocated_gpus == 0, f"west should stay untouched, got {west.allocated_gpus}"
 
     def t_pending_ttl_expires():
         ledger = ResourceLedger(pending_ttl=0.0)  # instant expiry
@@ -565,6 +587,7 @@ def run_tier1():
     check("release clears pending", t_release_clears_pending)
     check("multiple reserves sum correctly", t_multiple_reserves_sum)
     check("apply_to_resource_map subtracts pending", t_apply_subtracts_from_resource_map)
+    check("apply_to_resource_map only subtracts from matching region", t_apply_only_hits_matching_region)
     check("pending TTL expires stale reservations", t_pending_ttl_expires)
     check("summary returns structured data", t_summary_has_fields)
 
@@ -1157,6 +1180,8 @@ def run_tier2():
                     "group_id": "job-fallback-1",
                     "gpu_type": "A100-80GB",
                     "instance_type": "p4de.24xlarge",
+                    "region": "us-west-2",
+                    "market": "on_demand",
                     "tp": 8, "pp": 1, "dp": 1,
                     "slo_deadline_hours": 8.0,
                     "total_tokens": 6_000_000,
@@ -1180,7 +1205,7 @@ def run_tier2():
             def t_fallback_updates_distinct_priors():
                 m = AgenticMemory(db_path)
                 s_primary = m.get_failure_summary("L40S", region="us-east-1", market="spot")
-                s_fallback = m.get_failure_summary("A100-80GB", region="unknown", market="on_demand")
+                s_fallback = m.get_failure_summary("A100-80GB", region="us-west-2", market="on_demand")
                 assert s_primary["availability_pct"] < 50.0, \
                     f"primary spot should be <50%, got {s_primary['availability_pct']}"
                 assert s_fallback["availability_pct"] > 50.0, \
@@ -1195,6 +1220,105 @@ def run_tier2():
             "primary config failure is recorded before fallback",
             "fallback /job/started creates a child decision",
             "primary failure and fallback success update distinct priors",
+        ]:
+            skip(name, str(e))
+
+    # ── T2.8: launch-failed clears pending by decision_id ──────────────────
+    section("T2.8  /job/launch-failed clears pending reservation by decision_id")
+
+    try:
+        fake_env = {
+            "KOI_TEST_FAKE_DECIDE": "1",
+            "KOI_TEST_GPU_TYPE": "L40S",
+            "KOI_TEST_REQUIRED_GPUS": "8",
+            "KOI_TEST_DECIDE_DELAY_SEC": "0.01",
+        }
+        with koi_server(extra_env=fake_env) as db_path:
+            from koi.tools.memory import AgenticMemory
+
+            payload = {
+                "job_request": {
+                    "model_name": "Qwen/Qwen2.5-72B-Instruct",
+                    "task_type": "batch",
+                    "avg_input_tokens": 953,
+                    "avg_output_tokens": 1024,
+                    "num_requests": 5000,
+                    "slo_deadline_hours": 8.0,
+                    "objective": "cheapest",
+                },
+                "resource_map": {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                            "region": "us-east-1",
+                            "interconnect": "PCIe",
+                        },
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 96,
+                            "used_vcpus": 0,
+                        },
+                    ],
+                },
+            }
+            decide_resp = requests.post(f"{KOI_URL}/decide", json=payload, timeout=30)
+            decide_resp.raise_for_status()
+            decide_body = decide_resp.json()
+            decision_id = decide_body["_decision_id"]
+            job_id = decide_body["job_id"]
+
+            def t_decide_left_pending_reservation():
+                resources = requests.get(f"{KOI_URL}/resources", timeout=5).json()
+                pending_ids = [p["decision_id"] for p in resources.get("pending_reservations", [])]
+                assert decision_id in pending_ids, f"expected {decision_id} in pending reservations: {pending_ids}"
+
+            def t_launch_failed_clears_pending_by_decision_id():
+                r = post(f"{KOI_URL}/job/launch-failed", {
+                    "job_id": job_id,
+                    "decision_id": decision_id,
+                    "configs_tried": [{
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.12xlarge",
+                        "region": "us-east-1",
+                        "market": "on_demand",
+                    }],
+                    "failure_reasons": ["InsufficientCapacity"],
+                    "total_time_seconds": 12.0,
+                })
+                assert r.get("status") == "recorded", f"unexpected response: {r}"
+
+                resources = requests.get(f"{KOI_URL}/resources", timeout=5).json()
+                pending_ids = [p["decision_id"] for p in resources.get("pending_reservations", [])]
+                assert decision_id not in pending_ids, \
+                    f"decision {decision_id} should be cleared after /job/launch-failed, pending={pending_ids}"
+
+            def t_launch_failed_updates_real_region_market_prior():
+                m = AgenticMemory(db_path)
+                summary = m.get_failure_summary("L40S", region="us-east-1", market="on_demand")
+                assert summary["effective_observations"] == 1, \
+                    f"expected 1 observation, got {summary['effective_observations']}"
+                assert summary["availability_pct"] < 50.0, \
+                    f"expected availability < 50%, got {summary['availability_pct']}"
+
+            check("/decide creates a pending reservation", t_decide_left_pending_reservation)
+            check("/job/launch-failed clears the pending reservation", t_launch_failed_clears_pending_by_decision_id)
+            check("/job/launch-failed updates the real region/market prior", t_launch_failed_updates_real_region_market_prior)
+
+    except RuntimeError as e:
+        for name in [
+            "/decide creates a pending reservation",
+            "/job/launch-failed clears the pending reservation",
+            "/job/launch-failed updates the real region/market prior",
         ]:
             skip(name, str(e))
 
@@ -1435,12 +1559,21 @@ def _get_sim_job_state():
     return None, {}
 
 
-def _register_replicas_with_koi(group_id, replica_ids, total_tokens, slo, predicted_tps=1200):
+def _register_replicas_with_koi(
+    group_id,
+    replica_ids,
+    total_tokens,
+    slo,
+    predicted_tps=1200,
+    region="us-east-1",
+    market="on_demand",
+):
     """Register replicas with Koi via /job/started."""
     for rid in replica_ids:
         post(f"{KOI_URL}/job/started", {
             "job_id": rid, "group_id": group_id,
             "gpu_type": "L40S", "instance_type": "g6e.12xlarge",
+            "region": region, "market": market,
             "tp": 4, "pp": 1, "dp": 1,
             "slo_deadline_hours": slo, "total_tokens": total_tokens,
             "predicted_tps": predicted_tps,
