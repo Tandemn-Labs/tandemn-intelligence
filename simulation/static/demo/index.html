@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Koi Demo Simulator</title>
+  <link rel="stylesheet" href="/demo/static/styles.css">
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Tandemn Demo</p>
+        <h1>Koi + Orca Batch Inference Simulator</h1>
+        <p class="subcopy">
+          Launch a realistic simulated batch job, watch the launch phases, and stream
+          progress, throughput, ETA, and scenario events in real time.
+        </p>
+      </div>
+      <div class="hero-badge">
+        <span class="badge-label">Mode</span>
+        <span class="badge-value">Demo Runtime</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel controls">
+        <div class="panel-header">
+          <h2>Launch Controls</h2>
+          <p>Any model string is accepted. Known models get stronger offline defaults.</p>
+        </div>
+
+        <form id="launch-form" class="control-grid">
+          <label>
+            <span>Model</span>
+            <input id="model-input" name="model_name" list="model-options" placeholder="Qwen/Qwen3-32B">
+            <datalist id="model-options"></datalist>
+          </label>
+
+          <label>
+            <span>Quota Preset</span>
+            <select id="quota-select" name="quota_preset"></select>
+          </label>
+
+          <label>
+            <span>Scenario</span>
+            <select id="scenario-select" name="scenario"></select>
+          </label>
+
+          <label>
+            <span>Avg Input Tokens</span>
+            <input id="input-tokens" name="avg_input_tokens" type="number" min="1" value="800">
+          </label>
+
+          <label>
+            <span>Avg Output Tokens</span>
+            <input id="output-tokens" name="avg_output_tokens" type="number" min="1" value="200">
+          </label>
+
+          <label>
+            <span>Total Chunks</span>
+            <input id="total-chunks" name="total_chunks" type="number" min="1" value="500">
+          </label>
+
+          <label>
+            <span>SLO (hours)</span>
+            <input id="slo-hours" name="slo_deadline_hours" type="number" min="0.1" step="0.1" value="8.0">
+          </label>
+
+          <label>
+            <span>Cost Cap (USD)</span>
+            <input id="cost-cap" name="cost_cap_usd" type="number" min="1" step="1" value="120">
+          </label>
+
+          <div class="form-actions">
+            <button id="launch-button" type="submit">Launch Demo Session</button>
+            <span id="launch-status" class="launch-status">Idle</span>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel live">
+        <div class="panel-header">
+          <h2>Live Session</h2>
+          <p id="session-label">No demo session active yet.</p>
+        </div>
+
+        <div class="metrics-grid">
+          <article class="metric-card">
+            <span class="metric-label">Runtime Status</span>
+            <strong id="runtime-status" class="metric-value">-</strong>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Launch Phase</span>
+            <strong id="launch-phase" class="metric-value">-</strong>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Aggregate TPS</span>
+            <strong id="aggregate-tps" class="metric-value">-</strong>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">ETA</span>
+            <strong id="eta-seconds" class="metric-value">-</strong>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Active Replicas</span>
+            <strong id="active-replicas" class="metric-value">-</strong>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Progress</span>
+            <strong id="progress-percent" class="metric-value">-</strong>
+          </article>
+        </div>
+
+        <div class="progress-panel">
+          <div class="progress-meta">
+            <span>Batch Progress</span>
+            <span id="token-progress">0 / 0 tokens</span>
+          </div>
+          <div class="progress-bar">
+            <div id="progress-fill" class="progress-fill"></div>
+          </div>
+        </div>
+
+        <div class="launch-timing-card">
+          <h3>Launch Timing Preview</h3>
+          <div id="launch-timing-grid" class="timing-grid"></div>
+        </div>
+      </section>
+
+      <section class="panel details">
+        <div class="panel-header">
+          <h2>Model + Fleet</h2>
+          <p>Resolved model facts, quota inventory, and scenario notes.</p>
+        </div>
+
+        <div class="detail-block">
+          <h3>Model Resolution</h3>
+          <dl id="model-details" class="detail-list"></dl>
+        </div>
+
+        <div class="detail-block">
+          <h3>Koi Decision</h3>
+          <div id="koi-details" class="scenario-copy">No live Koi decision attached yet.</div>
+        </div>
+
+        <div class="detail-block">
+          <h3>Quota Inventory</h3>
+          <div id="quota-details" class="quota-list"></div>
+        </div>
+
+        <div class="detail-block">
+          <h3>Scenario Notes</h3>
+          <div id="scenario-details" class="scenario-copy">Choose a scenario to see the workflow.</div>
+        </div>
+      </section>
+
+      <section class="panel timeline">
+        <div class="panel-header">
+          <h2>Timeline</h2>
+          <p>Launch phases and scenario events currently emitted by the demo runtime.</p>
+        </div>
+        <div id="timeline-feed" class="timeline-feed">
+          <div class="timeline-empty">Launch a session to start the feed.</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/demo/static/app.js"></script>
+</body>
+</html>
