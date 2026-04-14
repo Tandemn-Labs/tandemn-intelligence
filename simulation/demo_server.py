@@ -67,8 +67,8 @@ class ReplicaTpsRequest(BaseModel):
     target_tps: float = Field(gt=0)
 
 
-async def _post_koi(path: str, payload: dict) -> dict:
-    async with httpx.AsyncClient(timeout=20.0) as client:
+async def _post_koi(path: str, payload: dict, timeout: float = 20.0) -> dict:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(f"{DEMO_KOI_URL}{path}", json=payload)
         response.raise_for_status()
         return response.json()
@@ -99,7 +99,7 @@ async def _request_koi_decision(
         },
         "resource_map": resource_map,
     }
-    return await _post_koi("/decide", payload)
+    return await _post_koi("/decide", payload, timeout=90.0)
 
 
 def _pick_launch_config(

@@ -13,6 +13,9 @@ from simulation.demo_server import SESSION_MANAGER, app
 @pytest_asyncio.fixture
 async def client():
     SESSION_MANAGER.clear()
+    old_request = demo_server._request_koi_decision
+    old_post = demo_server._post_koi
+    old_get = demo_server._get_koi_json
 
     async def _no_koi(*args, **kwargs):
         return None
@@ -31,6 +34,9 @@ async def client():
     transport = ASGITransport(app=app, raise_app_exceptions=True)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+    demo_server._request_koi_decision = old_request
+    demo_server._post_koi = old_post
+    demo_server._get_koi_json = old_get
     SESSION_MANAGER.clear()
 
 
@@ -60,6 +66,41 @@ class TestDemoCatalog:
 
 
 class TestDemoLaunch:
+    @pytest.mark.asyncio
+    async def test_request_koi_decision_uses_extended_timeout(self):
+        captured = {}
+
+        async def _fake_post(path, payload, timeout=20.0):
+            captured["path"] = path
+            captured["timeout"] = timeout
+            captured["payload"] = payload
+            return {"config": {"gpu_type": "L40S"}}
+
+        old_post = demo_server._post_koi
+        demo_server._post_koi = _fake_post
+        try:
+            req = demo_server.DemoLaunchRequest(
+                model_name="Qwen/Qwen3-32B",
+                avg_input_tokens=800,
+                avg_output_tokens=200,
+                total_chunks=500,
+                slo_deadline_hours=8.0,
+                quota_preset="aws_mixed_demo",
+                scenario="hero_elastic",
+            )
+            result = await demo_server._request_koi_decision(
+                "demo-timeout-check",
+                req,
+                {"instances": [], "quotas": []},
+            )
+        finally:
+            demo_server._post_koi = old_post
+
+        assert result["config"]["gpu_type"] == "L40S"
+        assert captured["path"] == "/decide"
+        assert captured["timeout"] == 90.0
+        assert captured["payload"]["job_request"]["job_id"] == "demo-timeout-check"
+
     @pytest.mark.asyncio
     async def test_launch_creates_session_with_preview(self, client):
         resp = await client.post(
