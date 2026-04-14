@@ -30,84 +30,35 @@ import asyncio
 import logging
 import random
 import time
-import uuid
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+try:
+    from simulation.sim_engine import (
+        SimJob,
+        SimReplica,
+        SimState,
+        advance_chunks_loop,
+        aggregate_job_tps,
+    )
+except ModuleNotFoundError:
+    # Support direct script execution: `python simulation/mock_orca.py`
+    from sim_engine import (  # type: ignore
+        SimJob,
+        SimReplica,
+        SimState,
+        advance_chunks_loop,
+        aggregate_job_tps,
+    )
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("mock_orca")
 
 app = FastAPI(title="Mock Orca", version="0.1")
 
-
-# ---------------------------------------------------------------------------
-# Simulated state
-# ---------------------------------------------------------------------------
-
-@dataclass
-class SimReplica:
-    replica_id: str
-    phase: str = "running"          # launching, provisioned, model_ready, running, dead, failed, killed, completed
-    base_tps: float = 1200.0        # baseline tokens/sec (wobble applied on read)
-    gpu_type: str = "L40S"
-    instance_type: str = "g6e.12xlarge"
-    tp: int = 4
-    pp: int = 2
-    region: str = "us-east-1"
-    market: str = "on_demand"
-    config_index: int = 0
-    started_at: float = field(default_factory=time.time)
-    last_heartbeat: float = field(default_factory=time.time)
-    warmup_seconds: float = 30.0    # ramp from 0 to base_tps over this period
-    wobble_pct: float = 0.10        # ±10% random noise on each read
-
-    @property
-    def tps(self) -> float:
-        """Current TPS with warmup ramp + realistic wobble."""
-        if self.phase != "running":
-            return 0.0
-        elapsed = time.time() - self.started_at
-        # Warmup: ramp linearly from 0 → base_tps
-        if elapsed < self.warmup_seconds:
-            ramp = elapsed / self.warmup_seconds
-        else:
-            ramp = 1.0
-        base = self.base_tps * ramp
-        # Wobble: ±wobble_pct gaussian noise
-        noise = random.gauss(1.0, self.wobble_pct)
-        return max(0, base * noise)
-
-
-@dataclass
-class SimJob:
-    job_id: str
-    model_name: str
-    replicas: Dict[str, SimReplica] = field(default_factory=dict)
-    total_chunks: int = 500
-    completed_chunks: int = 0
-    failed_chunks: int = 0
-    status: str = "running"         # running, succeeded, failed
-    slo_deadline_hours: float = 8.0
-    decision_id: Optional[str] = None
-    # Tokens per chunk (approximation)
-    tokens_per_chunk: int = 12000   # ~6M tokens / 500 chunks
-    deploy_timestamp: float = field(default_factory=time.time)
-
-
-class SimState:
-    """Global simulator state."""
-    def __init__(self):
-        self.jobs: Dict[str, SimJob] = {}
-        self.koi_url: str = "http://localhost:8090"
-        self._chunk_task: Optional[asyncio.Task] = None
-
-    @property
-    def primary_job(self) -> Optional[SimJob]:
-        return next(iter(self.jobs.values()), None)
 
 SIM = SimState()
 
@@ -118,40 +69,12 @@ SIM = SimState()
 
 async def _advance_chunks():
     """Background loop: advance completed chunks based on aggregate TPS."""
-    while True:
-        await asyncio.sleep(5)  # tick every 5s
-        for job in list(SIM.jobs.values()):
-            if job.status != "running":
-                continue
-            # Aggregate TPS from alive replicas
-            agg_tps = sum(r.tps for r in job.replicas.values()
-                          if r.phase == "running")
-            if agg_tps <= 0:
-                continue
-            # Tokens generated in 5s
-            tokens_this_tick = agg_tps * 5
-            chunks_this_tick = tokens_this_tick / max(job.tokens_per_chunk, 1)
-            job.completed_chunks = min(
-                job.total_chunks,
-                job.completed_chunks + int(chunks_this_tick),
-            )
-            # Update heartbeats for alive replicas
-            now = time.time()
-            for r in job.replicas.values():
-                if r.phase == "running":
-                    r.last_heartbeat = now
-
-            # Check completion
-            if job.completed_chunks >= job.total_chunks:
-                job.status = "succeeded"
-                job.completed_chunks = job.total_chunks
-                logger.info(f"[Sim] Job {job.job_id} completed all chunks!")
-                await _notify_koi_complete(job)
+    await advance_chunks_loop(SIM, notify_complete=_notify_koi_complete, tick_seconds=5.0)
 
 
 async def _notify_koi_complete(job: SimJob):
     """POST /job/complete to Koi."""
-    agg_tps = sum(r.tps for r in job.replicas.values() if r.phase in ("running", "completed"))
+    agg_tps = aggregate_job_tps(job, running_phases=("running", "completed"))
     try:
         async with httpx.AsyncClient() as client:
             await client.post(f"{SIM.koi_url}/job/complete", json={
@@ -305,7 +228,7 @@ async def get_job_metrics(job_id: str):
     job = SIM.jobs.get(job_id)
     if not job:
         raise HTTPException(404)
-    agg_tps = sum(r.tps for r in job.replicas.values() if r.phase == "running")
+    agg_tps = aggregate_job_tps(job)
     return {
         "avg_generation_throughput_toks_per_s": agg_tps,
         "gpu_cache_usage_perc": 0.65,
@@ -597,7 +520,7 @@ async def sim_state():
     """Dump full simulator state."""
     result = {}
     for jid, job in SIM.jobs.items():
-        agg_tps = sum(r.tps for r in job.replicas.values() if r.phase == "running")
+        agg_tps = aggregate_job_tps(job)
         alive = sum(1 for r in job.replicas.values() if r.phase == "running")
         pct = (job.completed_chunks / max(job.total_chunks, 1)) * 100
         result[jid] = {
