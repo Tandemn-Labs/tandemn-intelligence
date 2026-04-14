@@ -6,6 +6,7 @@ const modelInput = document.getElementById("model-input");
 const launchStatus = document.getElementById("launch-status");
 const sessionLabel = document.getElementById("session-label");
 const timelineFeed = document.getElementById("timeline-feed");
+const koiActivity = document.getElementById("koi-activity");
 const replicaGrid = document.getElementById("replica-grid");
 const addReplicaButton = document.getElementById("add-replica-button");
 const killOldestButton = document.getElementById("kill-oldest-button");
@@ -30,6 +31,11 @@ function formatSeconds(value) {
   const hours = Math.floor(minutes / 60);
   const mins = minutes % 60;
   return `${hours}h ${mins}m`;
+}
+
+function formatClock(value) {
+  if (!value) return "-";
+  return new Date(value * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
 }
 
 function renderCatalog(data) {
@@ -161,7 +167,35 @@ function renderSession(snapshot) {
   `).join("");
 
   renderReplicaFleet(snapshot);
+  renderKoiActivity(snapshot);
   renderTimeline(runtime.events, runtime.status, runtime.launch_phase, runtime.elapsed_seconds);
+}
+
+function renderKoiActivity(snapshot) {
+  const events = (((snapshot || {}).koi || {}).events) || [];
+  if (!events.length) {
+    koiActivity.innerHTML = `<div class="timeline-empty">No Koi activity yet.</div>`;
+    return;
+  }
+
+  koiActivity.innerHTML = events.slice().reverse().map((event) => `
+    <article class="timeline-event">
+      <h4>${event.event.replaceAll("_", " ")}</h4>
+      <p>${renderKoiEventDetails(event)}</p>
+      <span class="timeline-meta">${formatClock(event.timestamp)}</span>
+    </article>
+  `).join("");
+}
+
+function renderKoiEventDetails(event) {
+  const parts = [];
+  if (event.job_id) parts.push(`job ${event.job_id}`);
+  if (event.group_id) parts.push(`group ${event.group_id}`);
+  if (event.tool) parts.push(`tool ${event.tool}`);
+  if (event.trigger_type) parts.push(`trigger ${event.trigger_type}`);
+  if (event.phase) parts.push(`phase ${event.phase}`);
+  if (event.response) parts.push(event.response);
+  return parts.join(" · ");
 }
 
 function renderReplicaFleet(snapshot) {

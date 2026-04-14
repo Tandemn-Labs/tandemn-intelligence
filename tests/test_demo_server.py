@@ -1,5 +1,7 @@
 """Tests for the demo backend API."""
 
+import json
+
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -84,7 +86,7 @@ class TestDemoLaunch:
         assert body["launch_preview"]["launch_timing_s"]["total"] > 0
         assert body["resource_map"]["instances"]
         assert body["koi"]["decision"] is None
-        assert body["koi"]["live"] is None
+        assert body["koi"]["live"]["jobs"]["jobs"] == []
 
         session = await client.get(f"/demo/session/{body['session_id']}")
         assert session.status_code == 200
@@ -180,6 +182,29 @@ class TestDemoLaunch:
         assert body["launch_preview"]["baseline_replica_tps"] == 1875.0
         assert body["launch_preview"]["tp"] == 8
         assert body["launch_preview"]["pp"] == 1
+
+    def test_read_session_koi_events_filters_by_session(self, tmp_path):
+        path = tmp_path / "koi-events.jsonl"
+        path.write_text(
+            "\n".join([
+                json.dumps({"event": "agent_deciding", "job_id": "demo-a"}),
+                json.dumps({"event": "tool_call", "job_id": "demo-a-r0"}),
+                json.dumps({"event": "tool_call", "job_id": "demo-b"}),
+                json.dumps({"event": "job_launching", "group_id": "demo-a"}),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        old_path = demo_server.DEMO_KOI_EVENT_LOG
+        demo_server.DEMO_KOI_EVENT_LOG = str(path)
+        try:
+            events = demo_server._read_session_koi_events("demo-a")
+        finally:
+            demo_server.DEMO_KOI_EVENT_LOG = old_path
+        assert [event["event"] for event in events] == [
+            "agent_deciding",
+            "tool_call",
+            "job_launching",
+        ]
 
     @pytest.mark.asyncio
     async def test_session_endpoint_attaches_filtered_live_koi_state(self, client):

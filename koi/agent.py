@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from anthropic import AsyncAnthropic, beta_async_tool
 
+from koi.event_tap import emit_event
 from koi.logging_config import get_logger
 from koi.schemas import (
     AgentDecision, DataSource, EngineConfig, JobRequest,
@@ -393,6 +394,7 @@ class KoiAgent:
         tools = self._build_tools(resource_map=resource_map)
 
         logger.info("agent_deciding", model=job_request.model_name, job_id=job_request.job_id)
+        emit_event("agent_deciding", model=job_request.model_name, job_id=job_request.job_id)
 
         # Run the agentic loop with wall-clock timeout
         runner = self._client.beta.messages.tool_runner(
@@ -406,7 +408,7 @@ class KoiAgent:
 
         try:
             tool_calls, final_text = await asyncio.wait_for(
-                self._consume_runner(runner, "decide"), timeout=DECIDE_TIMEOUT)
+                self._consume_runner(runner, "decide", job_id=job_request.job_id), timeout=DECIDE_TIMEOUT)
         except asyncio.TimeoutError:
             elapsed = time.time() - t0
             logger.error("decide_timeout", model=job_request.model_name,
@@ -415,6 +417,7 @@ class KoiAgent:
 
         elapsed = time.time() - t0
         logger.info("agent_decided", elapsed_s=round(elapsed, 1), tool_calls=tool_calls)
+        emit_event("agent_decided", job_id=job_request.job_id, elapsed_s=round(elapsed, 1), tool_calls=tool_calls)
 
         # Parse the decision from the agent's response
         decision = self._parse_decision(final_text, job_request, resource_map, tool_calls, elapsed)
@@ -445,6 +448,7 @@ class KoiAgent:
         tools = self._build_tools(monitor=self.monitor)
 
         logger.info("trigger_handling", trigger_type=trigger.trigger_type.value, job_id=trigger.job_id)
+        emit_event("trigger_handling", trigger_type=trigger.trigger_type.value, job_id=trigger.job_id)
 
         runner = self._client.beta.messages.tool_runner(
             model=self.model,
@@ -457,20 +461,21 @@ class KoiAgent:
 
         try:
             _, final_text = await asyncio.wait_for(
-                self._consume_runner(runner, "trigger"), timeout=TRIGGER_TIMEOUT)
+                self._consume_runner(runner, "trigger", job_id=trigger.job_id), timeout=TRIGGER_TIMEOUT)
         except asyncio.TimeoutError:
             logger.error("trigger_timeout", job_id=trigger.job_id,
                          trigger_type=trigger.trigger_type.value, timeout=TRIGGER_TIMEOUT)
             return f"[TIMEOUT] Agent did not respond within {TRIGGER_TIMEOUT}s"
 
         logger.info("trigger_response", response=final_text[:200])
+        emit_event("trigger_response", job_id=trigger.job_id, response=final_text[:200])
         return final_text
 
     # ------------------------------------------------------------------
     # Runner helpers
     # ------------------------------------------------------------------
 
-    async def _consume_runner(self, runner, label: str) -> tuple:
+    async def _consume_runner(self, runner, label: str, job_id: Optional[str] = None) -> tuple:
         """Consume all events from tool_runner. Returns (tool_calls, final_text)."""
         tool_calls = 0
         final_text = ""
@@ -483,6 +488,8 @@ class KoiAgent:
                         tool_calls += 1
                         logger.info("tool_call", label=label, call_number=tool_calls,
                                     tool=block.name)
+                        emit_event("tool_call", label=label, call_number=tool_calls,
+                                   tool=block.name, job_id=job_id)
         if last_response and hasattr(last_response, "content"):
             for block in last_response.content:
                 if hasattr(block, "text"):

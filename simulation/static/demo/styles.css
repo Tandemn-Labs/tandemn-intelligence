@@ -425,6 +425,17 @@ button:hover {
   color: var(--text);
 }
 
+.compact-feed {
+  padding: 0;
+  gap: 10px;
+}
+
+.compact-feed .timeline-event,
+.compact-feed .timeline-empty {
+  padding: 12px 14px;
+  border-radius: 14px;
+}
+
 .quota-item {
   padding: 12px 0;
   border-top: 1px solid rgba(255, 255, 255, 0.06);

@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from koi.agent import KoiAgent
+from koi.event_tap import emit_event
 from koi.logging_config import setup_logging, get_logger, bind_context, clear_context
 from koi.monitor import MonitoringLoop
 from koi.resource_ledger import ResourceLedger
@@ -438,6 +439,8 @@ async def job_launching(req: JobLaunchingRequest):
     })
     logger.info("job_launching", job_id=req.job_id, group_id=req.group_id,
                 gpu_type=req.gpu_type, instance_type=req.instance_type)
+    emit_event("job_launching", job_id=req.job_id, group_id=req.group_id,
+               gpu_type=req.gpu_type, instance_type=req.instance_type)
     return {"status": "tracked", "job_id": req.job_id}
 
 
@@ -465,6 +468,8 @@ async def job_launch_heartbeat(req: JobLaunchHeartbeatRequest):
     })
     logger.info("job_launch_heartbeat", job_id=req.job_id, group_id=req.group_id,
                 phase=req.phase, attempt_index=req.attempt_index, refreshed=refreshed)
+    emit_event("job_launch_heartbeat", job_id=req.job_id, group_id=req.group_id,
+               phase=req.phase, attempt_index=req.attempt_index, refreshed=refreshed)
     return {"status": "tracked", "job_id": req.job_id, "lease_refreshed": refreshed}
 
 
@@ -639,6 +644,8 @@ async def job_complete(req: JobCompleteRequest):
 
         logger.info("group_completed", job_id=req.job_id, outcomes=outcomes_recorded,
                     aggregate_tps=round(total_tps), status=req.status)
+        emit_event("group_completed", job_id=req.job_id, outcomes=outcomes_recorded,
+                   aggregate_tps=round(total_tps), status=req.status)
 
         # Unregister all chains in the group
         monitor.unregister_group(req.job_id)
@@ -726,6 +733,8 @@ async def replica_failed(req: ReplicaFailedRequest):
     await monitor._trigger_queue.put(trigger)
     logger.info("replica_failed", job_id=req.job_id, group_id=req.group_id,
                 reason=req.reason[:100])
+    emit_event("replica_failed", job_id=req.job_id, group_id=req.group_id,
+               reason=req.reason[:100])
     return {"status": "trigger_emitted", "job_id": req.job_id}
 
 
@@ -805,6 +814,8 @@ async def job_launch_failed(req: LaunchFailedRequest):
 
     logger.info("launch_failed", job_id=req.job_id, configs_tried=len(req.configs_tried),
                 total_time_s=round(req.total_time_seconds))
+    emit_event("launch_failed", job_id=req.job_id, configs_tried=len(req.configs_tried),
+               total_time_s=round(req.total_time_seconds))
 
     # Release pending reservation (never launched)
     if decision_id:

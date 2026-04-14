@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from koi.event_tap import read_recent_events
 from simulation.demo_runtime import DemoSessionManager
 from simulation.demo_scenarios import (
     get_quota_preset,
@@ -33,6 +34,7 @@ SESSION_MANAGER = DemoSessionManager()
 STATIC_DIR = Path(__file__).resolve().parent / "static" / "demo"
 app.mount("/demo/static", StaticFiles(directory=str(STATIC_DIR)), name="demo-static")
 DEMO_KOI_URL = os.environ.get("KOI_DEMO_URL", "http://localhost:8090")
+DEMO_KOI_EVENT_LOG = os.environ.get("KOI_EVENT_TAP_PATH", "")
 HEARTBEAT_INTERVAL_S = 3.0
 
 
@@ -80,11 +82,13 @@ async def _get_koi_json(path: str) -> dict:
 
 
 async def _request_koi_decision(
+    session_id: str,
     req: DemoLaunchRequest,
     resource_map: dict,
 ) -> Optional[dict]:
     payload = {
         "job_request": {
+            "job_id": session_id,
             "model_name": req.model_name,
             "task_type": "batch",
             "avg_input_tokens": req.avg_input_tokens,
@@ -165,6 +169,19 @@ async def _fetch_koi_live_state(session_id: str) -> dict:
         "jobs": _filter_session_koi_jobs(session_id, jobs_payload),
         "resources": resources_payload,
     }
+
+
+def _read_session_koi_events(session_id: str, limit: int = 40) -> list[dict[str, Any]]:
+    if not DEMO_KOI_EVENT_LOG:
+        return []
+    events = read_recent_events(DEMO_KOI_EVENT_LOG, limit=200)
+    filtered = []
+    for event in events:
+        job_id = str(event.get("job_id", ""))
+        group_id = str(event.get("group_id", ""))
+        if job_id == session_id or job_id.startswith(f"{session_id}-") or group_id == session_id:
+            filtered.append(event)
+    return filtered[-limit:]
 
 
 def _build_replica_payloads(session_id: str, snapshot: dict, replica: dict) -> tuple[dict, dict, dict]:
@@ -271,6 +288,7 @@ async def _attach_live_koi(session_id: str, snapshot: dict) -> dict:
         snapshot["koi"]["live"] = None
         snapshot["koi"]["live_error"] = error
         session["koi"]["live_error"] = error
+    snapshot["koi"]["events"] = _read_session_koi_events(session_id)
     snapshot["koi"]["sync_error"] = session["koi"].get("sync_error")
     return snapshot
 
@@ -370,11 +388,12 @@ async def demo_launch(req: DemoLaunchRequest):
         overrides=req.model_overrides,
     )
 
+    session_id = f"demo-{uuid.uuid4().hex[:10]}"
     resource_map = quota_preset_to_resource_map(req.quota_preset)
     koi_decision = None
     koi_error = None
     try:
-        koi_decision = await _request_koi_decision(req, resource_map)
+        koi_decision = await _request_koi_decision(session_id, req, resource_map)
     except Exception as exc:
         koi_error = str(exc)
 
@@ -400,7 +419,6 @@ async def demo_launch(req: DemoLaunchRequest):
         )
     )
 
-    session_id = f"demo-{uuid.uuid4().hex[:10]}"
     tp = ((koi_decision or {}).get("config", {}) or {}).get("tp", 4)
     pp = ((koi_decision or {}).get("config", {}) or {}).get("pp", 1)
     launch_config = _pick_launch_config(
@@ -458,7 +476,8 @@ async def demo_launch(req: DemoLaunchRequest):
         },
         "launch_config": launch_config,
     }
-    return SESSION_MANAGER.create_session(payload)
+    created = SESSION_MANAGER.create_session(payload)
+    return await _attach_live_koi(session_id, created)
 
 
 @app.get("/demo/session/{session_id}")
