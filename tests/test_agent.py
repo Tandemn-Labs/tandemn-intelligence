@@ -4,8 +4,14 @@ import pytest
 from types import SimpleNamespace
 from koi.agent import KoiAgent, KOI_SYSTEM_PROMPT
 from koi.schemas import (
-    JobRequest, ResourceMap, GPUResource, EngineConfig, PlacementConfig,
-    MonitoringStatus, MonitoringTrigger, DataSource,
+    JobRequest,
+    ResourceMap,
+    GPUResource,
+    EngineConfig,
+    PlacementConfig,
+    MonitoringStatus,
+    MonitoringTrigger,
+    DataSource,
 )
 from koi.tools.perfdb import PerfDB
 from koi.tools.memory import AgenticMemory
@@ -26,16 +32,31 @@ def memory():
 @pytest.fixture
 def resource_map():
     return ResourceMap(
-        vpc_id="test", region="us-east-1",
+        vpc_id="test",
+        region="us-east-1",
         resources=[
-            GPUResource(gpu_type="L40S", instance_type="g6e.12xlarge",
-                        gpus_per_instance=4, total_gpus=80, allocated_gpus=0,
-                        cost_per_instance_hour_usd=10.49, gpu_memory_gb=48.0,
-                        region="us-east-1", interconnect="PCIe"),
-            GPUResource(gpu_type="A100-80GB", instance_type="p4de.24xlarge",
-                        gpus_per_instance=8, total_gpus=32, allocated_gpus=0,
-                        cost_per_instance_hour_usd=40.96, gpu_memory_gb=80.0,
-                        region="us-west-2", interconnect="NVLink"),
+            GPUResource(
+                gpu_type="L40S",
+                instance_type="g6e.12xlarge",
+                gpus_per_instance=4,
+                total_gpus=80,
+                allocated_gpus=0,
+                cost_per_instance_hour_usd=10.49,
+                gpu_memory_gb=48.0,
+                region="us-east-1",
+                interconnect="PCIe",
+            ),
+            GPUResource(
+                gpu_type="A100-80GB",
+                instance_type="p4de.24xlarge",
+                gpus_per_instance=8,
+                total_gpus=32,
+                allocated_gpus=0,
+                cost_per_instance_hour_usd=40.96,
+                gpu_memory_gb=80.0,
+                region="us-west-2",
+                interconnect="NVLink",
+            ),
         ],
     )
 
@@ -44,9 +65,12 @@ def resource_map():
 def job_request():
     return JobRequest(
         model_name="Qwen/Qwen2.5-72B-Instruct",
-        avg_input_tokens=953, avg_output_tokens=1024,
-        num_requests=5000, slo_deadline_hours=8.0,
+        avg_input_tokens=953,
+        avg_output_tokens=1024,
+        num_requests=5000,
+        slo_deadline_hours=8.0,
         objective="cheapest",
+        preferred_market="on_demand",
     )
 
 
@@ -66,7 +90,9 @@ class TestSystemPrompt:
 class TestToolWiring:
     def test_build_tools_count(self, agent, resource_map):
         tools = agent._build_tools(resource_map=resource_map)
-        assert len(tools) == 8  # query_perfdb, query_memory, gpu_physics, model_arch, similar_models, resources, record_outcome
+        assert (
+            len(tools) == 8
+        )  # query_perfdb, query_memory, gpu_physics, model_arch, similar_models, resources, record_outcome
 
     def test_build_tools_without_resource_map(self, agent):
         tools = agent._build_tools()
@@ -75,7 +101,50 @@ class TestToolWiring:
 
 class TestActionTools:
     @pytest.mark.asyncio
-    async def test_scale_chain_tool_does_not_freeze_or_record_on_confirm(self, perfdb, memory, resource_map):
+    async def test_get_quota_status_tool_treats_missing_rows_as_zero(
+        self, perfdb, memory
+    ):
+        class FakeOrca:
+            async def get_resources(self):
+                return {
+                    "instances": [
+                        {
+                            "instance_type": "g6.2xlarge",
+                            "gpu_type": "L4",
+                            "gpus_per_instance": 1,
+                            "vcpus": 8,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 24.0,
+                            "cost_per_instance_hour_usd": 1.0,
+                            "interconnect": "PCIe",
+                        },
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 96,
+                            "used_vcpus": 0,
+                        },
+                    ],
+                }
+
+        agent = KoiAgent(
+            perfdb=perfdb, memory=memory, orca=FakeOrca(), api_key="test-key"
+        )
+        tools = agent._build_tools(monitor=None)
+        quota_tool = next(t for t in tools if t.name == "get_quota_status_tool")
+
+        result = await quota_tool(gpu_type="L4")
+
+        assert "on_demand" in result
+        assert "no rows returned -> treat all unlisted spot quota as ZERO" in result
+
+    @pytest.mark.asyncio
+    async def test_scale_chain_tool_does_not_freeze_or_record_on_confirm(
+        self, perfdb, memory, resource_map
+    ):
         class FakeOrca:
             async def get_resources(self):
                 return {
@@ -105,7 +174,9 @@ class TestActionTools:
             async def scale_job(self, *args, **kwargs):
                 return {"status": "confirm", "message": "Config may not be feasible"}
 
-        agent = KoiAgent(perfdb=perfdb, memory=memory, orca=FakeOrca(), api_key="test-key")
+        agent = KoiAgent(
+            perfdb=perfdb, memory=memory, orca=FakeOrca(), api_key="test-key"
+        )
         parent_decision = memory.record_decision(
             job_id="parent-job",
             model_name="Qwen/Qwen2.5-72B-Instruct",
@@ -138,13 +209,77 @@ class TestActionTools:
         tools = agent._build_tools(resource_map=resource_map, monitor=monitor)
         scale_tool = next(t for t in tools if t.name == "scale_chain_tool")
 
-        result = await scale_tool(job_id="parent-job", gpu_type="L40S", tp=4, pp=1, count=1)
+        result = await scale_tool(
+            job_id="parent-job", gpu_type="L40S", tp=4, pp=1, count=1
+        )
 
         assert "Scale not started" in result
         assert memory.decision_count() == 1
         assert tracker.action_in_progress is False
         assert tracker.action_freeze_until is None
         assert not hasattr(monitor, "_pending_scale_decisions")
+
+    @pytest.mark.asyncio
+    async def test_scale_chain_defaults_on_demand_and_avoids_spot_without_quota(
+        self, perfdb, memory
+    ):
+        class FakeOrca:
+            def __init__(self):
+                self.calls = []
+
+            async def get_resources(self):
+                return {
+                    "instances": [
+                        {
+                            "instance_type": "g6.2xlarge",
+                            "gpu_type": "L4",
+                            "gpus_per_instance": 1,
+                            "vcpus": 8,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 24.0,
+                            "cost_per_instance_hour_usd": 1.0,
+                            "interconnect": "PCIe",
+                        },
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 96,
+                            "used_vcpus": 0,
+                        },
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "spot",
+                            "baseline_vcpus": 0,
+                            "used_vcpus": 0,
+                        },
+                    ],
+                }
+
+            async def scale_job(self, *args, **kwargs):
+                self.calls.append(kwargs)
+                return {"status": "scaling"}
+
+        fake_orca = FakeOrca()
+        agent = KoiAgent(
+            perfdb=perfdb, memory=memory, orca=fake_orca, api_key="test-key"
+        )
+        tools = agent._build_tools(monitor=None)
+        scale_tool = next(t for t in tools if t.name == "scale_chain_tool")
+
+        # No parent decision + no override should default to on-demand.
+        await scale_tool(job_id="job-default", gpu_type="L4", tp=1, pp=1, count=1)
+        assert fake_orca.calls[-1]["on_demand"] is True
+
+        # Explicit spot request should still switch to on-demand when spot quota is zero.
+        result = await scale_tool(
+            job_id="job-spot", gpu_type="L4", tp=1, pp=1, count=1, on_demand=False
+        )
+        assert fake_orca.calls[-1]["on_demand"] is True
+        assert "forced on-demand" in result
 
 
 class TestPromptBuilding:
@@ -157,6 +292,8 @@ class TestPromptBuilding:
         assert "L40S" in prompt
         assert "A100-80GB" in prompt
         assert "gpu_type" in prompt  # JSON schema
+        assert "planned_market" in prompt
+        assert "Preferred market: on_demand" in prompt
 
     def test_decide_prompt_has_required_tps(self, agent, job_request, resource_map):
         prompt = agent._build_decide_prompt(job_request, resource_map)
@@ -167,9 +304,15 @@ class TestPromptBuilding:
         trigger = MonitoringTrigger(
             trigger_type=MonitoringStatus.FALLING_BEHIND,
             job_id="job-test",
-            job_tracker={"smoothed_tps": 200, "slo_headroom_pct": 5.0,
-                         "elapsed_hours": 2.0, "tokens_remaining": 5_000_000,
-                         "gpu_cache_usage": 0.85, "gpu_sm_util": 90, "gpu_mem_bw_util": 95},
+            job_tracker={
+                "smoothed_tps": 200,
+                "slo_headroom_pct": 5.0,
+                "elapsed_hours": 2.0,
+                "tokens_remaining": 5_000_000,
+                "gpu_cache_usage": 0.85,
+                "gpu_sm_util": 90,
+                "gpu_mem_bw_util": 95,
+            },
             diagnosis_hint="Throughput dropped below SLO requirement",
         )
         prompt = agent._build_trigger_prompt(trigger)
@@ -181,8 +324,12 @@ class TestPromptBuilding:
         trigger = MonitoringTrigger(
             trigger_type=MonitoringStatus.COMPLETED,
             job_id="job-done",
-            job_tracker={"smoothed_tps": 1500, "slo_headroom_pct": 80.0,
-                         "elapsed_hours": 1.5, "tokens_remaining": 0},
+            job_tracker={
+                "smoothed_tps": 1500,
+                "slo_headroom_pct": 80.0,
+                "elapsed_hours": 1.5,
+                "tokens_remaining": 0,
+            },
         )
         prompt = agent._build_trigger_prompt(trigger)
         assert "completed" in prompt
@@ -200,6 +347,7 @@ class TestParseDecision:
   "tp": 4,
   "pp": 2,
   "dp": 1,
+  "planned_market": "spot",
   "predicted_tps": 2590.0,
   "predicted_cost_per_hour": 40.96,
   "reasoning": "PerfDB shows A100-80GB TP=4 PP=2 gets 2590 TPS",
@@ -207,10 +355,14 @@ class TestParseDecision:
   "data_source": "perfdb_exact"
 }
 ```"""
-        decision = agent._parse_decision(text, job_request, resource_map, tool_calls=5, elapsed=12.3)
+        decision = agent._parse_decision(
+            text, job_request, resource_map, tool_calls=5, elapsed=12.3
+        )
         assert decision.config.gpu_type == "A100-80GB"
         assert decision.config.tp == 4
         assert decision.config.pp == 2
+        assert decision.config.market == "spot"
+        assert decision.planned_market == "spot"
         assert decision.predicted_tps == 2590.0
         assert decision.confidence == 0.88
         assert decision.data_source == DataSource.EXACT_MATCH
@@ -219,13 +371,19 @@ class TestParseDecision:
 
     def test_parse_raw_json(self, agent, job_request, resource_map):
         text = 'I recommend {"gpu_type": "L40S", "instance_type": "g6e.12xlarge", "tp": 4, "pp": 2, "dp": 1, "predicted_tps": 833.0, "confidence": 0.75, "reasoning": "cheapest option"}'
-        decision = agent._parse_decision(text, job_request, resource_map, tool_calls=3, elapsed=8.0)
+        decision = agent._parse_decision(
+            text, job_request, resource_map, tool_calls=3, elapsed=8.0
+        )
         assert decision.config.gpu_type == "L40S"
         assert decision.predicted_tps == 833.0
+        assert decision.planned_market == "on_demand"
 
     def test_parse_fallback_on_no_json(self, agent, job_request, resource_map):
         text = "I suggest using L40S with TP=4 but I couldn't format JSON properly."
-        decision = agent._parse_decision(text, job_request, resource_map, tool_calls=2, elapsed=5.0)
+        decision = agent._parse_decision(
+            text, job_request, resource_map, tool_calls=2, elapsed=5.0
+        )
         # Should fall back to defaults without crashing
         assert decision.config.gpu_type == "L40S"  # default
+        assert decision.planned_market == "on_demand"
         assert decision.confidence == 0.5  # default

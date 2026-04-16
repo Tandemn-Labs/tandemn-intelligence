@@ -8,7 +8,11 @@ from httpx import AsyncClient, ASGITransport
 from contextlib import asynccontextmanager
 
 from koi.schemas import (
-    AgentDecision, PlacementConfig, EngineConfig, DataSource, MonitoringStatus,
+    AgentDecision,
+    PlacementConfig,
+    EngineConfig,
+    DataSource,
+    MonitoringStatus,
 )
 from koi.server import app
 from koi.resource_ledger import ResourceLedger
@@ -18,18 +22,29 @@ from koi.tools.perfdb import PerfDB
 
 def _mock_decision(job_id="job-test123"):
     config = PlacementConfig(
-        gpu_type="L40S", instance_type="g6e.12xlarge",
-        num_gpus=8, num_instances=2, tp=4, pp=2, dp=1,
+        gpu_type="L40S",
+        instance_type="g6e.12xlarge",
+        num_gpus=8,
+        num_instances=2,
+        tp=4,
+        pp=2,
+        dp=1,
         region="us-east-1",
         engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=2),
+        market="on_demand",
     )
     return AgentDecision(
-        job_id=job_id, model_name="Qwen/Qwen2.5-72B-Instruct",
+        job_id=job_id,
+        model_name="Qwen/Qwen2.5-72B-Instruct",
         config=config,
-        predicted_tps=833.0, predicted_cost_per_hour=13.35,
-        predicted_total_cost=33.38, predicted_runtime_hours=2.5,
+        planned_market="on_demand",
+        predicted_tps=833.0,
+        predicted_cost_per_hour=13.35,
+        predicted_total_cost=33.38,
+        predicted_runtime_hours=2.5,
         reasoning="PerfDB shows L40S TP=4 PP=2 gets 833 TPS",
-        confidence=0.85, data_source=DataSource.EXACT_MATCH,
+        confidence=0.85,
+        data_source=DataSource.EXACT_MATCH,
     )
 
 
@@ -91,11 +106,17 @@ async def client():
     monitor.track_pending_launch = MagicMock(side_effect=_track_pending_launch)
     monitor.get_pending_launch = MagicMock(side_effect=_get_pending_launch)
     monitor.clear_pending_launch = MagicMock(side_effect=_clear_pending_launch)
-    monitor.clear_pending_launches_for_group = MagicMock(side_effect=_clear_pending_launches_for_group)
-    monitor.consume_pending_scale_decision = MagicMock(side_effect=_consume_pending_scale_decision)
+    monitor.clear_pending_launches_for_group = MagicMock(
+        side_effect=_clear_pending_launches_for_group
+    )
+    monitor.consume_pending_scale_decision = MagicMock(
+        side_effect=_consume_pending_scale_decision
+    )
     monitor.persist_job = MagicMock()
     monitor.register_job = MagicMock()
-    monitor.unregister_job = MagicMock(side_effect=lambda job_id: monitor.tracked_jobs.pop(job_id, None))
+    monitor.unregister_job = MagicMock(
+        side_effect=lambda job_id: monitor.tracked_jobs.pop(job_id, None)
+    )
     monitor.get_group_chains = MagicMock(return_value={})
     monitor.unregister_group = MagicMock(return_value=[])
     app.state.monitor = monitor
@@ -130,44 +151,156 @@ class TestHealth:
 class TestDecide:
     @pytest.mark.asyncio
     async def test_valid_decide(self, client):
-        resp = await client.post("/decide", json={
-            "job_request": {
-                "model_name": "Qwen/Qwen2.5-72B-Instruct",
-                "task_type": "batch",
-                "avg_input_tokens": 953,
-                "avg_output_tokens": 1024,
-                "num_requests": 5000,
-                "slo_deadline_hours": 8.0,
-                "objective": "cheapest",
+        resp = await client.post(
+            "/decide",
+            json={
+                "job_request": {
+                    "model_name": "Qwen/Qwen2.5-72B-Instruct",
+                    "task_type": "batch",
+                    "avg_input_tokens": 953,
+                    "avg_output_tokens": 1024,
+                    "num_requests": 5000,
+                    "slo_deadline_hours": 8.0,
+                    "objective": "cheapest",
+                },
+                "resource_map": {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                        }
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 192,
+                            "used_vcpus": 0,
+                        }
+                    ],
+                },
             },
-            "resource_map": {
-                "instances": [
-                    {"instance_type": "g6e.12xlarge", "gpu_type": "L40S",
-                     "gpus_per_instance": 4, "vcpus": 48, "quota_family": "G",
-                     "gpu_memory_gb": 48.0, "cost_per_instance_hour_usd": 10.49}
-                ],
-                "quotas": [
-                    {"family": "G", "region": "us-east-1", "market": "on_demand",
-                     "baseline_vcpus": 192, "used_vcpus": 0}
-                ],
-            },
-        })
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["job_id"] == "job-test123"
         assert body["config"]["gpu_type"] == "L40S"
+        assert body["planned_market"] == "on_demand"
         pending = app.state.ledger.summary()
         assert len(pending) == 1
         assert pending[0]["region"] == "us-east-1"
 
     @pytest.mark.asyncio
-    async def test_empty_resources_422(self, client):
-        resp = await client.post("/decide", json={
-            "job_request": {
-                "model_name": "test", "avg_input_tokens": 512, "avg_output_tokens": 256,
+    async def test_decide_preserves_incoming_job_id(self, client):
+        captured = {}
+
+        async def decide_capture(job_request, resource_map):
+            captured["job_id"] = job_request.job_id
+            return _mock_decision(job_id=job_request.job_id)
+
+        app.state.agent.decide = decide_capture
+
+        resp = await client.post(
+            "/decide",
+            json={
+                "job_request": {
+                    "job_id": "demo-session-123",
+                    "model_name": "Qwen/Qwen2.5-72B-Instruct",
+                    "task_type": "batch",
+                    "avg_input_tokens": 953,
+                    "avg_output_tokens": 1024,
+                    "num_requests": 5000,
+                    "slo_deadline_hours": 8.0,
+                    "objective": "cheapest",
+                },
+                "resource_map": {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                        }
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 192,
+                            "used_vcpus": 0,
+                        }
+                    ],
+                },
             },
-            "resource_map": {"instances": [], "quotas": []},
-        })
+        )
+
+        assert resp.status_code == 200
+        assert captured["job_id"] == "demo-session-123"
+        assert resp.json()["job_id"] == "demo-session-123"
+
+    @pytest.mark.asyncio
+    async def test_decide_rejects_unknown_job_request_fields(self, client):
+        resp = await client.post(
+            "/decide",
+            json={
+                "job_request": {
+                    "model_name": "Qwen/Qwen2.5-72B-Instruct",
+                    "avg_input_tokens": 953,
+                    "avg_output_tokens": 1024,
+                    "num_requests": 5000,
+                    "mystery_field": 123,
+                },
+                "resource_map": {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                        }
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 192,
+                            "used_vcpus": 0,
+                        }
+                    ],
+                },
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "mystery_field" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_empty_resources_422(self, client):
+        resp = await client.post(
+            "/decide",
+            json={
+                "job_request": {
+                    "model_name": "test",
+                    "avg_input_tokens": 512,
+                    "avg_output_tokens": 256,
+                },
+                "resource_map": {"instances": [], "quotas": []},
+            },
+        )
         assert resp.status_code == 422
 
 
@@ -247,11 +380,14 @@ class TestJobComplete:
             ),
         }
 
-        resp = await client.post("/job/complete", json={
-            "job_id": "job-done",
-            "status": "succeeded",
-            "metrics": {"avg_generation_throughput_toks_per_s": 1500.0},
-        })
+        resp = await client.post(
+            "/job/complete",
+            json={
+                "job_id": "job-done",
+                "status": "succeeded",
+                "metrics": {"avg_generation_throughput_toks_per_s": 1500.0},
+            },
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "recorded"
@@ -259,11 +395,14 @@ class TestJobComplete:
     @pytest.mark.asyncio
     async def test_unknown_job(self, client):
         app.state.monitor.tracked_jobs = {}
-        resp = await client.post("/job/complete", json={
-            "job_id": "job-unknown",
-            "status": "succeeded",
-            "metrics": {},
-        })
+        resp = await client.post(
+            "/job/complete",
+            json={
+                "job_id": "job-unknown",
+                "status": "succeeded",
+                "metrics": {},
+            },
+        )
         assert resp.status_code == 200
         assert resp.json()["status"] == "unknown_job"
 
@@ -272,15 +411,26 @@ class TestLaunchFailed:
     @pytest.mark.asyncio
     async def test_records_failures(self, client):
         app.state.monitor.tracked_jobs = {}
-        resp = await client.post("/job/launch-failed", json={
-            "job_id": "job-fail1",
-            "configs_tried": [
-                {"gpu_type": "A100-80GB", "instance_type": "p4de.24xlarge", "region": "us-west-2"},
-                {"gpu_type": "L40S", "instance_type": "g6e.12xlarge", "region": "us-east-1"},
-            ],
-            "failure_reasons": ["InsufficientCapacity", "QuotaExceeded"],
-            "total_time_seconds": 180.0,
-        })
+        resp = await client.post(
+            "/job/launch-failed",
+            json={
+                "job_id": "job-fail1",
+                "configs_tried": [
+                    {
+                        "gpu_type": "A100-80GB",
+                        "instance_type": "p4de.24xlarge",
+                        "region": "us-west-2",
+                    },
+                    {
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.12xlarge",
+                        "region": "us-east-1",
+                    },
+                ],
+                "failure_reasons": ["InsufficientCapacity", "QuotaExceeded"],
+                "total_time_seconds": 180.0,
+            },
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["attempts_recorded"] == 2
@@ -294,25 +444,28 @@ class TestLaunchFailed:
         }
         app.state.monitor.unregister_job = MagicMock()
 
-        resp = await client.post("/job/launch-failed", json={
-            "job_id": "job-fail2",
-            "configs_tried": [
-                {
-                    "gpu_type": "L40S",
-                    "instance_type": "g6e.12xlarge",
-                    "region": "us-east-1",
-                    "market": "spot",
-                },
-                {
-                    "gpu_type": "A100-80GB",
-                    "instance_type": "p4de.24xlarge",
-                    "region": "us-west-2",
-                    "market": "on_demand",
-                },
-            ],
-            "failure_reasons": ["InsufficientCapacity", "QuotaExceeded"],
-            "total_time_seconds": 240.0,
-        })
+        resp = await client.post(
+            "/job/launch-failed",
+            json={
+                "job_id": "job-fail2",
+                "configs_tried": [
+                    {
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.12xlarge",
+                        "region": "us-east-1",
+                        "market": "spot",
+                    },
+                    {
+                        "gpu_type": "A100-80GB",
+                        "instance_type": "p4de.24xlarge",
+                        "region": "us-west-2",
+                        "market": "on_demand",
+                    },
+                ],
+                "failure_reasons": ["InsufficientCapacity", "QuotaExceeded"],
+                "total_time_seconds": 240.0,
+            },
+        )
 
         assert resp.status_code == 200
         body = resp.json()
@@ -322,10 +475,14 @@ class TestLaunchFailed:
         app.state.monitor.unregister_job.assert_called_once_with("job-fail2")
 
         spot = app.state.memory.get_failure_summary(
-            "L40S", region="us-east-1", market="spot",
+            "L40S",
+            region="us-east-1",
+            market="spot",
         )
         on_demand = app.state.memory.get_failure_summary(
-            "A100-80GB", region="us-west-2", market="on_demand",
+            "A100-80GB",
+            region="us-west-2",
+            market="on_demand",
         )
         assert spot["effective_observations"] == 1
         assert spot["availability_pct"] < 50.0
@@ -333,25 +490,30 @@ class TestLaunchFailed:
         assert on_demand["availability_pct"] < 50.0
 
     @pytest.mark.asyncio
-    async def test_releases_ledger_without_tracked_job_when_decision_id_provided(self, client):
+    async def test_releases_ledger_without_tracked_job_when_decision_id_provided(
+        self, client
+    ):
         """decision_id should release pending GPUs before the job is registered."""
         app.state.ledger.reserve("dec-launchfail-direct", "L40S", 8, region="us-east-1")
         app.state.monitor.tracked_jobs = {}
 
-        resp = await client.post("/job/launch-failed", json={
-            "job_id": "job-fail3",
-            "decision_id": "dec-launchfail-direct",
-            "configs_tried": [
-                {
-                    "gpu_type": "L40S",
-                    "instance_type": "g6e.12xlarge",
-                    "region": "us-east-1",
-                    "market": "spot",
-                },
-            ],
-            "failure_reasons": ["InsufficientCapacity"],
-            "total_time_seconds": 45.0,
-        })
+        resp = await client.post(
+            "/job/launch-failed",
+            json={
+                "job_id": "job-fail3",
+                "decision_id": "dec-launchfail-direct",
+                "configs_tried": [
+                    {
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.12xlarge",
+                        "region": "us-east-1",
+                        "market": "spot",
+                    },
+                ],
+                "failure_reasons": ["InsufficientCapacity"],
+                "total_time_seconds": 45.0,
+            },
+        )
 
         assert resp.status_code == 200
         assert resp.json()["attempts_recorded"] == 1
@@ -378,25 +540,30 @@ class TestLaunchFailed:
             },
         }
 
-        resp = await client.post("/job/launch-failed", json={
-            "job_id": "job-fail-group",
-            "configs_tried": [
-                {
-                    "gpu_type": "L40S",
-                    "instance_type": "g6e.12xlarge",
-                    "region": "us-east-1",
-                    "market": "spot",
-                },
-            ],
-            "failure_reasons": ["InsufficientCapacity"],
-            "total_time_seconds": 45.0,
-        })
+        resp = await client.post(
+            "/job/launch-failed",
+            json={
+                "job_id": "job-fail-group",
+                "configs_tried": [
+                    {
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.12xlarge",
+                        "region": "us-east-1",
+                        "market": "spot",
+                    },
+                ],
+                "failure_reasons": ["InsufficientCapacity"],
+                "total_time_seconds": 45.0,
+            },
+        )
 
         assert resp.status_code == 200
         assert "replica-r0" not in app.state.monitor._pending_launches
         assert "replica-r1" not in app.state.monitor._pending_launches
         assert "replica-other" in app.state.monitor._pending_launches
-        app.state.monitor.clear_pending_launches_for_group.assert_called_once_with("job-fail-group")
+        app.state.monitor.clear_pending_launches_for_group.assert_called_once_with(
+            "job-fail-group"
+        )
 
 
 class TestReplicaFailed:
@@ -407,25 +574,43 @@ class TestReplicaFailed:
         from koi.schemas import JobTracker, MonitoringStatus
 
         config = PlacementConfig(
-            gpu_type="L40S", instance_type="g6e.12xlarge",
-            num_gpus=4, num_instances=1, tp=4, pp=1, dp=1,
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            num_gpus=4,
+            num_instances=1,
+            tp=4,
+            pp=1,
+            dp=1,
             region="us-east-1",
-            engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=1),
+            engine_config=EngineConfig(
+                tensor_parallel_size=4, pipeline_parallel_size=1
+            ),
         )
         tracker = JobTracker(
-            job_id="r0", config=config,
-            slo_deadline_hours=8.0, total_tokens=6_000_000,
-            predicted_tps=1200.0, tokens_remaining=5_000_000,
+            job_id="r0",
+            config=config,
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
+            predicted_tps=1200.0,
+            tokens_remaining=5_000_000,
         )
         tracker.smoothed_tps = 1850.0  # was running at 1850 TPS before death
         # Record a decision so the outcome JOIN works
         dec_id = app.state.memory.record_decision(
-            job_id="parent-job", model_name="Qwen/Qwen3-32B",
-            instance_type="g6e.12xlarge", gpu_type="L40S",
-            tp=4, pp=1, dp=1, num_gpus=4,
-            predicted_tps=1200.0, predicted_cost_per_hour=6.85,
-            slo_deadline_hours=8.0, objective="cheapest",
-            avg_input_tokens=953, avg_output_tokens=1024,
+            job_id="parent-job",
+            model_name="Qwen/Qwen3-32B",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=6.85,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
         )
         tracker.decision_id = dec_id
 
@@ -434,12 +619,15 @@ class TestReplicaFailed:
         app.state.monitor._trigger_queue = asyncio.Queue()
         app.state.monitor._pending_launches = {}
 
-        resp = await client.post("/job/replica-failed", json={
-            "job_id": "r0",
-            "group_id": "parent-job",
-            "status": "failed",
-            "reason": "Heartbeat timeout (45s)",
-        })
+        resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "r0",
+                "group_id": "parent-job",
+                "status": "failed",
+                "reason": "Heartbeat timeout (45s)",
+            },
+        )
         assert resp.status_code == 200
         assert resp.json()["status"] == "trigger_emitted"
 
@@ -460,14 +648,23 @@ class TestReplicaFailed:
         from koi.schemas import JobTracker, MonitoringStatus
 
         config = PlacementConfig(
-            gpu_type="L40S", instance_type="g6e.12xlarge",
-            num_gpus=4, num_instances=1, tp=4, pp=1, dp=1,
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            num_gpus=4,
+            num_instances=1,
+            tp=4,
+            pp=1,
+            dp=1,
             region="us-east-1",
-            engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=1),
+            engine_config=EngineConfig(
+                tensor_parallel_size=4, pipeline_parallel_size=1
+            ),
         )
         tracker = JobTracker(
-            job_id="r0", config=config,
-            slo_deadline_hours=8.0, total_tokens=6_000_000,
+            job_id="r0",
+            config=config,
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
             predicted_tps=1200.0,
         )
         tracker.status = MonitoringStatus.FAILED  # already dead
@@ -477,12 +674,15 @@ class TestReplicaFailed:
         app.state.monitor._trigger_queue = asyncio.Queue()
         app.state.monitor._pending_launches = {}
 
-        resp = await client.post("/job/replica-failed", json={
-            "job_id": "r0",
-            "group_id": "parent-job",
-            "status": "failed",
-            "reason": "Heartbeat timeout (45s)",
-        })
+        resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "r0",
+                "group_id": "parent-job",
+                "status": "failed",
+                "reason": "Heartbeat timeout (45s)",
+            },
+        )
         assert resp.status_code == 200
         assert resp.json()["status"] == "already_failed"
 
@@ -493,25 +693,42 @@ class TestReplicaFailed:
         from koi.schemas import JobTracker, MonitoringStatus
 
         config = PlacementConfig(
-            gpu_type="L40S", instance_type="g6e.12xlarge",
-            num_gpus=4, num_instances=1, tp=4, pp=1, dp=1,
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            num_gpus=4,
+            num_instances=1,
+            tp=4,
+            pp=1,
+            dp=1,
             region="us-east-1",
-            engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=1),
+            engine_config=EngineConfig(
+                tensor_parallel_size=4, pipeline_parallel_size=1
+            ),
         )
         tracker = JobTracker(
-            job_id="r0", config=config,
-            slo_deadline_hours=8.0, total_tokens=6_000_000,
+            job_id="r0",
+            config=config,
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
             predicted_tps=1200.0,
         )
         tracker.smoothed_tps = 900.0
 
         dec_id = app.state.memory.record_decision(
-            job_id="parent-job", model_name="Qwen/Qwen3-32B",
-            instance_type="g6e.12xlarge", gpu_type="L40S",
-            tp=4, pp=1, dp=1, num_gpus=4,
-            predicted_tps=1200.0, predicted_cost_per_hour=6.85,
-            slo_deadline_hours=8.0, objective="cheapest",
-            avg_input_tokens=953, avg_output_tokens=1024,
+            job_id="parent-job",
+            model_name="Qwen/Qwen3-32B",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=6.85,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
         )
         tracker.decision_id = dec_id
 
@@ -520,18 +737,24 @@ class TestReplicaFailed:
         app.state.monitor._trigger_queue = asyncio.Queue()
         app.state.monitor._pending_launches = {}
 
-        launcher_resp = await client.post("/job/replica-failed", json={
-            "job_id": "r0",
-            "group_id": "parent-job",
-            "status": "failed",
-            "reason": "Clean exit with pending chunks (likely killed)",
-        })
-        watchdog_resp = await client.post("/job/replica-failed", json={
-            "job_id": "r0",
-            "group_id": "parent-job",
-            "status": "failed",
-            "reason": "Heartbeat timeout (45s)",
-        })
+        launcher_resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "r0",
+                "group_id": "parent-job",
+                "status": "failed",
+                "reason": "Clean exit with pending chunks (likely killed)",
+            },
+        )
+        watchdog_resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "r0",
+                "group_id": "parent-job",
+                "status": "failed",
+                "reason": "Heartbeat timeout (45s)",
+            },
+        )
 
         assert launcher_resp.status_code == 200
         assert launcher_resp.json()["status"] == "trigger_emitted"
@@ -545,30 +768,37 @@ class TestReplicaFailed:
         assert len(outcomes) == 1
         assert outcomes[0]["job_id"] == "parent-job"
         assert outcomes[0]["actual_tps"] == 900.0
-        assert outcomes[0]["diagnosis"] == "Clean exit with pending chunks (likely killed)"
+        assert (
+            outcomes[0]["diagnosis"] == "Clean exit with pending chunks (likely killed)"
+        )
 
 
 class TestClassifyFailure:
     def test_spot_preemption(self):
         from koi.server import _classify_failure
+
         assert _classify_failure("SpotInstanceInterruption") == "spot_preemption"
         assert _classify_failure("spot preempted by EC2") == "spot_preemption"
 
     def test_no_capacity(self):
         from koi.server import _classify_failure
+
         assert _classify_failure("InsufficientCapacity in us-east-1") == "no_capacity"
 
     def test_oom(self):
         from koi.server import _classify_failure
+
         assert _classify_failure("CUDA OOM: tried to allocate 40GB") == "oom"
         assert _classify_failure("OutOfMemoryError") == "oom"
 
     def test_quota(self):
         from koi.server import _classify_failure
+
         assert _classify_failure("QuotaExceeded for p5.48xlarge") == "quota"
 
     def test_unknown(self):
         from koi.server import _classify_failure
+
         assert _classify_failure("some random error") == "unknown"
         assert _classify_failure("") == "unknown"
 
@@ -577,37 +807,50 @@ class TestJobLaunching:
     @pytest.mark.asyncio
     async def test_launching_tracked(self, client):
         """POST /job/launching stores in _pending_launches."""
-        resp = await client.post("/job/launching", json={
-            "job_id": "r0",
-            "decision_id": "dec-r0",
-            "group_id": "parent-job",
-            "gpu_type": "L40S",
-            "instance_type": "g6e.12xlarge",
-            "tp": 4, "pp": 1,
-            "region": "us-east-1",
-            "market": "on_demand",
-        })
+        resp = await client.post(
+            "/job/launching",
+            json={
+                "job_id": "r0",
+                "decision_id": "dec-r0",
+                "group_id": "parent-job",
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+                "tp": 4,
+                "pp": 1,
+                "region": "us-east-1",
+                "market": "on_demand",
+            },
+        )
         assert resp.status_code == 200
         assert resp.json()["status"] == "tracked"
         assert "r0" in app.state.monitor._pending_launches
         launch = app.state.monitor._pending_launches["r0"]
         assert launch["decision_id"] == "dec-r0"
         assert launch["launch_phase"] == "waiting_model_ready"
-        assert launch["launch_message"] == "Replica provisioned, waiting for model_ready"
+        assert (
+            launch["launch_message"] == "Replica provisioned, waiting for model_ready"
+        )
 
     @pytest.mark.asyncio
     async def test_launching_visible_in_jobs(self, client):
         """Pending launches appear in /jobs with status=launching."""
         import time
+
         app.state.monitor._pending_launches = {
-            "r0": {"group_id": "parent", "gpu_type": "L40S",
-                    "instance_type": "g6e.12xlarge", "tp": 4, "pp": 1,
-                    "region": "us-east-1", "market": "on_demand",
-                    "launch_phase": "provisioning",
-                    "launch_message": "Still provisioning",
-                    "attempt_index": 1,
-                    "launched_at": time.time(),
-                    "last_heartbeat_at": time.time()},
+            "r0": {
+                "group_id": "parent",
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+                "tp": 4,
+                "pp": 1,
+                "region": "us-east-1",
+                "market": "on_demand",
+                "launch_phase": "provisioning",
+                "launch_message": "Still provisioning",
+                "attempt_index": 1,
+                "launched_at": time.time(),
+                "last_heartbeat_at": time.time(),
+            },
         }
         resp = await client.get("/jobs")
         assert resp.status_code == 200
@@ -638,21 +881,24 @@ class TestJobLaunching:
             },
         }
 
-        resp = await client.post("/job/launch-heartbeat", json={
-            "job_id": "r-heartbeat",
-            "decision_id": "dec-heartbeat",
-            "group_id": "parent-job",
-            "gpu_type": "L40S",
-            "instance_type": "g6e.12xlarge",
-            "tp": 4,
-            "pp": 1,
-            "region": "us-east-1",
-            "market": "spot",
-            "attempt_index": 2,
-            "phase": "provisioning",
-            "message": "still searching for capacity",
-            "timestamp": 456.0,
-        })
+        resp = await client.post(
+            "/job/launch-heartbeat",
+            json={
+                "job_id": "r-heartbeat",
+                "decision_id": "dec-heartbeat",
+                "group_id": "parent-job",
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+                "tp": 4,
+                "pp": 1,
+                "region": "us-east-1",
+                "market": "spot",
+                "attempt_index": 2,
+                "phase": "provisioning",
+                "message": "still searching for capacity",
+                "timestamp": 456.0,
+            },
+        )
 
         assert resp.status_code == 200
         assert resp.json()["lease_refreshed"] is True
@@ -671,39 +917,49 @@ class TestConfigAttempted:
     @pytest.mark.asyncio
     async def test_config_attempted_separates_spot_and_on_demand_priors(self, client):
         """Spot failures and on-demand successes should update different priors."""
-        spot_resp = await client.post("/job/config-attempted", json={
-            "job_id": "job-market",
-            "decision_id": "dec-market",
-            "instance_type": "g6e.12xlarge",
-            "gpu_type": "L40S",
-            "region": "us-east-1",
-            "market": "spot",
-            "launched": False,
-            "failure_reason": "InsufficientCapacity",
-            "attempt_index": 0,
-        })
+        spot_resp = await client.post(
+            "/job/config-attempted",
+            json={
+                "job_id": "job-market",
+                "decision_id": "dec-market",
+                "instance_type": "g6e.12xlarge",
+                "gpu_type": "L40S",
+                "region": "us-east-1",
+                "market": "spot",
+                "launched": False,
+                "failure_reason": "InsufficientCapacity",
+                "attempt_index": 0,
+            },
+        )
         assert spot_resp.status_code == 200
         assert spot_resp.json()["launched"] is False
 
-        on_demand_resp = await client.post("/job/config-attempted", json={
-            "job_id": "job-market",
-            "decision_id": "dec-market",
-            "instance_type": "g6e.12xlarge",
-            "gpu_type": "L40S",
-            "region": "us-east-1",
-            "market": "on_demand",
-            "launched": True,
-            "time_to_launch": 45.0,
-            "attempt_index": 1,
-        })
+        on_demand_resp = await client.post(
+            "/job/config-attempted",
+            json={
+                "job_id": "job-market",
+                "decision_id": "dec-market",
+                "instance_type": "g6e.12xlarge",
+                "gpu_type": "L40S",
+                "region": "us-east-1",
+                "market": "on_demand",
+                "launched": True,
+                "time_to_launch": 45.0,
+                "attempt_index": 1,
+            },
+        )
         assert on_demand_resp.status_code == 200
         assert on_demand_resp.json()["launched"] is True
 
         spot = app.state.memory.get_failure_summary(
-            "L40S", region="us-east-1", market="spot",
+            "L40S",
+            region="us-east-1",
+            market="spot",
         )
         on_demand = app.state.memory.get_failure_summary(
-            "L40S", region="us-east-1", market="on_demand",
+            "L40S",
+            region="us-east-1",
+            market="on_demand",
         )
         assert spot["effective_observations"] == 1
         assert spot["availability_pct"] < 50.0
@@ -735,19 +991,22 @@ class TestJobStarted:
         )
         app.state.monitor.tracked_jobs = {"existing-r1": existing}
 
-        resp = await client.post("/job/started", json={
-            "job_id": "r0",
-            "decision_id": "dec-started",
-            "group_id": "parent-job",
-            "gpu_type": "L40S",
-            "instance_type": "g6e.12xlarge",
-            "tp": 4,
-            "pp": 1,
-            "dp": 1,
-            "slo_deadline_hours": 8.0,
-            "total_tokens": 6_000_000,
-            "predicted_tps": 1200.0,
-        })
+        resp = await client.post(
+            "/job/started",
+            json={
+                "job_id": "r0",
+                "decision_id": "dec-started",
+                "group_id": "parent-job",
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+                "tp": 4,
+                "pp": 1,
+                "dp": 1,
+                "slo_deadline_hours": 8.0,
+                "total_tokens": 6_000_000,
+                "predicted_tps": 1200.0,
+            },
+        )
 
         assert resp.status_code == 200
         body = resp.json()
@@ -770,7 +1029,9 @@ class TestJobStarted:
         assert existing.action_freeze_until is None
 
         summary = app.state.memory.get_failure_summary(
-            "L40S", region="us-east-1", market="spot",
+            "L40S",
+            region="us-east-1",
+            market="spot",
         )
         assert summary["effective_observations"] == 1
         assert summary["availability_pct"] > 50.0
@@ -798,22 +1059,25 @@ class TestJobStarted:
         )
         app.state.ledger.reserve(original_decision_id, "L40S", 4, region="unknown")
 
-        resp = await client.post("/job/started", json={
-            "job_id": "r1",
-            "decision_id": original_decision_id,
-            "group_id": "parent-job",
-            "gpu_type": "A100-80GB",
-            "instance_type": "p4de.24xlarge",
-            "region": "us-west-2",
-            "market": "on_demand",
-            "tp": 8,
-            "pp": 1,
-            "dp": 1,
-            "slo_deadline_hours": 8.0,
-            "total_tokens": 8_000_000,
-            "predicted_tps": 0.0,
-            "is_fallback": True,
-        })
+        resp = await client.post(
+            "/job/started",
+            json={
+                "job_id": "r1",
+                "decision_id": original_decision_id,
+                "group_id": "parent-job",
+                "gpu_type": "A100-80GB",
+                "instance_type": "p4de.24xlarge",
+                "region": "us-west-2",
+                "market": "on_demand",
+                "tp": 8,
+                "pp": 1,
+                "dp": 1,
+                "slo_deadline_hours": 8.0,
+                "total_tokens": 8_000_000,
+                "predicted_tps": 0.0,
+                "is_fallback": True,
+            },
+        )
 
         assert resp.status_code == 200
         body = resp.json()
@@ -830,7 +1094,9 @@ class TestJobStarted:
         assert kwargs["config"].region == "us-west-2"
         assert kwargs["config"].market == "on_demand"
 
-        decisions = app.state.memory.query_decisions(model_name="Qwen/Qwen2.5-72B-Instruct")
+        decisions = app.state.memory.query_decisions(
+            model_name="Qwen/Qwen2.5-72B-Instruct"
+        )
         child = next(d for d in decisions if d["decision_id"] == body["decision_id"])
         assert child["parent_decision_id"] == original_decision_id
         assert child["triggered_by"] == "fallback"
@@ -839,10 +1105,14 @@ class TestJobStarted:
         assert child["market"] == "on_demand"
 
         on_demand = app.state.memory.get_failure_summary(
-            "A100-80GB", region="us-west-2", market="on_demand",
+            "A100-80GB",
+            region="us-west-2",
+            market="on_demand",
         )
         spot = app.state.memory.get_failure_summary(
-            "A100-80GB", region="us-west-2", market="spot",
+            "A100-80GB",
+            region="us-west-2",
+            market="spot",
         )
         assert on_demand["effective_observations"] == 1
         assert on_demand["availability_pct"] > 50.0
@@ -858,26 +1128,32 @@ class TestJobStarted:
         }
 
         for replica_id in ("r-scale-0", "r-scale-1"):
-            resp = await client.post("/job/started", json={
-                "job_id": replica_id,
-                "decision_id": "dec-parent",
-                "group_id": "parent-job",
-                "gpu_type": "L40S",
-                "instance_type": "g6e.12xlarge",
-                "region": "us-east-1",
-                "market": "on_demand",
-                "tp": 4,
-                "pp": 1,
-                "dp": 1,
-                "slo_deadline_hours": 8.0,
-                "total_tokens": 6_000_000,
-                "predicted_tps": 1200.0,
-            })
+            resp = await client.post(
+                "/job/started",
+                json={
+                    "job_id": replica_id,
+                    "decision_id": "dec-parent",
+                    "group_id": "parent-job",
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "region": "us-east-1",
+                    "market": "on_demand",
+                    "tp": 4,
+                    "pp": 1,
+                    "dp": 1,
+                    "slo_deadline_hours": 8.0,
+                    "total_tokens": 6_000_000,
+                    "predicted_tps": 1200.0,
+                },
+            )
             assert resp.status_code == 200
             assert resp.json()["decision_id"] == "dec-scale"
 
         assert "parent-job" not in app.state.monitor._pending_scale_decisions
-        assert app.state.monitor._pending_scale_decisions["other-job"][0]["decision_id"] == "dec-other"
+        assert (
+            app.state.monitor._pending_scale_decisions["other-job"][0]["decision_id"]
+            == "dec-other"
+        )
 
 
 class TestStartupRestore:
@@ -920,17 +1196,23 @@ class TestStartupRestore:
             "dead_replicas": [],
         }
         store.upsert_tracked_job("restored-job", tracker_state)
-        store.upsert_pending_launch("replica-restore", {
-            "group_id": "grp-restored",
-            "gpu_type": "L40S",
-            "instance_type": "g6e.12xlarge",
-            "region": "us-west-2",
-            "market": "spot",
-            "launched_at": 123.4,
-        })
-        store.replace_pending_scale_group("grp-restored", [
-            {"decision_id": "dec-scale", "remaining": 1},
-        ])
+        store.upsert_pending_launch(
+            "replica-restore",
+            {
+                "group_id": "grp-restored",
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+                "region": "us-west-2",
+                "market": "spot",
+                "launched_at": 123.4,
+            },
+        )
+        store.replace_pending_scale_group(
+            "grp-restored",
+            [
+                {"decision_id": "dec-scale", "remaining": 1},
+            ],
+        )
         store.upsert_ledger_reservation(
             "dec-ledger",
             {
@@ -957,8 +1239,16 @@ class TestStartupRestore:
                 restored = app.state.monitor.tracked_jobs["restored-job"]
                 assert restored.action_in_progress is False
                 assert restored.action_freeze_until is None
-                assert app.state.monitor._pending_launches["replica-restore"]["market"] == "spot"
-                assert app.state.monitor._pending_scale_decisions["grp-restored"][0]["decision_id"] == "dec-scale"
+                assert (
+                    app.state.monitor._pending_launches["replica-restore"]["market"]
+                    == "spot"
+                )
+                assert (
+                    app.state.monitor._pending_scale_decisions["grp-restored"][0][
+                        "decision_id"
+                    ]
+                    == "dec-scale"
+                )
                 assert app.state.ledger.pending_count == 1
 
 
@@ -975,54 +1265,60 @@ class TestRestartPersistenceFlows:
 
         with patch.dict(os.environ, env, clear=False):
             async with _lifespan_client() as c1:
-                decide_resp = await c1.post("/decide", json={
-                    "job_request": {
-                        "model_name": "Qwen/Qwen2.5-72B-Instruct",
-                        "task_type": "batch",
-                        "avg_input_tokens": 953,
-                        "avg_output_tokens": 1024,
-                        "num_requests": 5000,
-                        "slo_deadline_hours": 8.0,
-                        "objective": "cheapest",
+                decide_resp = await c1.post(
+                    "/decide",
+                    json={
+                        "job_request": {
+                            "model_name": "Qwen/Qwen2.5-72B-Instruct",
+                            "task_type": "batch",
+                            "avg_input_tokens": 953,
+                            "avg_output_tokens": 1024,
+                            "num_requests": 5000,
+                            "slo_deadline_hours": 8.0,
+                            "objective": "cheapest",
+                        },
+                        "resource_map": {
+                            "instances": [
+                                {
+                                    "instance_type": "g6e.12xlarge",
+                                    "gpu_type": "L40S",
+                                    "gpus_per_instance": 4,
+                                    "vcpus": 48,
+                                    "quota_family": "G",
+                                    "gpu_memory_gb": 48.0,
+                                    "cost_per_instance_hour_usd": 10.49,
+                                    "region": "us-west-2",
+                                },
+                            ],
+                            "quotas": [
+                                {
+                                    "family": "G",
+                                    "region": "us-west-2",
+                                    "market": "on_demand",
+                                    "baseline_vcpus": 192,
+                                    "used_vcpus": 0,
+                                },
+                            ],
+                        },
                     },
-                    "resource_map": {
-                        "instances": [
-                            {
-                                "instance_type": "g6e.12xlarge",
-                                "gpu_type": "L40S",
-                                "gpus_per_instance": 4,
-                                "vcpus": 48,
-                                "quota_family": "G",
-                                "gpu_memory_gb": 48.0,
-                                "cost_per_instance_hour_usd": 10.49,
-                                "region": "us-west-2",
-                            },
-                        ],
-                        "quotas": [
-                            {
-                                "family": "G",
-                                "region": "us-west-2",
-                                "market": "on_demand",
-                                "baseline_vcpus": 192,
-                                "used_vcpus": 0,
-                            },
-                        ],
-                    },
-                })
+                )
                 assert decide_resp.status_code == 200
                 decision_id = decide_resp.json()["_decision_id"]
                 assert app.state.ledger.pending_count == 1
 
-                launching_resp = await c1.post("/job/launching", json={
-                    "job_id": "replica-r0",
-                    "group_id": "group-1",
-                    "gpu_type": "L40S",
-                    "instance_type": "g6e.12xlarge",
-                    "tp": 4,
-                    "pp": 1,
-                    "region": "us-west-2",
-                    "market": "on_demand",
-                })
+                launching_resp = await c1.post(
+                    "/job/launching",
+                    json={
+                        "job_id": "replica-r0",
+                        "group_id": "group-1",
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.12xlarge",
+                        "tp": 4,
+                        "pp": 1,
+                        "region": "us-west-2",
+                        "market": "on_demand",
+                    },
+                )
                 assert launching_resp.status_code == 200
                 assert "replica-r0" in app.state.monitor._pending_launches
 
@@ -1031,21 +1327,24 @@ class TestRestartPersistenceFlows:
                 assert "replica-r0" in app.state.monitor._pending_launches
                 assert app.state.monitor.tracked_jobs == {}
 
-                started_resp = await c2.post("/job/started", json={
-                    "job_id": "replica-r0",
-                    "decision_id": decision_id,
-                    "group_id": "group-1",
-                    "gpu_type": "L40S",
-                    "instance_type": "g6e.12xlarge",
-                    "region": "us-west-2",
-                    "market": "on_demand",
-                    "tp": 4,
-                    "pp": 1,
-                    "dp": 1,
-                    "slo_deadline_hours": 8.0,
-                    "total_tokens": 6_000_000,
-                    "predicted_tps": 1200.0,
-                })
+                started_resp = await c2.post(
+                    "/job/started",
+                    json={
+                        "job_id": "replica-r0",
+                        "decision_id": decision_id,
+                        "group_id": "group-1",
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.12xlarge",
+                        "region": "us-west-2",
+                        "market": "on_demand",
+                        "tp": 4,
+                        "pp": 1,
+                        "dp": 1,
+                        "slo_deadline_hours": 8.0,
+                        "total_tokens": 6_000_000,
+                        "predicted_tps": 1200.0,
+                    },
+                )
                 assert started_resp.status_code == 200
                 assert app.state.ledger.pending_count == 0
                 assert "replica-r0" not in app.state.monitor._pending_launches
@@ -1071,29 +1370,45 @@ class TestRestartPersistenceFlows:
 
         with patch.dict(os.environ, env, clear=False):
             async with _lifespan_client():
-                app.state.monitor.enqueue_pending_scale_decision("group-1", {
-                    "decision_id": "dec-scale",
-                    "remaining": 1,
-                })
-                assert app.state.monitor._pending_scale_decisions["group-1"][0]["decision_id"] == "dec-scale"
+                app.state.monitor.enqueue_pending_scale_decision(
+                    "group-1",
+                    {
+                        "decision_id": "dec-scale",
+                        "remaining": 1,
+                    },
+                )
+                assert (
+                    app.state.monitor._pending_scale_decisions["group-1"][0][
+                        "decision_id"
+                    ]
+                    == "dec-scale"
+                )
 
             async with _lifespan_client() as c2:
-                assert app.state.monitor._pending_scale_decisions["group-1"][0]["decision_id"] == "dec-scale"
-                started_resp = await c2.post("/job/started", json={
-                    "job_id": "replica-r1",
-                    "decision_id": "dec-parent",
-                    "group_id": "group-1",
-                    "gpu_type": "L40S",
-                    "instance_type": "g6e.12xlarge",
-                    "region": "us-west-2",
-                    "market": "on_demand",
-                    "tp": 4,
-                    "pp": 1,
-                    "dp": 1,
-                    "slo_deadline_hours": 8.0,
-                    "total_tokens": 6_000_000,
-                    "predicted_tps": 1200.0,
-                })
+                assert (
+                    app.state.monitor._pending_scale_decisions["group-1"][0][
+                        "decision_id"
+                    ]
+                    == "dec-scale"
+                )
+                started_resp = await c2.post(
+                    "/job/started",
+                    json={
+                        "job_id": "replica-r1",
+                        "decision_id": "dec-parent",
+                        "group_id": "group-1",
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.12xlarge",
+                        "region": "us-west-2",
+                        "market": "on_demand",
+                        "tp": 4,
+                        "pp": 1,
+                        "dp": 1,
+                        "slo_deadline_hours": 8.0,
+                        "total_tokens": 6_000_000,
+                        "predicted_tps": 1200.0,
+                    },
+                )
                 assert started_resp.status_code == 200
                 assert started_resp.json()["decision_id"] == "dec-scale"
                 assert "group-1" not in app.state.monitor._pending_scale_decisions
@@ -1106,6 +1421,7 @@ class TestHappyPath:
     @pytest.mark.asyncio
     async def test_decide_started_complete_flow(self, client):
         """Decision, start, and complete should preserve one clean learning record."""
+
         def register_job_side_effect(**kwargs):
             app.state.monitor.tracked_jobs[kwargs["job_id"]] = MagicMock(
                 decision_id=kwargs["decision_id"],
@@ -1116,70 +1432,79 @@ class TestHappyPath:
 
         app.state.monitor.register_job.side_effect = register_job_side_effect
 
-        decide_resp = await client.post("/decide", json={
-            "job_request": {
-                "model_name": "Qwen/Qwen2.5-72B-Instruct",
-                "task_type": "batch",
-                "avg_input_tokens": 953,
-                "avg_output_tokens": 1024,
-                "num_requests": 5000,
-                "slo_deadline_hours": 8.0,
-                "objective": "cheapest",
+        decide_resp = await client.post(
+            "/decide",
+            json={
+                "job_request": {
+                    "model_name": "Qwen/Qwen2.5-72B-Instruct",
+                    "task_type": "batch",
+                    "avg_input_tokens": 953,
+                    "avg_output_tokens": 1024,
+                    "num_requests": 5000,
+                    "slo_deadline_hours": 8.0,
+                    "objective": "cheapest",
+                },
+                "resource_map": {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                        },
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 192,
+                            "used_vcpus": 0,
+                        },
+                    ],
+                },
             },
-            "resource_map": {
-                "instances": [
-                    {
-                        "instance_type": "g6e.12xlarge",
-                        "gpu_type": "L40S",
-                        "gpus_per_instance": 4,
-                        "vcpus": 48,
-                        "quota_family": "G",
-                        "gpu_memory_gb": 48.0,
-                        "cost_per_instance_hour_usd": 10.49,
-                    },
-                ],
-                "quotas": [
-                    {
-                        "family": "G",
-                        "region": "us-east-1",
-                        "market": "on_demand",
-                        "baseline_vcpus": 192,
-                        "used_vcpus": 0,
-                    },
-                ],
-            },
-        })
+        )
         assert decide_resp.status_code == 200
         decide_body = decide_resp.json()
         decision_id = decide_body["_decision_id"]
         assert app.state.ledger.pending_count == 1
         assert app.state.memory.decision_count() == 1
 
-        started_resp = await client.post("/job/started", json={
-            "job_id": decide_body["job_id"],
-            "decision_id": decision_id,
-            "gpu_type": decide_body["config"]["gpu_type"],
-            "instance_type": decide_body["config"]["instance_type"],
-            "tp": decide_body["config"]["tp"],
-            "pp": decide_body["config"]["pp"],
-            "dp": decide_body["config"]["dp"],
-            "slo_deadline_hours": 8.0,
-            "total_tokens": 6_000_000,
-            "predicted_tps": decide_body["predicted_tps"],
-        })
+        started_resp = await client.post(
+            "/job/started",
+            json={
+                "job_id": decide_body["job_id"],
+                "decision_id": decision_id,
+                "gpu_type": decide_body["config"]["gpu_type"],
+                "instance_type": decide_body["config"]["instance_type"],
+                "tp": decide_body["config"]["tp"],
+                "pp": decide_body["config"]["pp"],
+                "dp": decide_body["config"]["dp"],
+                "slo_deadline_hours": 8.0,
+                "total_tokens": 6_000_000,
+                "predicted_tps": decide_body["predicted_tps"],
+            },
+        )
         assert started_resp.status_code == 200
         assert started_resp.json()["decision_id"] == decision_id
         assert app.state.ledger.pending_count == 0
         assert decide_body["job_id"] in app.state.monitor.tracked_jobs
 
-        complete_resp = await client.post("/job/complete", json={
-            "job_id": decide_body["job_id"],
-            "status": "succeeded",
-            "metrics": {
-                "avg_generation_throughput_toks_per_s": 1500.0,
-                "cost_per_hour": 10.49,
+        complete_resp = await client.post(
+            "/job/complete",
+            json={
+                "job_id": decide_body["job_id"],
+                "status": "succeeded",
+                "metrics": {
+                    "avg_generation_throughput_toks_per_s": 1500.0,
+                    "cost_per_hour": 10.49,
+                },
             },
-        })
+        )
         assert complete_resp.status_code == 200
         assert complete_resp.json()["status"] == "recorded"
         assert app.state.memory.outcome_count() == 1
@@ -1282,17 +1607,22 @@ class TestGroupedCompletion:
         tracker2.elapsed_hours = 2.5
         tracker2.slo_headroom_pct = 42.0
 
-        app.state.monitor.get_group_chains = MagicMock(return_value={
-            "r0": tracker1,
-            "r1": tracker2,
-        })
+        app.state.monitor.get_group_chains = MagicMock(
+            return_value={
+                "r0": tracker1,
+                "r1": tracker2,
+            }
+        )
         app.state.monitor.unregister_group = MagicMock(return_value=["r0", "r1"])
 
-        resp = await client.post("/job/complete", json={
-            "job_id": "parent-job",
-            "status": "succeeded",
-            "metrics": {"throughput_tokens_per_sec": 2600.0},
-        })
+        resp = await client.post(
+            "/job/complete",
+            json={
+                "job_id": "parent-job",
+                "status": "succeeded",
+                "metrics": {"throughput_tokens_per_sec": 2600.0},
+            },
+        )
 
         assert resp.status_code == 200
         body = resp.json()

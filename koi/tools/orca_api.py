@@ -39,7 +39,9 @@ class OrcaClient:
     async def get_resources(self) -> Dict[str, Any]:
         """GET /resources → {instances[], quotas[]}"""
         session = await self._get_session()
-        async with session.get(f"{self.base_url}/resources", timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.get(
+            f"{self.base_url}/resources", timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
             resp.raise_for_status()
             return await resp.json()
 
@@ -97,7 +99,9 @@ class OrcaClient:
         ) as resp:
             data = await resp.json()
             if resp.status >= 400:
-                logger.error("submit_failed", status=resp.status, response=str(data)[:200])
+                logger.error(
+                    "submit_failed", status=resp.status, response=str(data)[:200]
+                )
             return data
 
     # ------------------------------------------------------------------
@@ -146,7 +150,13 @@ class OrcaClient:
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             if resp.status == 404:
-                return {"total": 0, "pending": 0, "inflight": 0, "completed": 0, "failed": 0}
+                return {
+                    "total": 0,
+                    "pending": 0,
+                    "inflight": 0,
+                    "completed": 0,
+                    "failed": 0,
+                }
             resp.raise_for_status()
             return await resp.json()
 
@@ -167,9 +177,14 @@ class OrcaClient:
     # ------------------------------------------------------------------
 
     async def scale_job(
-        self, job_id: str,
-        gpu_type: str, tp: int, pp: int, count: int,
+        self,
+        job_id: str,
+        gpu_type: str,
+        tp: int,
+        pp: int,
+        count: int,
         on_demand: bool = False,
+        planned_market: Optional[str] = None,
     ) -> Dict[str, Any]:
         """POST /job/{id}/scale → add replicas (can be different GPU type)."""
         payload = {
@@ -179,6 +194,8 @@ class OrcaClient:
             "pp_size": pp,
             "on_demand": on_demand,
         }
+        if planned_market:
+            payload["planned_market"] = planned_market
         session = await self._get_session()
         async with session.post(
             f"{self.base_url}/job/{job_id}/scale",
@@ -187,11 +204,15 @@ class OrcaClient:
         ) as resp:
             data = await resp.json()
             if resp.status >= 400:
-                logger.error("scale_failed", status=resp.status, response=str(data)[:200])
+                logger.error(
+                    "scale_failed", status=resp.status, response=str(data)[:200]
+                )
                 resp.raise_for_status()
             return data
 
-    async def kill_replicas(self, job_id: str, replica_ids: List[str]) -> Dict[str, Any]:
+    async def kill_replicas(
+        self, job_id: str, replica_ids: List[str]
+    ) -> Dict[str, Any]:
         """POST /job/{id}/kill → terminate specific replicas, reclaim chunks."""
         payload = {"replica_ids": replica_ids}
         session = await self._get_session()
@@ -202,16 +223,22 @@ class OrcaClient:
         ) as resp:
             data = await resp.json()
             if resp.status >= 400:
-                logger.error("kill_failed", status=resp.status, response=str(data)[:200])
+                logger.error(
+                    "kill_failed", status=resp.status, response=str(data)[:200]
+                )
                 resp.raise_for_status()
             return data
 
     async def swap_replicas(
-        self, job_id: str,
-        gpu_type: str, tp: int, pp: int,
+        self,
+        job_id: str,
+        gpu_type: str,
+        tp: int,
+        pp: int,
         num_replicas: Optional[int] = None,
         ready_threshold: int = 1,
         on_demand: bool = False,
+        planned_market: Optional[str] = None,
     ) -> Dict[str, Any]:
         """POST /job/{id}/swap → hot-swap to new GPU config mid-job."""
         payload = {
@@ -221,6 +248,8 @@ class OrcaClient:
             "ready_threshold": ready_threshold,
             "on_demand": on_demand,
         }
+        if planned_market:
+            payload["planned_market"] = planned_market
         if num_replicas is not None:
             payload["num_replicas"] = num_replicas
 
@@ -232,7 +261,9 @@ class OrcaClient:
         ) as resp:
             data = await resp.json()
             if resp.status >= 400:
-                logger.error("swap_failed", status=resp.status, response=str(data)[:200])
+                logger.error(
+                    "swap_failed", status=resp.status, response=str(data)[:200]
+                )
                 resp.raise_for_status()
             return data
 
@@ -241,13 +272,16 @@ class OrcaClient:
 # Agent tool functions (async — safe to call from tool_runner)
 # ---------------------------------------------------------------------------
 
+
 async def async_launch_chain(
     orca: OrcaClient,
     model_name: str,
     input_file: str,
     instance_type: str,
     gpu_type: str,
-    tp: int, pp: int, dp: int,
+    tp: int,
+    pp: int,
+    dp: int,
     slo_deadline_hours: float,
     avg_input_tokens: int,
     avg_output_tokens: int,
@@ -256,9 +290,13 @@ async def async_launch_chain(
 ) -> str:
     """Launch a batch job via Orca. Returns job_id and status."""
     result = await orca.submit_batch(
-        model_name=model_name, input_file=input_file,
-        instance_type=instance_type, gpu_type=gpu_type,
-        tp=tp, pp=pp, dp=dp,
+        model_name=model_name,
+        input_file=input_file,
+        instance_type=instance_type,
+        gpu_type=gpu_type,
+        tp=tp,
+        pp=pp,
+        dp=dp,
         slo_deadline_hours=slo_deadline_hours,
         avg_input_tokens=avg_input_tokens,
         avg_output_tokens=avg_output_tokens,
@@ -273,20 +311,34 @@ async def async_launch_chain(
 async def async_scale_chain(
     orca: OrcaClient,
     job_id: str,
-    gpu_type: str, tp: int, pp: int,
+    gpu_type: str,
+    tp: int,
+    pp: int,
     count: int,
     on_demand: bool = False,
 ) -> str:
     """Scale a running job. Positive count = add replicas. Negative = kill excess."""
     if count > 0:
-        result = await orca.scale_job(job_id, gpu_type, tp, pp, count, on_demand=on_demand)
+        planned_market = "on_demand" if on_demand else "spot"
+        result = await orca.scale_job(
+            job_id,
+            gpu_type,
+            tp,
+            pp,
+            count,
+            on_demand=on_demand,
+            planned_market=planned_market,
+        )
         return f"Scaled up: {count} replicas added. {result}"
     elif count < 0:
         replicas_data = await orca.get_replicas(job_id)
         replicas = replicas_data.get("replicas", [])
-        active = [r["replica_id"] for r in replicas
-                  if r.get("phase") not in ("dead", "killed", "completed", "failed")]
-        to_kill = active[:abs(count)]  # kill the first N (oldest)
+        active = [
+            r["replica_id"]
+            for r in replicas
+            if r.get("phase") not in ("dead", "killed", "completed", "failed")
+        ]
+        to_kill = active[: abs(count)]  # kill the first N (oldest)
         if not to_kill:
             return "No active replicas to kill."
         result = await orca.kill_replicas(job_id, to_kill)
@@ -312,10 +364,12 @@ async def async_get_job_metrics(orca: OrcaClient, job_id: str) -> str:
     failed = progress.get("failed", 0)
     pct = (completed / max(total, 1)) * 100
 
-    return "\n".join([
-        f"Job {job_id} metrics:",
-        f"  Throughput: {tps:.0f} tok/s",
-        f"  GPU cache: {cache:.0%} | SM util: {sm_util:.0f}% | Mem BW: {mem_bw:.0f}%",
-        f"  Requests: {running} running, {waiting} waiting",
-        f"  Chunks: {completed}/{total} done ({pct:.0f}%), {failed} failed",
-    ])
+    return "\n".join(
+        [
+            f"Job {job_id} metrics:",
+            f"  Throughput: {tps:.0f} tok/s",
+            f"  GPU cache: {cache:.0%} | SM util: {sm_util:.0f}% | Mem BW: {mem_bw:.0f}%",
+            f"  Requests: {running} running, {waiting} waiting",
+            f"  Chunks: {completed}/{total} done ({pct:.0f}%), {failed} failed",
+        ]
+    )

@@ -5,19 +5,32 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 from koi.schemas import (
-    JobTracker, MonitoringStatus, PlacementConfig, EngineConfig, MonitoringTrigger,
+    JobTracker,
+    MonitoringStatus,
+    PlacementConfig,
+    EngineConfig,
+    MonitoringTrigger,
 )
 from koi.monitor import (
-    _ema, _classify_status, compute_slo_headroom,
-    MonitoringLoop, WARMUP_MINUTES,
+    _ema,
+    _classify_status,
+    _required_overprovision_elapsed_hours,
+    compute_slo_headroom,
+    MonitoringLoop,
+    WARMUP_MINUTES,
 )
 from koi.runtime_state import RuntimeStateStore
 
 
 def _make_config():
     return PlacementConfig(
-        gpu_type="L40S", instance_type="g6e.12xlarge",
-        num_gpus=8, num_instances=2, tp=4, pp=2, dp=1,
+        gpu_type="L40S",
+        instance_type="g6e.12xlarge",
+        num_gpus=8,
+        num_instances=2,
+        tp=4,
+        pp=2,
+        dp=1,
         region="us-east-1",
         engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=2),
     )
@@ -25,9 +38,12 @@ def _make_config():
 
 def _make_tracker(**overrides):
     defaults = dict(
-        job_id="job-test", config=_make_config(),
-        slo_deadline_hours=8.0, total_tokens=7_500_000,
-        predicted_tps=2590.0, tokens_remaining=7_500_000,
+        job_id="job-test",
+        config=_make_config(),
+        slo_deadline_hours=8.0,
+        total_tokens=7_500_000,
+        predicted_tps=2590.0,
+        tokens_remaining=7_500_000,
     )
     defaults.update(overrides)
     return JobTracker(**defaults)
@@ -69,6 +85,16 @@ class TestSLOHeadroom:
         h = compute_slo_headroom(8.0, 7.0, 3_600_000, 1000.0)
         assert abs(h) < 1.0
 
+    def test_late_job_with_buffer_stays_positive(self):
+        # 1.8M tokens, 1000 TPS → 0.5h remaining. SLO=8h, elapsed=7h → 1h left.
+        # This should be comfortably on track, not near-falling-behind.
+        h = compute_slo_headroom(8.0, 7.0, 1_800_000, 1000.0)
+        assert h == pytest.approx(50.0)
+
+    def test_overdue_job_is_clamped(self):
+        h = compute_slo_headroom(8.0, 8.5, 1_000_000, 1200.0)
+        assert h == -100.0
+
 
 class TestClassifyStatus:
     def test_warmup(self):
@@ -76,39 +102,73 @@ class TestClassifyStatus:
         assert _classify_status(tracker) == MonitoringStatus.WARMING_UP
 
     def test_warmup_complete(self):
-        tracker = _make_tracker(elapsed_hours=0.2, warmup_complete=True, slo_headroom_pct=80.0)
+        tracker = _make_tracker(
+            elapsed_hours=0.2, warmup_complete=True, slo_headroom_pct=60.0
+        )
         assert _classify_status(tracker) == MonitoringStatus.ON_TRACK
 
     def test_on_track(self):
-        tracker = _make_tracker(elapsed_hours=1.0, warmup_complete=True, slo_headroom_pct=50.0)
+        tracker = _make_tracker(
+            elapsed_hours=1.0, warmup_complete=True, slo_headroom_pct=50.0
+        )
         assert _classify_status(tracker) == MonitoringStatus.ON_TRACK
 
     def test_at_risk(self):
-        tracker = _make_tracker(elapsed_hours=5.0, warmup_complete=True, slo_headroom_pct=15.0)
+        tracker = _make_tracker(
+            elapsed_hours=5.0, warmup_complete=True, slo_headroom_pct=15.0
+        )
         assert _classify_status(tracker) == MonitoringStatus.AT_RISK
 
     def test_falling_behind(self):
-        tracker = _make_tracker(elapsed_hours=6.0, warmup_complete=True, slo_headroom_pct=5.0)
+        tracker = _make_tracker(
+            elapsed_hours=6.0, warmup_complete=True, slo_headroom_pct=5.0
+        )
         assert _classify_status(tracker) == MonitoringStatus.FALLING_BEHIND
 
     def test_over_provisioned(self):
-        # headroom > 70% AND elapsed > 20% of SLO
-        tracker = _make_tracker(elapsed_hours=2.0, warmup_complete=True, slo_headroom_pct=85.0)
+        # headroom > 70% AND elapsed exceeds the capped wait threshold
+        tracker = _make_tracker(
+            elapsed_hours=2.0, warmup_complete=True, slo_headroom_pct=85.0
+        )
         assert _classify_status(tracker) == MonitoringStatus.OVER_PROVISIONED
 
     def test_not_over_provisioned_too_early(self):
-        # headroom > 70% BUT elapsed < 20% of SLO → just ON_TRACK
-        tracker = _make_tracker(elapsed_hours=0.5, warmup_complete=True, slo_headroom_pct=85.0)
+        # headroom > 70% BUT elapsed < capped wait threshold → just ON_TRACK
+        tracker = _make_tracker(
+            elapsed_hours=0.03, warmup_complete=True, slo_headroom_pct=85.0
+        )
         assert _classify_status(tracker) == MonitoringStatus.ON_TRACK
+
+    def test_single_live_replica_can_mark_over_provisioned_by_default(self):
+        tracker = _make_tracker(
+            elapsed_hours=1.0, warmup_complete=True, slo_headroom_pct=85.0
+        )
+        assert (
+            _classify_status(tracker, active_replicas=1)
+            == MonitoringStatus.OVER_PROVISIONED
+        )
+
+
+class TestOverprovisionWindow:
+    def test_long_slo_wait_is_capped(self):
+        required = _required_overprovision_elapsed_hours(8.0)
+        assert required == pytest.approx(max(WARMUP_MINUTES / 60, 0.05))
+
+    def test_short_slo_still_respects_warmup_floor(self):
+        required = _required_overprovision_elapsed_hours(0.02)
+        assert required >= WARMUP_MINUTES / 60
 
 
 class TestMonitoringLoopRegistration:
     def test_register_job(self):
         monitor = MonitoringLoop(orca=MagicMock())
         monitor.register_job(
-            job_id="job-1", config=_make_config(),
-            slo_deadline_hours=8.0, total_tokens=7_500_000,
-            predicted_tps=2590.0, decision_id="dec-abc",
+            job_id="job-1",
+            config=_make_config(),
+            slo_deadline_hours=8.0,
+            total_tokens=7_500_000,
+            predicted_tps=2590.0,
+            decision_id="dec-abc",
         )
         assert "job-1" in monitor.tracked_jobs
         assert monitor.tracked_jobs["job-1"].decision_id == "dec-abc"
@@ -116,8 +176,10 @@ class TestMonitoringLoopRegistration:
     def test_unregister_job(self):
         monitor = MonitoringLoop(orca=MagicMock())
         monitor.register_job(
-            job_id="job-1", config=_make_config(),
-            slo_deadline_hours=8.0, total_tokens=7_500_000,
+            job_id="job-1",
+            config=_make_config(),
+            slo_deadline_hours=8.0,
+            total_tokens=7_500_000,
             predicted_tps=2590.0,
         )
         monitor.unregister_job("job-1")
@@ -130,8 +192,10 @@ class TestTriggerSuppression:
         """FALLING_BEHIND trigger should NOT emit for a replica already marked FAILED."""
         monitor = MonitoringLoop(orca=MagicMock())
         monitor.register_job(
-            job_id="job-1", config=_make_config(),
-            slo_deadline_hours=8.0, total_tokens=7_500_000,
+            job_id="job-1",
+            config=_make_config(),
+            slo_deadline_hours=8.0,
+            total_tokens=7_500_000,
             predicted_tps=2590.0,
         )
         tracker = monitor.tracked_jobs["job-1"]
@@ -147,14 +211,18 @@ class TestTriggerSuppression:
         """FAILED trigger should still emit even if status is already FAILED (idempotent)."""
         monitor = MonitoringLoop(orca=MagicMock())
         monitor.register_job(
-            job_id="job-1", config=_make_config(),
-            slo_deadline_hours=8.0, total_tokens=7_500_000,
+            job_id="job-1",
+            config=_make_config(),
+            slo_deadline_hours=8.0,
+            total_tokens=7_500_000,
             predicted_tps=2590.0,
         )
         tracker = monitor.tracked_jobs["job-1"]
         tracker.status = MonitoringStatus.FAILED
 
-        await monitor._emit_trigger("job-1", MonitoringStatus.FAILED, "Heartbeat timeout")
+        await monitor._emit_trigger(
+            "job-1", MonitoringStatus.FAILED, "Heartbeat timeout"
+        )
 
         assert not monitor._trigger_queue.empty()
 
@@ -174,8 +242,11 @@ class TestGroupAggregation:
         group = {"r0": t1, "r1": t2, "r2": t3}
 
         # Filter like the production code does
-        live = {k: v for k, v in group.items()
-                if v.status not in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED)}
+        live = {
+            k: v
+            for k, v in group.items()
+            if v.status not in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED)
+        }
         aggregate = sum(t.smoothed_tps for t in live.values())
 
         assert "r1" not in live  # dead replica excluded
@@ -189,8 +260,11 @@ class TestGroupAggregation:
         t2.status = MonitoringStatus.COMPLETED
 
         group = {"r0": t1, "r1": t2}
-        live = {k: v for k, v in group.items()
-                if v.status not in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED)}
+        live = {
+            k: v
+            for k, v in group.items()
+            if v.status not in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED)
+        }
         aggregate = sum(t.smoothed_tps for t in live.values()) if live else 0
 
         assert aggregate == 0
@@ -222,17 +296,24 @@ class TestMonitoringLoopPersistence:
         store = RuntimeStateStore(str(tmp_path / "runtime.sqlite"))
         monitor = MonitoringLoop(orca=MagicMock(), runtime_state=store)
 
-        monitor.track_pending_launch("replica-1", {
-            "group_id": "grp-1",
-            "gpu_type": "L40S",
-            "instance_type": "g6e.12xlarge",
-            "region": "us-west-2",
-            "market": "spot",
-        })
+        monitor.track_pending_launch(
+            "replica-1",
+            {
+                "group_id": "grp-1",
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+                "region": "us-west-2",
+                "market": "spot",
+            },
+        )
         assert store.load_pending_launches()["replica-1"]["launch"]["market"] == "spot"
 
-        monitor.enqueue_pending_scale_decision("grp-1", {"decision_id": "dec-a", "remaining": 2})
-        monitor.enqueue_pending_scale_decision("grp-1", {"decision_id": "dec-b", "remaining": 1})
+        monitor.enqueue_pending_scale_decision(
+            "grp-1", {"decision_id": "dec-a", "remaining": 2}
+        )
+        monitor.enqueue_pending_scale_decision(
+            "grp-1", {"decision_id": "dec-b", "remaining": 1}
+        )
         assert store.load_pending_scale_decisions()["grp-1"] == [
             {"decision_id": "dec-a", "remaining": 2},
             {"decision_id": "dec-b", "remaining": 1},
@@ -252,18 +333,22 @@ class TestMonitoringLoopPersistence:
     async def test_poll_job_persists_updated_tracker_state(self, tmp_path):
         store = RuntimeStateStore(str(tmp_path / "runtime.sqlite"))
         orca = MagicMock()
-        orca.get_job_metrics = AsyncMock(return_value={
-            "avg_generation_throughput_toks_per_s": 1000.0,
-            "gpu_cache_usage_perc": 25.0,
-            "gpu_sm_util_pct": 50.0,
-            "gpu_mem_bw_util_pct": 60.0,
-        })
-        orca.get_chunk_progress = AsyncMock(return_value={
-            "total": 10,
-            "completed": 5,
-            "failed": 0,
-            "all_done": False,
-        })
+        orca.get_job_metrics = AsyncMock(
+            return_value={
+                "avg_generation_throughput_toks_per_s": 1000.0,
+                "gpu_cache_usage_perc": 25.0,
+                "gpu_sm_util_pct": 50.0,
+                "gpu_mem_bw_util_pct": 60.0,
+            }
+        )
+        orca.get_chunk_progress = AsyncMock(
+            return_value={
+                "total": 10,
+                "completed": 5,
+                "failed": 0,
+                "all_done": False,
+            }
+        )
         orca.get_job_status = AsyncMock(return_value={"status": "running"})
 
         monitor = MonitoringLoop(orca=orca, runtime_state=store)
@@ -297,16 +382,22 @@ class TestMonitoringLoopPersistence:
             smoothed_tps=850.0,
         )
         store.upsert_tracked_job("job-restore", tracker.model_dump(mode="json"))
-        store.upsert_pending_launch("replica-restore", {
-            "group_id": "grp-restore",
-            "gpu_type": "L40S",
-            "instance_type": "g6e.12xlarge",
-            "region": "us-west-2",
-            "market": "spot",
-        })
-        store.replace_pending_scale_group("grp-restore", [
-            {"decision_id": "dec-scale", "remaining": 2},
-        ])
+        store.upsert_pending_launch(
+            "replica-restore",
+            {
+                "group_id": "grp-restore",
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+                "region": "us-west-2",
+                "market": "spot",
+            },
+        )
+        store.replace_pending_scale_group(
+            "grp-restore",
+            [
+                {"decision_id": "dec-scale", "remaining": 2},
+            ],
+        )
 
         restored = MonitoringLoop(
             orca=MagicMock(),
@@ -323,4 +414,7 @@ class TestMonitoringLoopPersistence:
         assert restored.tracked_jobs["job-restore"].action_in_progress is False
         assert restored.tracked_jobs["job-restore"].action_freeze_until is None
         assert restored._pending_launches["replica-restore"]["market"] == "spot"
-        assert restored._pending_scale_decisions["grp-restore"][0]["decision_id"] == "dec-scale"
+        assert (
+            restored._pending_scale_decisions["grp-restore"][0]["decision_id"]
+            == "dec-scale"
+        )

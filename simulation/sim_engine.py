@@ -14,11 +14,13 @@ class SimReplica:
     base_tps: float = 1200.0
     gpu_type: str = "L40S"
     instance_type: str = "g6e.12xlarge"
+    num_instances: int = 1
     tp: int = 4
     pp: int = 2
     region: str = "us-east-1"
     market: str = "on_demand"
     config_index: int = 0
+    decision_id: Optional[str] = None
     started_at: float = field(default_factory=time.time)
     last_heartbeat: float = field(default_factory=time.time)
     warmup_seconds: float = 30.0
@@ -67,8 +69,14 @@ class SimState:
         return next(iter(self.jobs.values()), None)
 
 
-def aggregate_job_tps(job: SimJob, running_phases: tuple[str, ...] = ("running",)) -> float:
-    return sum(replica.tps for replica in job.replicas.values() if replica.phase in running_phases)
+def aggregate_job_tps(
+    job: SimJob, running_phases: tuple[str, ...] = ("running",)
+) -> float:
+    return sum(
+        replica.tps
+        for replica in job.replicas.values()
+        if replica.phase in running_phases
+    )
 
 
 async def advance_chunks_once(
@@ -89,7 +97,9 @@ async def advance_chunks_once(
 
         tokens_this_tick = aggregate_tps * tick_seconds
         chunks_this_tick = tokens_this_tick / max(job.tokens_per_chunk, 1)
-        job.completed_chunks = min(job.total_chunks, job.completed_chunks + int(chunks_this_tick))
+        job.completed_chunks = min(
+            job.total_chunks, job.completed_chunks + int(chunks_this_tick)
+        )
 
         for replica in job.replicas.values():
             if replica.phase == "running":

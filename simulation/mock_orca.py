@@ -30,11 +30,35 @@ import asyncio
 import logging
 import random
 import time
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+try:
+    from simulation.orca_webhooks import (
+        build_complete_payload,
+        build_config_attempt_payload,
+        build_launch_heartbeat_payload,
+        build_launch_failed_payload,
+        build_launching_payload,
+        build_replica_failed_payload,
+        build_started_payload,
+        heartbeat_message,
+    )
+except ModuleNotFoundError:
+    from orca_webhooks import (  # type: ignore
+        build_complete_payload,
+        build_config_attempt_payload,
+        build_launch_heartbeat_payload,
+        build_launch_failed_payload,
+        build_launching_payload,
+        build_replica_failed_payload,
+        build_started_payload,
+        heartbeat_message,
+    )
 
 try:
     from simulation.sim_engine import (
@@ -54,22 +78,97 @@ except ModuleNotFoundError:
         aggregate_job_tps,
     )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S"
+)
 logger = logging.getLogger("mock_orca")
 
 app = FastAPI(title="Mock Orca", version="0.1")
 
 
 SIM = SimState()
+TERMINAL_REPLICA_PHASES = {"dead", "killed", "failed", "completed"}
+RESOURCE_INSTANCES = [
+    {
+        "instance_type": "g6e.12xlarge",
+        "gpu_type": "L40S",
+        "gpus_per_instance": 4,
+        "gpu_memory_gb": 48,
+        "vcpus": 48,
+        "quota_family": "G6E",
+        "cost_per_instance_hour_usd": 7.35,
+    },
+    {
+        "instance_type": "g6e.48xlarge",
+        "gpu_type": "L40S",
+        "gpus_per_instance": 8,
+        "gpu_memory_gb": 48,
+        "vcpus": 192,
+        "quota_family": "G6E",
+        "cost_per_instance_hour_usd": 14.69,
+    },
+]
+RESOURCE_QUOTAS = [
+    {
+        "family": "G6E",
+        "region": "us-east-1",
+        "market": "on_demand",
+        "baseline_vcpus": 384,
+        "used_vcpus": 0,
+    },
+    {
+        "family": "G6E",
+        "region": "us-east-2",
+        "market": "on_demand",
+        "baseline_vcpus": 192,
+        "used_vcpus": 0,
+    },
+]
 
 
 # ---------------------------------------------------------------------------
 # Chunk progress background task
 # ---------------------------------------------------------------------------
 
+
 async def _advance_chunks():
     """Background loop: advance completed chunks based on aggregate TPS."""
-    await advance_chunks_loop(SIM, notify_complete=_notify_koi_complete, tick_seconds=5.0)
+    await advance_chunks_loop(
+        SIM, notify_complete=_notify_koi_complete, tick_seconds=5.0
+    )
+
+
+def _resource_snapshot() -> Dict[str, Any]:
+    instances = deepcopy(RESOURCE_INSTANCES)
+    quotas = deepcopy(RESOURCE_QUOTAS)
+    instances_by_type = {item["instance_type"]: item for item in instances}
+    used_vcpus = {
+        (quota["family"], quota["region"], quota["market"]): int(
+            quota.get("used_vcpus", 0)
+        )
+        for quota in quotas
+    }
+    for job in SIM.jobs.values():
+        for replica in job.replicas.values():
+            if replica.phase in TERMINAL_REPLICA_PHASES:
+                continue
+            instance = instances_by_type.get(replica.instance_type)
+            if not instance:
+                continue
+            key = (instance["quota_family"], replica.region, replica.market)
+            used_vcpus[key] = used_vcpus.get(key, 0) + (
+                int(instance["vcpus"])
+                * max(1, int(getattr(replica, "num_instances", 1)))
+            )
+
+    for quota in quotas:
+        key = (quota["family"], quota["region"], quota["market"])
+        quota["used_vcpus"] = used_vcpus.get(key, int(quota.get("used_vcpus", 0)))
+
+    return {
+        "instances": instances,
+        "quotas": quotas,
+    }
 
 
 async def _notify_koi_complete(job: SimJob):
@@ -77,15 +176,14 @@ async def _notify_koi_complete(job: SimJob):
     agg_tps = aggregate_job_tps(job, running_phases=("running", "completed"))
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(f"{SIM.koi_url}/job/complete", json={
-                "job_id": job.job_id,
-                "status": "succeeded",
-                "metrics": {
-                    "avg_generation_throughput_toks_per_s": agg_tps,
-                    "throughput_tokens_per_sec": agg_tps,
-                },
-            }, timeout=5)
-        logger.info(f"[Sim] Notified Koi: job {job.job_id} complete (TPS={agg_tps:.0f})")
+            await client.post(
+                f"{SIM.koi_url}/job/complete",
+                json=build_complete_payload(job_id=job.job_id, throughput_tps=agg_tps),
+                timeout=5,
+            )
+        logger.info(
+            f"[Sim] Notified Koi: job {job.job_id} complete (TPS={agg_tps:.0f})"
+        )
     except Exception as e:
         logger.warning(f"[Sim] Failed to notify Koi of completion: {e}")
 
@@ -94,37 +192,76 @@ async def _notify_koi_launching(job: SimJob, replica: SimReplica):
     """POST /job/launching to Koi (replica provisioned, pre-model_ready visibility)."""
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(f"{SIM.koi_url}/job/launching", json={
-                "job_id": replica.replica_id,
-                "group_id": job.job_id,
-                "gpu_type": replica.gpu_type,
-                "instance_type": replica.instance_type,
-                "tp": replica.tp,
-                "pp": replica.pp,
-                "region": replica.region,
-                "market": replica.market,
-            }, timeout=5)
+            await client.post(
+                f"{SIM.koi_url}/job/launching",
+                json=build_launching_payload(
+                    job_id=replica.replica_id,
+                    decision_id=replica.decision_id or job.decision_id,
+                    group_id=job.job_id,
+                    gpu_type=replica.gpu_type,
+                    instance_type=replica.instance_type,
+                    tp=replica.tp,
+                    pp=replica.pp,
+                    region=replica.region,
+                    market=replica.market,
+                    attempt_index=replica.config_index,
+                ),
+                timeout=5,
+            )
         logger.info(f"[Sim] Notified Koi: replica {replica.replica_id} launching")
     except Exception as e:
         logger.warning(f"[Sim] Failed to notify Koi of replica launching: {e}")
 
 
-async def _notify_koi_config_attempted(job: SimJob, replica: SimReplica, launched: bool,
-                                        failure_reason: str = ""):
+async def _notify_koi_launch_heartbeat(job: SimJob, replica: SimReplica, phase: str):
+    """POST /job/launch-heartbeat to Koi while the replica is still launching."""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{SIM.koi_url}/job/launch-heartbeat",
+                json=build_launch_heartbeat_payload(
+                    job_id=replica.replica_id,
+                    decision_id=replica.decision_id or job.decision_id,
+                    group_id=job.job_id,
+                    gpu_type=replica.gpu_type,
+                    instance_type=replica.instance_type,
+                    tp=replica.tp,
+                    pp=replica.pp,
+                    region=replica.region,
+                    market=replica.market,
+                    phase=phase,
+                    message=heartbeat_message(phase),
+                    attempt_index=replica.config_index,
+                    timestamp=time.time(),
+                ),
+                timeout=5,
+            )
+    except Exception:
+        pass
+
+
+async def _notify_koi_config_attempted(
+    job: SimJob, replica: SimReplica, launched: bool, failure_reason: str = ""
+):
     """POST /job/config-attempted to Koi."""
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(f"{SIM.koi_url}/job/config-attempted", json={
-                "job_id": job.job_id,
-                "decision_id": job.decision_id,
-                "instance_type": replica.instance_type,
-                "gpu_type": replica.gpu_type,
-                "region": replica.region,
-                "market": replica.market,
-                "launched": launched,
-                "failure_reason": failure_reason,
-                "attempt_index": replica.config_index,
-            }, timeout=5)
+            await client.post(
+                f"{SIM.koi_url}/job/config-attempted",
+                json=build_config_attempt_payload(
+                    job_id=job.job_id,
+                    decision_id=replica.decision_id or job.decision_id,
+                    instance_type=replica.instance_type,
+                    gpu_type=replica.gpu_type,
+                    region=replica.region,
+                    market=replica.market,
+                    launched=launched,
+                    failure_reason=failure_reason,
+                    attempt_index=replica.config_index,
+                    time_to_launch=max(0.0, time.time() - job.deploy_timestamp),
+                ),
+                timeout=5,
+            )
     except Exception:
         pass
 
@@ -136,21 +273,29 @@ async def _notify_koi_replica_started(job: SimJob, replica: SimReplica):
     total_tokens = job.total_chunks * job.tokens_per_chunk
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(f"{SIM.koi_url}/job/started", json={
-                "job_id": replica.replica_id,
-                "decision_id": job.decision_id,
-                "group_id": job.job_id,
-                "gpu_type": replica.gpu_type,
-                "instance_type": replica.instance_type,
-                "tp": replica.tp,
-                "pp": replica.pp,
-                "dp": 1,
-                "slo_deadline_hours": adjusted_slo,
-                "total_tokens": total_tokens,
-                "predicted_tps": replica.base_tps,
-                "is_fallback": replica.config_index > 0,
-            }, timeout=5)
-            logger.info(f"[Sim] Notified Koi: replica {replica.replica_id} started (resp={resp.status_code})")
+            resp = await client.post(
+                f"{SIM.koi_url}/job/started",
+                json=build_started_payload(
+                    job_id=replica.replica_id,
+                    decision_id=replica.decision_id or job.decision_id,
+                    group_id=job.job_id,
+                    gpu_type=replica.gpu_type,
+                    instance_type=replica.instance_type,
+                    tp=replica.tp,
+                    pp=replica.pp,
+                    dp=1,
+                    region=replica.region,
+                    market=replica.market,
+                    slo_deadline_hours=adjusted_slo,
+                    total_tokens=total_tokens,
+                    predicted_tps=replica.base_tps,
+                    is_fallback=replica.config_index > 0,
+                ),
+                timeout=5,
+            )
+            logger.info(
+                f"[Sim] Notified Koi: replica {replica.replica_id} started (resp={resp.status_code})"
+            )
     except Exception as e:
         logger.warning(f"[Sim] Failed to notify Koi of replica start: {e}")
 
@@ -159,52 +304,61 @@ async def _notify_koi_replica_failed(job: SimJob, replica: SimReplica, reason: s
     """POST /job/replica-failed to Koi."""
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(f"{SIM.koi_url}/job/replica-failed", json={
-                "job_id": replica.replica_id,
-                "group_id": job.job_id,
-                "status": "failed",
-                "reason": reason,
-            }, timeout=5)
-        logger.info(f"[Sim] Notified Koi: replica {replica.replica_id} failed ({reason})")
+            await client.post(
+                f"{SIM.koi_url}/job/replica-failed",
+                json=build_replica_failed_payload(
+                    job_id=replica.replica_id,
+                    group_id=job.job_id,
+                    reason=reason,
+                ),
+                timeout=5,
+            )
+        logger.info(
+            f"[Sim] Notified Koi: replica {replica.replica_id} failed ({reason})"
+        )
     except Exception as e:
         logger.warning(f"[Sim] Failed to notify Koi of replica failure: {e}")
+
+
+async def _notify_koi_launch_failed(
+    job: SimJob, replicas: List[SimReplica], failure_reason: str
+):
+    """POST /job/launch-failed to Koi when a launch never succeeds."""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{SIM.koi_url}/job/launch-failed",
+                json=build_launch_failed_payload(
+                    job_id=job.job_id,
+                    decision_id=job.decision_id,
+                    configs_tried=[
+                        {
+                            "instance_type": replica.instance_type,
+                            "gpu_type": replica.gpu_type,
+                            "region": replica.region,
+                            "market": replica.market,
+                        }
+                        for replica in replicas
+                    ],
+                    failure_reasons=[failure_reason for _ in replicas]
+                    or [failure_reason],
+                    total_time_seconds=max(0.0, time.time() - job.deploy_timestamp),
+                ),
+                timeout=5,
+            )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
 # Orca API endpoints (what Koi calls)
 # ---------------------------------------------------------------------------
 
+
 @app.get("/resources")
 async def get_resources():
     """Mock resource discovery — matches Orca Shape C format."""
-    return {
-        "instances": [
-            {
-                "instance_type": "g6e.12xlarge",
-                "gpu_type": "L40S",
-                "gpus_per_instance": 4,
-                "gpu_memory_gb": 48,
-                "vcpus": 48,
-                "quota_family": "G6E",
-                "cost_per_instance_hour_usd": 7.35,
-            },
-            {
-                "instance_type": "g6e.48xlarge",
-                "gpu_type": "L40S",
-                "gpus_per_instance": 8,
-                "gpu_memory_gb": 48,
-                "vcpus": 192,
-                "quota_family": "G6E",
-                "cost_per_instance_hour_usd": 14.69,
-            },
-        ],
-        "quotas": [
-            {"family": "G6E", "region": "us-east-1", "market": "on_demand",
-             "baseline_vcpus": 384, "used_vcpus": 0},
-            {"family": "G6E", "region": "us-east-2", "market": "on_demand",
-             "baseline_vcpus": 192, "used_vcpus": 0},
-        ],
-    }
+    return _resource_snapshot()
 
 
 @app.get("/job/{job_id}")
@@ -218,7 +372,9 @@ async def get_job_status(job_id: str):
         "status": job.status,
         "model_name": job.model_name,
         "num_replicas": len(job.replicas),
-        "active_replicas": sum(1 for r in job.replicas.values() if r.phase == "running"),
+        "active_replicas": sum(
+            1 for r in job.replicas.values() if r.phase == "running"
+        ),
     }
 
 
@@ -270,7 +426,14 @@ async def get_chunk_progress(job_id: str):
     """Chunk progress."""
     job = SIM.jobs.get(job_id)
     if not job:
-        return {"total": 0, "pending": 0, "inflight": 0, "completed": 0, "failed": 0, "all_done": False}
+        return {
+            "total": 0,
+            "pending": 0,
+            "inflight": 0,
+            "completed": 0,
+            "failed": 0,
+            "all_done": False,
+        }
     pending = job.total_chunks - job.completed_chunks - job.failed_chunks
     return {
         "total": job.total_chunks,
@@ -342,7 +505,9 @@ async def scale_job(job_id: str, req: ScaleRequest):
         )
         job.replicas[rid] = replica
         new_replicas.append(rid)
-        logger.info(f"[Sim] Scale-up: replica {rid} launching (TP={req.tp_size} PP={req.pp_size})")
+        logger.info(
+            f"[Sim] Scale-up: replica {rid} launching (TP={req.tp_size} PP={req.pp_size})"
+        )
 
     # Simulate launch delay, then notify Koi
     asyncio.create_task(_delayed_replica_ready(job, new_replicas))
@@ -350,7 +515,9 @@ async def scale_job(job_id: str, req: ScaleRequest):
     return {"status": "scaling", "new_replicas": new_replicas}
 
 
-async def _delayed_replica_ready(job: SimJob, replica_ids: List[str], delay: float = 15.0):
+async def _delayed_replica_ready(
+    job: SimJob, replica_ids: List[str], delay: float = 15.0
+):
     """Simulate provisioning + model loading delay, then mark running and notify Koi."""
     # Phase 1: provisioned (fire /job/launching + /job/config-attempted)
     await asyncio.sleep(3)
@@ -360,12 +527,14 @@ async def _delayed_replica_ready(job: SimJob, replica_ids: List[str], delay: flo
             replica.phase = "provisioned"
             await _notify_koi_launching(job, replica)
             await _notify_koi_config_attempted(job, replica, launched=True)
+            await _notify_koi_launch_heartbeat(job, replica, "waiting_model_ready")
 
     # Phase 2: model loading → running (fire /job/started)
     await asyncio.sleep(max(0, delay - 3))
     for rid in replica_ids:
         replica = job.replicas.get(rid)
         if replica and replica.phase == "provisioned":
+            await _notify_koi_launch_heartbeat(job, replica, "waiting_model_ready")
             replica.phase = "running"
             replica.base_tps = 1200.0  # default TPS for new replica
             replica.started_at = time.time()
@@ -417,12 +586,15 @@ async def swap_replicas(job_id: str, req: SwapRequest):
 # Control endpoints (/sim/*)
 # ---------------------------------------------------------------------------
 
+
 class KillReplicaRequest(BaseModel):
     reason: str = "Simulated EC2 termination"
 
 
 @app.post("/sim/kill-replica/{replica_id}")
-async def sim_kill_replica(replica_id: str, req: KillReplicaRequest = KillReplicaRequest()):
+async def sim_kill_replica(
+    replica_id: str, req: KillReplicaRequest = KillReplicaRequest()
+):
     """Simulate a replica dying. Pass reason to control failure category."""
     for job in SIM.jobs.values():
         replica = job.replicas.get(replica_id)
@@ -455,7 +627,9 @@ async def sim_set_tps(replica_id: str, req: SetTpsRequest):
         if replica:
             old_tps = replica.base_tps
             replica.base_tps = req.tps
-            logger.info(f"[Sim] Set TPS for {replica_id}: {old_tps:.0f} → {req.tps:.0f}")
+            logger.info(
+                f"[Sim] Set TPS for {replica_id}: {old_tps:.0f} → {req.tps:.0f}"
+            )
             return {"status": "updated", "replica_id": replica_id, "tps": req.tps}
     raise HTTPException(404, f"Replica {replica_id} not found")
 
@@ -484,14 +658,25 @@ async def sim_degrade_replica(replica_id: str, req: DegradeRequest):
         replica = job.replicas.get(replica_id)
         if replica:
             start_tps = replica.base_tps
-            logger.info(f"[Sim] Degrading {replica_id}: {start_tps:.0f} → {req.target_tps:.0f} over {req.over_seconds}s")
-            asyncio.create_task(_gradual_degrade(replica, start_tps, req.target_tps, req.over_seconds))
-            return {"status": "degrading", "replica_id": replica_id,
-                    "from_tps": start_tps, "to_tps": req.target_tps, "seconds": req.over_seconds}
+            logger.info(
+                f"[Sim] Degrading {replica_id}: {start_tps:.0f} → {req.target_tps:.0f} over {req.over_seconds}s"
+            )
+            asyncio.create_task(
+                _gradual_degrade(replica, start_tps, req.target_tps, req.over_seconds)
+            )
+            return {
+                "status": "degrading",
+                "replica_id": replica_id,
+                "from_tps": start_tps,
+                "to_tps": req.target_tps,
+                "seconds": req.over_seconds,
+            }
     raise HTTPException(404, f"Replica {replica_id} not found")
 
 
-async def _gradual_degrade(replica: SimReplica, start_tps: float, target_tps: float, seconds: float):
+async def _gradual_degrade(
+    replica: SimReplica, start_tps: float, target_tps: float, seconds: float
+):
     """Linearly ramp TPS from start to target over N seconds."""
     steps = int(seconds / 2)  # update every 2s
     for i in range(steps + 1):
@@ -531,8 +716,13 @@ async def sim_state():
             "replicas_alive": alive,
             "replicas_total": len(job.replicas),
             "replicas": {
-                rid: {"phase": r.phase, "tps": r.tps, "gpu": r.gpu_type,
-                       "tp": r.tp, "pp": r.pp}
+                rid: {
+                    "phase": r.phase,
+                    "tps": r.tps,
+                    "gpu": r.gpu_type,
+                    "tp": r.tp,
+                    "pp": r.pp,
+                }
                 for rid, r in job.replicas.items()
             },
         }
@@ -543,6 +733,7 @@ async def sim_state():
 # Startup: create initial job + replicas, ask Koi for /decide, send /job/started
 # ---------------------------------------------------------------------------
 
+
 @app.on_event("startup")
 async def startup():
     """Start chunk advancement loop."""
@@ -551,9 +742,15 @@ async def startup():
 
 
 async def init_scenario(
-    model_name: str, num_replicas: int, tps_per_replica: float,
-    total_chunks: int, slo_hours: float, gpu_type: str,
-    tp: int, pp: int, koi_url: str,
+    model_name: str,
+    num_replicas: int,
+    tps_per_replica: float,
+    total_chunks: int,
+    slo_hours: float,
+    gpu_type: str,
+    tp: int,
+    pp: int,
+    koi_url: str,
 ):
     """Initialize the simulated scenario: create job, ask Koi for decision, register replicas."""
     SIM.koi_url = koi_url
@@ -575,29 +772,36 @@ async def init_scenario(
             replica_id=rid,
             base_tps=tps_per_replica,
             gpu_type=gpu_type,
-            tp=tp, pp=pp,
+            tp=tp,
+            pp=pp,
             config_index=0,
         )
 
     SIM.jobs[job_id] = job
-    logger.info(f"[Sim] Job {job_id}: {num_replicas} replicas × {tps_per_replica} TPS, "
-                f"{total_chunks} chunks, SLO={slo_hours}h")
+    logger.info(
+        f"[Sim] Job {job_id}: {num_replicas} replicas × {tps_per_replica} TPS, "
+        f"{total_chunks} chunks, SLO={slo_hours}h"
+    )
 
     # Step 1: Ask Koi for a decision
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(f"{koi_url}/decide", json={
-                "job_request": {
-                    "model_name": model_name,
-                    "task_type": "batch",
-                    "avg_input_tokens": 800,
-                    "avg_output_tokens": 200,
-                    "num_requests": total_chunks * 10,
-                    "slo_deadline_hours": slo_hours,
-                    "objective": "cheapest",
+            resp = await client.post(
+                f"{koi_url}/decide",
+                json={
+                    "job_request": {
+                        "model_name": model_name,
+                        "task_type": "batch",
+                        "avg_input_tokens": 800,
+                        "avg_output_tokens": 200,
+                        "num_requests": total_chunks,
+                        "slo_deadline_hours": slo_hours,
+                        "objective": "cheapest",
+                    },
+                    "resource_map": await get_resources(),
                 },
-                "resource_map": await get_resources(),
-            }, timeout=120)
+                timeout=120,
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 job.decision_id = data.get("_decision_id")
@@ -609,14 +813,20 @@ async def init_scenario(
                         r.pp = cfg.get("pp", r.pp)
                         r.gpu_type = cfg.get("gpu_type", r.gpu_type)
                         r.instance_type = cfg.get("instance_type", r.instance_type)
-                logger.info(f"[Sim] Koi decision: {cfg.get('gpu_type', '?')} "
-                           f"TP={cfg.get('tp', '?')} PP={cfg.get('pp', '?')} "
-                           f"(decision_id={job.decision_id})")
+                logger.info(
+                    f"[Sim] Koi decision: {cfg.get('gpu_type', '?')} "
+                    f"TP={cfg.get('tp', '?')} PP={cfg.get('pp', '?')} "
+                    f"(decision_id={job.decision_id})"
+                )
             else:
-                logger.warning(f"[Sim] Koi /decide returned {resp.status_code}: {resp.text[:200]}")
+                logger.warning(
+                    f"[Sim] Koi /decide returned {resp.status_code}: {resp.text[:200]}"
+                )
     except Exception as e:
         logger.warning(f"[Sim] Could not reach Koi at {koi_url}/decide: {e}")
-        logger.info("[Sim] Continuing without Koi decision — replicas will register without decision_id")
+        logger.info(
+            "[Sim] Continuing without Koi decision — replicas will register without decision_id"
+        )
 
     # Step 2: Simulate provisioning → notify /job/launching + /job/config-attempted
     await asyncio.sleep(1)
@@ -624,35 +834,48 @@ async def init_scenario(
         replica.phase = "provisioned"
         await _notify_koi_launching(job, replica)
         await _notify_koi_config_attempted(job, replica, launched=True)
+        await _notify_koi_launch_heartbeat(job, replica, "waiting_model_ready")
         await asyncio.sleep(0.3)
 
     # Step 3: Model loaded → notify /job/started
     await asyncio.sleep(1)
     for rid, replica in job.replicas.items():
+        await _notify_koi_launch_heartbeat(job, replica, "waiting_model_ready")
         replica.phase = "running"
         await _notify_koi_replica_started(job, replica)
         await asyncio.sleep(0.3)
 
-    logger.info(f"[Sim] All {num_replicas} replicas registered with Koi. Chunks advancing.")
+    logger.info(
+        f"[Sim] All {num_replicas} replicas registered with Koi. Chunks advancing."
+    )
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(description="Mock Orca server for Koi testing")
     parser.add_argument("--port", type=int, default=26336, help="Port to listen on")
-    parser.add_argument("--koi-url", default="http://localhost:8090", help="Koi service URL")
-    parser.add_argument("--model", default="Qwen/Qwen3-32B", help="Model name to simulate")
+    parser.add_argument(
+        "--koi-url", default="http://localhost:8090", help="Koi service URL"
+    )
+    parser.add_argument(
+        "--model", default="Qwen/Qwen3-32B", help="Model name to simulate"
+    )
     parser.add_argument("--replicas", type=int, default=4, help="Number of replicas")
     parser.add_argument("--tps", type=float, default=1200, help="TPS per replica")
-    parser.add_argument("--total-chunks", type=int, default=500, help="Total chunks in job")
+    parser.add_argument(
+        "--total-chunks", type=int, default=500, help="Total chunks in job"
+    )
     parser.add_argument("--slo", type=float, default=8.0, help="SLO deadline in hours")
     parser.add_argument("--gpu-type", default="L40S", help="GPU type")
     parser.add_argument("--tp", type=int, default=4, help="Tensor parallel")
     parser.add_argument("--pp", type=int, default=2, help="Pipeline parallel")
-    parser.add_argument("--no-decide", action="store_true", help="Skip calling Koi /decide")
+    parser.add_argument(
+        "--no-decide", action="store_true", help="Skip calling Koi /decide"
+    )
     args = parser.parse_args()
 
     import uvicorn
@@ -665,10 +888,15 @@ def main():
         else:
             # Just create the job without asking Koi
             await init_scenario(
-                model_name=args.model, num_replicas=args.replicas,
-                tps_per_replica=args.tps, total_chunks=args.total_chunks,
-                slo_hours=args.slo, gpu_type=args.gpu_type,
-                tp=args.tp, pp=args.pp, koi_url=args.koi_url,
+                model_name=args.model,
+                num_replicas=args.replicas,
+                tps_per_replica=args.tps,
+                total_chunks=args.total_chunks,
+                slo_hours=args.slo,
+                gpu_type=args.gpu_type,
+                tp=args.tp,
+                pp=args.pp,
+                koi_url=args.koi_url,
             )
 
     uvicorn.run(app, host="0.0.0.0", port=args.port)
@@ -683,10 +911,15 @@ async def _init_with_retry(args, max_retries: int = 12, delay: float = 5.0):
                 if resp.status_code == 200:
                     logger.info(f"[Sim] Koi is ready (attempt {attempt + 1})")
                     await init_scenario(
-                        model_name=args.model, num_replicas=args.replicas,
-                        tps_per_replica=args.tps, total_chunks=args.total_chunks,
-                        slo_hours=args.slo, gpu_type=args.gpu_type,
-                        tp=args.tp, pp=args.pp, koi_url=args.koi_url,
+                        model_name=args.model,
+                        num_replicas=args.replicas,
+                        tps_per_replica=args.tps,
+                        total_chunks=args.total_chunks,
+                        slo_hours=args.slo,
+                        gpu_type=args.gpu_type,
+                        tp=args.tp,
+                        pp=args.pp,
+                        koi_url=args.koi_url,
                     )
                     return
         except Exception:

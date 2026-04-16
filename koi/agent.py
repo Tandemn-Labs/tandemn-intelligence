@@ -17,21 +17,37 @@ from anthropic import AsyncAnthropic, beta_async_tool
 from koi.event_tap import emit_event
 from koi.logging_config import get_logger
 from koi.schemas import (
-    AgentDecision, DataSource, EngineConfig, JobRequest,
-    MonitoringStatus, MonitoringTrigger, PlacementConfig, ResourceMap,
+    AgentDecision,
+    DataSource,
+    EngineConfig,
+    JobRequest,
+    MonitoringStatus,
+    MonitoringTrigger,
+    PlacementConfig,
+    ResourceMap,
 )
 from koi.tools.memory import AgenticMemory
 from koi.tools.orca_api import OrcaClient
 from koi.tools.perfdb import PerfDB
 from koi.tools.physics import (
-    ModelFeatures, find_similar_models, get_gpu_physics,
-    get_model_arch, get_model_features, lookup_gpu_spec,
+    ModelFeatures,
+    find_similar_models,
+    get_gpu_physics,
+    get_model_arch,
+    get_model_features,
+    lookup_gpu_spec,
 )
-from koi.tools.resources import get_resources, parse_orca_resources
+from koi.tools.resources import (
+    format_quota_status,
+    get_matching_quota_rows,
+    get_resources,
+    normalize_gpu_type,
+    parse_orca_resources,
+)
 
 logger = get_logger("koi.agent")
 
-DECIDE_TIMEOUT = float(os.environ.get("KOI_DECIDE_TIMEOUT", "300"))    # 5 min
+DECIDE_TIMEOUT = float(os.environ.get("KOI_DECIDE_TIMEOUT", "300"))  # 5 min
 TRIGGER_TIMEOUT = float(os.environ.get("KOI_TRIGGER_TIMEOUT", "180"))  # 3 min
 
 
@@ -56,6 +72,12 @@ DECISION FRAMEWORK (follow this order STRICTLY):
    But if memory already has ground truth for this model, PerfDB is secondary — memory wins.
 3. CHECK PHYSICS — get_gpu_physics() and get_model_arch() to understand bottlenecks.
 4. If no data at all, use physics-based reasoning (roofline estimate).
+
+MARKET RULES:
+- Respect preferred_market if the user provides one.
+- planned_market is your recommendation before launch. Orca will report the actual launch market later.
+- Before recommending spot, verify live quota with get_quota_status_tool().
+- Orca omits zero-baseline quota rows. If a (family, region, market) row is missing, treat it as ZERO quota.
 
 TRUST HIERARCHY: ground truth outcome > PerfDB benchmarks > past decisions (unverified) > physics/roofline.
 
@@ -94,6 +116,7 @@ WHEN MONITORING TRIGGERS YOU:
 # KoiAgent
 # ---------------------------------------------------------------------------
 
+
 class KoiAgent:
     """
     Autonomous GPU placement agent.
@@ -108,12 +131,14 @@ class KoiAgent:
         perfdb: PerfDB,
         memory: AgenticMemory,
         orca: Optional[OrcaClient] = None,
+        ledger=None,
         api_key: Optional[str] = None,
         model: str = "claude-sonnet-4-6",
     ):
         self.perfdb = perfdb
         self.memory = memory
         self.orca = orca
+        self.ledger = ledger
         self.model = model
         self.monitor = None  # set by server.py after monitor is created
         self._client = AsyncAnthropic(
@@ -130,7 +155,27 @@ class KoiAgent:
         perfdb = self.perfdb
         memory = self.memory
         orca = self.orca
-        exclude_gpus = set(g.strip() for g in os.environ.get("KOI_EXCLUDE_GPUS", "").split(",") if g.strip())
+        ledger = self.ledger
+        exclude_gpus = set(
+            g.strip()
+            for g in os.environ.get("KOI_EXCLUDE_GPUS", "").split(",")
+            if g.strip()
+        )
+        live_snapshot: Dict[str, Any] = {"raw": None, "resource_map": resource_map}
+
+        async def _get_live_snapshot() -> tuple[
+            Optional[Dict[str, Any]], Optional[ResourceMap]
+        ]:
+            if live_snapshot["raw"] is not None or not orca:
+                return live_snapshot["raw"], live_snapshot["resource_map"]
+
+            raw = await orca.get_resources()
+            rm = parse_orca_resources(raw)
+            if ledger is not None:
+                rm = ledger.apply_to_resource_map(rm)
+            live_snapshot["raw"] = raw
+            live_snapshot["resource_map"] = rm
+            return raw, rm
 
         @beta_async_tool
         async def query_perfdb(
@@ -148,10 +193,19 @@ class KoiAgent:
             if gpu_type and gpu_type in exclude_gpus:
                 return f"GPU type {gpu_type} is excluded from consideration."
             from koi.tools.perfdb import query_perfdb as _qp
-            result = _qp(perfdb, model_name=model_name, gpu_type=gpu_type,
-                       tp=tp, pp=pp, io_ratio_min=io_ratio_min, io_ratio_max=io_ratio_max,
-                       sort_by=sort_by, limit=limit,
-                       exclude_gpus=exclude_gpus)
+
+            result = _qp(
+                perfdb,
+                model_name=model_name,
+                gpu_type=gpu_type,
+                tp=tp,
+                pp=pp,
+                io_ratio_min=io_ratio_min,
+                io_ratio_max=io_ratio_max,
+                sort_by=sort_by,
+                limit=limit,
+                exclude_gpus=exclude_gpus,
+            )
             return result
 
         @beta_async_tool
@@ -163,7 +217,10 @@ class KoiAgent:
         ) -> str:
             """Query Koi's memory for past job decisions, outcomes, and learned rules. Check this FIRST before PerfDB."""
             from koi.tools.memory import query_memory as _qm
-            return _qm(memory, model_name=model_name, job_id=job_id, status=status, limit=limit)
+
+            return _qm(
+                memory, model_name=model_name, job_id=job_id, status=status, limit=limit
+            )
 
         @beta_async_tool
         async def get_gpu_physics_tool(
@@ -199,8 +256,34 @@ class KoiAgent:
             """Get available GPU resources (types, counts, VRAM, cost, regions) from the cluster."""
             if resource_map:
                 from koi.tools.resources import get_resources as _gr
+
                 return _gr(resource_map)
+            if orca:
+                _, live_resource_map = await _get_live_snapshot()
+                if live_resource_map:
+                    from koi.tools.resources import get_resources as _gr
+
+                    return _gr(live_resource_map)
             return "No resource map available. Resources should be in prompt context."
+
+        if orca:
+
+            @beta_async_tool
+            async def get_quota_status_tool(
+                gpu_type: Optional[str] = None,
+                region: Optional[str] = None,
+                market: Optional[str] = None,
+            ) -> str:
+                """Inspect live Orca quota rows. Missing rows imply zero quota for that (family, region, market)."""
+                raw_resources, _ = await _get_live_snapshot()
+                if not raw_resources:
+                    return "No Orca quota data available."
+                return format_quota_status(
+                    raw_resources,
+                    gpu_type=gpu_type,
+                    region=region,
+                    market=market,
+                )
 
         @beta_async_tool
         async def record_outcome_tool(
@@ -217,11 +300,18 @@ class KoiAgent:
             diagnosis: narrative of what happened ('KV cache hit 92%, bandwidth-bound. Try A100.')
             bottleneck: 'memory_bound' | 'compute_bound' | 'kv_cache' | 'network' | 'unknown'"""
             from koi.tools.memory import record_outcome_tool as _rot
-            return _rot(memory, decision_id=decision_id, job_id=job_id,
-                       status=status, actual_tps=actual_tps,
-                       actual_cost_per_hour=actual_cost_per_hour,
-                       failure_category=failure_category, diagnosis=diagnosis,
-                       bottleneck=bottleneck)
+
+            return _rot(
+                memory,
+                decision_id=decision_id,
+                job_id=job_id,
+                status=status,
+                actual_tps=actual_tps,
+                actual_cost_per_hour=actual_cost_per_hour,
+                failure_category=failure_category,
+                diagnosis=diagnosis,
+                bottleneck=bottleneck,
+            )
 
         @beta_async_tool
         async def get_failure_summary_tool(
@@ -232,12 +322,14 @@ class KoiAgent:
             """Check GPU availability and failure history. Returns Beta-prior availability (%) with uncertainty,
             recent spot preemptions, and capacity failures. Call BEFORE replacing failed replicas."""
             import json as _json
+
             result = memory.get_failure_summary(gpu_type, region=region, market=market)
             return _json.dumps(result, indent=2)
 
         # Action tools — only when Orca is connected
         action_tools = []
         if orca:
+
             @beta_async_tool
             async def scale_chain_tool(
                 job_id: str,
@@ -262,40 +354,112 @@ class KoiAgent:
                 if on_demand is not None:
                     use_on_demand = on_demand
                 else:
-                    use_on_demand = parent.get("market", "on_demand") == "on_demand" if parent else False
+                    use_on_demand = (
+                        parent.get("market", "on_demand") == "on_demand"
+                        if parent
+                        else True
+                    )
                 market_str = "on_demand" if use_on_demand else "spot"
+                market_note = ""
 
-                resolved_instance_type = parent["instance_type"] if parent else "unknown"
-                resolved_cost_per_hour = parent["predicted_cost_per_hour"] if parent else 0
+                resolved_instance_type = (
+                    parent["instance_type"] if parent else "unknown"
+                )
+                resolved_cost_per_hour = (
+                    parent["predicted_cost_per_hour"] if parent else 0
+                )
                 resolved_region = "unknown"
                 try:
-                    rm = parse_orca_resources(await orca.get_resources())
+                    raw_resources, rm = await _get_live_snapshot()
                     resource = rm.get_resource(gpu_type)
+                    if isinstance(raw_resources, dict):
+                        for inst in raw_resources.get("instances", []):
+                            if (
+                                normalize_gpu_type(
+                                    inst.get("gpu_type"), inst.get("gpu_memory_gb")
+                                )
+                                != gpu_type
+                            ):
+                                continue
+                            resolved_instance_type = inst.get(
+                                "instance_type", resolved_instance_type
+                            )
+                            if count != 0:
+                                gpus_per_instance = int(
+                                    inst.get("gpus_per_instance", 1) or 1
+                                )
+                                num_instances = max(
+                                    1,
+                                    -(-tp * pp * abs(count) // gpus_per_instance),
+                                )
+                                resolved_cost_per_hour = num_instances * float(
+                                    inst.get("cost_per_instance_hour_usd", 0) or 0
+                                )
+                            break
                     if resource:
                         resolved_instance_type = resource.instance_type
                         resolved_region = resource.region
-                        num_instances = max(1, -(-tp * pp * abs(count) // resource.gpus_per_instance))
-                        resolved_cost_per_hour = num_instances * resource.cost_per_instance_hour_usd
+                        num_instances = max(
+                            1, -(-tp * pp * abs(count) // resource.gpus_per_instance)
+                        )
+                        resolved_cost_per_hour = (
+                            num_instances * resource.cost_per_instance_hour_usd
+                        )
+
+                    if isinstance(raw_resources, dict) and not use_on_demand:
+                        quota_rows, _, _ = get_matching_quota_rows(
+                            raw_resources,
+                            gpu_type=gpu_type,
+                            market="spot",
+                        )
+                        has_spot_capacity = any(
+                            row.get("available_vcpus", 0) > 0 for row in quota_rows
+                        )
+                        if not has_spot_capacity:
+                            use_on_demand = True
+                            market_str = "on_demand"
+                            market_note = (
+                                " Spot quota unavailable for requested GPU family; "
+                                "forced on-demand."
+                            )
                 except Exception as e:
-                    logger.warning("scale_resource_lookup_failed", job_id=job_id,
-                                   gpu_type=gpu_type, error=str(e))
+                    logger.warning(
+                        "scale_resource_lookup_failed",
+                        job_id=job_id,
+                        gpu_type=gpu_type,
+                        error=str(e),
+                    )
 
                 # For scale-down: mark replicas as intentionally killed so FAILED doesn't fire
                 if count < 0 and monitor:
                     try:
                         replicas_data = await orca.get_replicas(job_id)
-                        active = [r["replica_id"] for r in replicas_data.get("replicas", [])
-                                  if r.get("phase") not in ("dead", "killed", "completed", "failed")]
-                        to_kill = active[:abs(count)]
+                        active = [
+                            r["replica_id"]
+                            for r in replicas_data.get("replicas", [])
+                            if r.get("phase")
+                            not in ("dead", "killed", "completed", "failed")
+                        ]
+                        to_kill = active[: abs(count)]
                         monitor._koi_initiated_kills.update(to_kill)
                     except Exception as e:
-                        logger.warning("replica_list_failed_for_scale_down",
-                                       job_id=job_id, error=str(e))
+                        logger.warning(
+                            "replica_list_failed_for_scale_down",
+                            job_id=job_id,
+                            error=str(e),
+                        )
 
                 from koi.tools.orca_api import async_scale_chain
+
                 if count > 0:
                     scale_response = await orca.scale_job(
-                        job_id, gpu_type, tp, pp, count, on_demand=use_on_demand,
+                        job_id,
+                        gpu_type,
+                        tp,
+                        pp,
+                        count,
+                        on_demand=use_on_demand,
+                        planned_market=market_str,
                     )
                     if scale_response.get("status") != "scaling":
                         logger.warning(
@@ -311,7 +475,12 @@ class KoiAgent:
                     result = f"Scaled up: {count} replicas added. {scale_response}"
                 else:
                     result = await async_scale_chain(
-                        orca, job_id, gpu_type, tp, pp, count,
+                        orca,
+                        job_id,
+                        gpu_type,
+                        tp,
+                        pp,
+                        count,
                         on_demand=use_on_demand,
                     )
                 scale_dec_id = None
@@ -320,11 +489,16 @@ class KoiAgent:
                         job_id=job_id,
                         model_name=parent["model_name"] if parent else "unknown",
                         instance_type=resolved_instance_type,
-                        gpu_type=gpu_type, tp=tp, pp=pp, dp=abs(count),
+                        gpu_type=gpu_type,
+                        tp=tp,
+                        pp=pp,
+                        dp=abs(count),
                         num_gpus=tp * pp * abs(count),
                         predicted_tps=0,
                         predicted_cost_per_hour=resolved_cost_per_hour,
-                        slo_deadline_hours=parent["slo_deadline_hours"] if parent else 0,
+                        slo_deadline_hours=parent["slo_deadline_hours"]
+                        if parent
+                        else 0,
                         objective=parent["objective"] if parent else "cheapest",
                         avg_input_tokens=parent["avg_input_tokens"] if parent else 0,
                         avg_output_tokens=parent["avg_output_tokens"] if parent else 0,
@@ -333,22 +507,27 @@ class KoiAgent:
                         market=market_str,
                     )
                     if monitor and count > 0:
-                        monitor.enqueue_pending_scale_decision(job_id, {
-                            "decision_id": scale_dec_id,
-                            "remaining": abs(count),
-                            "region": resolved_region,
-                            "gpu_type": gpu_type,
-                        })
+                        monitor.enqueue_pending_scale_decision(
+                            job_id,
+                            {
+                                "decision_id": scale_dec_id,
+                                "remaining": abs(count),
+                                "region": resolved_region,
+                                "gpu_type": gpu_type,
+                            },
+                        )
                 # Anti-windup: freeze triggers for this job while scaling action takes effect
                 if monitor:
                     for tracker in monitor.tracked_jobs.values():
                         if tracker.group_id == job_id or tracker.job_id == job_id:
                             tracker.action_in_progress = True
-                            tracker.action_freeze_until = time.time() + 1200  # 20 min max, /job/started unfreezes early
+                            tracker.action_freeze_until = (
+                                time.time() + 1200
+                            )  # 20 min max, /job/started unfreezes early
                             monitor.persist_job(tracker.job_id)
                 if scale_dec_id and count > 0:
-                    return f"{result} decision_id={scale_dec_id}"
-                return result
+                    return f"{result}{market_note} decision_id={scale_dec_id}"
+                return f"{result}{market_note}"
 
             @beta_async_tool
             async def kill_replica_tool(job_id: str, replica_ids: list[str]) -> str:
@@ -369,13 +548,24 @@ class KoiAgent:
             async def get_job_metrics_tool(job_id: str) -> str:
                 """Get live throughput, GPU utilization, KV cache usage, and chunk progress for a running job."""
                 from koi.tools.orca_api import async_get_job_metrics
+
                 return await async_get_job_metrics(orca, job_id)
 
             action_tools = [scale_chain_tool, kill_replica_tool, get_job_metrics_tool]
 
-        return [query_perfdb, query_memory_tool, get_gpu_physics_tool,
-                get_model_arch_tool, find_similar_models_tool, get_resources_tool,
-                record_outcome_tool, get_failure_summary_tool] + action_tools
+        tools = [
+            query_perfdb,
+            query_memory_tool,
+            get_gpu_physics_tool,
+            get_model_arch_tool,
+            find_similar_models_tool,
+            get_resources_tool,
+            record_outcome_tool,
+            get_failure_summary_tool,
+        ]
+        if orca:
+            tools.append(get_quota_status_tool)
+        return tools + action_tools
 
     # ------------------------------------------------------------------
     # Main decision entry point
@@ -393,8 +583,12 @@ class KoiAgent:
         prompt = self._build_decide_prompt(job_request, resource_map)
         tools = self._build_tools(resource_map=resource_map)
 
-        logger.info("agent_deciding", model=job_request.model_name, job_id=job_request.job_id)
-        emit_event("agent_deciding", model=job_request.model_name, job_id=job_request.job_id)
+        logger.info(
+            "agent_deciding", model=job_request.model_name, job_id=job_request.job_id
+        )
+        emit_event(
+            "agent_deciding", model=job_request.model_name, job_id=job_request.job_id
+        )
 
         # Run the agentic loop with wall-clock timeout
         runner = self._client.beta.messages.tool_runner(
@@ -408,22 +602,40 @@ class KoiAgent:
 
         try:
             tool_calls, final_text = await asyncio.wait_for(
-                self._consume_runner(runner, "decide", job_id=job_request.job_id), timeout=DECIDE_TIMEOUT)
+                self._consume_runner(runner, "decide", job_id=job_request.job_id),
+                timeout=DECIDE_TIMEOUT,
+            )
         except asyncio.TimeoutError:
             elapsed = time.time() - t0
-            logger.error("decide_timeout", model=job_request.model_name,
-                         timeout=DECIDE_TIMEOUT, elapsed_s=round(elapsed, 1))
+            logger.error(
+                "decide_timeout",
+                model=job_request.model_name,
+                timeout=DECIDE_TIMEOUT,
+                elapsed_s=round(elapsed, 1),
+            )
             return self._fallback_decision(job_request, resource_map, elapsed)
 
         elapsed = time.time() - t0
         logger.info("agent_decided", elapsed_s=round(elapsed, 1), tool_calls=tool_calls)
-        emit_event("agent_decided", job_id=job_request.job_id, elapsed_s=round(elapsed, 1), tool_calls=tool_calls)
+        emit_event(
+            "agent_decided",
+            job_id=job_request.job_id,
+            elapsed_s=round(elapsed, 1),
+            tool_calls=tool_calls,
+        )
 
         # Parse the decision from the agent's response
-        decision = self._parse_decision(final_text, job_request, resource_map, tool_calls, elapsed)
+        decision = self._parse_decision(
+            final_text, job_request, resource_map, tool_calls, elapsed
+        )
 
         # Populate alternatives from cost table (exclude the primary config)
-        primary = (decision.config.gpu_type, decision.config.tp, decision.config.pp, decision.config.dp)
+        primary = (
+            decision.config.gpu_type,
+            decision.config.tp,
+            decision.config.pp,
+            decision.config.dp,
+        )
         alternatives = []
         for row in getattr(self, "_last_cost_rows", []):
             if not row["meets_slo"]:
@@ -431,7 +643,11 @@ class KoiAgent:
             candidate = (row["gpu_type"], row["tp"], row["pp"], row["dp"])
             if candidate == primary:
                 continue
-            alternatives.append(row)
+            if row.get("dp") != decision.config.dp:
+                continue
+            alt = dict(row)
+            alt["planned_market"] = decision.planned_market
+            alternatives.append(alt)
             if len(alternatives) >= 3:
                 break
         decision.alternatives = alternatives
@@ -447,8 +663,16 @@ class KoiAgent:
         prompt = self._build_trigger_prompt(trigger)
         tools = self._build_tools(monitor=self.monitor)
 
-        logger.info("trigger_handling", trigger_type=trigger.trigger_type.value, job_id=trigger.job_id)
-        emit_event("trigger_handling", trigger_type=trigger.trigger_type.value, job_id=trigger.job_id)
+        logger.info(
+            "trigger_handling",
+            trigger_type=trigger.trigger_type.value,
+            job_id=trigger.job_id,
+        )
+        emit_event(
+            "trigger_handling",
+            trigger_type=trigger.trigger_type.value,
+            job_id=trigger.job_id,
+        )
 
         runner = self._client.beta.messages.tool_runner(
             model=self.model,
@@ -461,10 +685,16 @@ class KoiAgent:
 
         try:
             _, final_text = await asyncio.wait_for(
-                self._consume_runner(runner, "trigger", job_id=trigger.job_id), timeout=TRIGGER_TIMEOUT)
+                self._consume_runner(runner, "trigger", job_id=trigger.job_id),
+                timeout=TRIGGER_TIMEOUT,
+            )
         except asyncio.TimeoutError:
-            logger.error("trigger_timeout", job_id=trigger.job_id,
-                         trigger_type=trigger.trigger_type.value, timeout=TRIGGER_TIMEOUT)
+            logger.error(
+                "trigger_timeout",
+                job_id=trigger.job_id,
+                trigger_type=trigger.trigger_type.value,
+                timeout=TRIGGER_TIMEOUT,
+            )
             return f"[TIMEOUT] Agent did not respond within {TRIGGER_TIMEOUT}s"
 
         logger.info("trigger_response", response=final_text[:200])
@@ -475,7 +705,9 @@ class KoiAgent:
     # Runner helpers
     # ------------------------------------------------------------------
 
-    async def _consume_runner(self, runner, label: str, job_id: Optional[str] = None) -> tuple:
+    async def _consume_runner(
+        self, runner, label: str, job_id: Optional[str] = None
+    ) -> tuple:
         """Consume all events from tool_runner. Returns (tool_calls, final_text)."""
         tool_calls = 0
         final_text = ""
@@ -486,54 +718,89 @@ class KoiAgent:
                 for block in event.content:
                     if hasattr(block, "type") and block.type == "tool_use":
                         tool_calls += 1
-                        logger.info("tool_call", label=label, call_number=tool_calls,
-                                    tool=block.name)
-                        emit_event("tool_call", label=label, call_number=tool_calls,
-                                   tool=block.name, job_id=job_id)
+                        logger.info(
+                            "tool_call",
+                            label=label,
+                            call_number=tool_calls,
+                            tool=block.name,
+                        )
+                        emit_event(
+                            "tool_call",
+                            label=label,
+                            call_number=tool_calls,
+                            tool=block.name,
+                            job_id=job_id,
+                        )
         if last_response and hasattr(last_response, "content"):
             for block in last_response.content:
                 if hasattr(block, "text"):
                     final_text += block.text
         return tool_calls, final_text
 
-    def _fallback_decision(self, req: JobRequest, rm: ResourceMap, elapsed: float) -> AgentDecision:
+    def _fallback_decision(
+        self, req: JobRequest, rm: ResourceMap, elapsed: float
+    ) -> AgentDecision:
         """Emergency fallback when agent times out. Picks cheapest SLO-meeting config."""
         rows = getattr(self, "_last_cost_rows", [])
         viable = [r for r in rows if r.get("meets_slo")]
         if viable:
             best = viable[0]
             config = PlacementConfig(
-                gpu_type=best["gpu_type"], instance_type=best.get("instance_type", "unknown"),
+                gpu_type=best["gpu_type"],
+                instance_type=best.get("instance_type", "unknown"),
                 num_gpus=best["tp"] * best["pp"] * best.get("dp", 1),
-                num_instances=max(1, (best["tp"] * best["pp"] * best.get("dp", 1)) // 8),
-                tp=best["tp"], pp=best["pp"], dp=best.get("dp", 1),
+                num_instances=max(
+                    1, (best["tp"] * best["pp"] * best.get("dp", 1)) // 8
+                ),
+                tp=best["tp"],
+                pp=best["pp"],
+                dp=best.get("dp", 1),
                 region=rm.region,
                 engine_config=EngineConfig(
-                    tensor_parallel_size=best["tp"], pipeline_parallel_size=best["pp"]),
+                    tensor_parallel_size=best["tp"], pipeline_parallel_size=best["pp"]
+                ),
+                market=best.get("planned_market", req.preferred_market or "on_demand"),
             )
             return AgentDecision(
                 job_id=req.job_id or "unknown",
                 model_name=req.model_name,
                 config=config,
+                planned_market=config.market,
                 predicted_tps=best.get("predicted_tps", 0),
                 predicted_cost_per_hour=best.get("cost_per_hour", 0),
                 predicted_total_cost=best.get("total_cost", 0),
                 reasoning=f"[TIMEOUT FALLBACK] Agent timed out after {elapsed:.0f}s. "
-                          f"Auto-selected cheapest SLO-meeting config.",
+                f"Auto-selected cheapest SLO-meeting config.",
                 confidence=0.3,
                 data_source=DataSource.ANALYTICAL,
                 latency_seconds=elapsed,
             )
         # Absolute fallback — no viable rows
         return AgentDecision(
-            job_id=req.job_id or "unknown", model_name=req.model_name,
+            job_id=req.job_id or "unknown",
+            model_name=req.model_name,
             config=PlacementConfig(
                 gpu_type=rm.resources[0].gpu_type if rm.resources else "L40S",
-                instance_type=rm.resources[0].instance_type if rm.resources else "unknown",
-                num_gpus=4, num_instances=1, tp=4, pp=1, dp=1, region=rm.region,
-                engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=1)),
-            predicted_tps=0, reasoning=f"[TIMEOUT FALLBACK] No viable configs. Elapsed {elapsed:.0f}s.",
-            confidence=0.1, data_source=DataSource.ANALYTICAL, latency_seconds=elapsed,
+                instance_type=rm.resources[0].instance_type
+                if rm.resources
+                else "unknown",
+                num_gpus=4,
+                num_instances=1,
+                tp=4,
+                pp=1,
+                dp=1,
+                region=rm.region,
+                engine_config=EngineConfig(
+                    tensor_parallel_size=4, pipeline_parallel_size=1
+                ),
+                market=req.preferred_market or "on_demand",
+            ),
+            planned_market=req.preferred_market or "on_demand",
+            predicted_tps=0,
+            reasoning=f"[TIMEOUT FALLBACK] No viable configs. Elapsed {elapsed:.0f}s.",
+            confidence=0.1,
+            data_source=DataSource.ANALYTICAL,
+            latency_seconds=elapsed,
         )
 
     # ------------------------------------------------------------------
@@ -549,16 +816,26 @@ class KoiAgent:
             return "COST TABLE: Cannot compute — total tokens unknown (num_requests not set)."
 
         lines = ["PRE-COMPUTED COST TABLE (sorted by total cost, cheapest first):"]
-        lines.append(f"  {'Source':<12} {'GPU':<12} {'Config':<18} {'TPS':>7} {'$/hr':>8} {'ETA(h)':>7} {'Total $':>9} {'SLO':>5} {'Avail':>10}")
-        lines.append(f"  {'─'*12} {'─'*12} {'─'*18} {'─'*7} {'─'*8} {'─'*7} {'─'*9} {'─'*5} {'─'*10}")
+        lines.append(
+            f"  {'Source':<12} {'GPU':<12} {'Config':<18} {'TPS':>7} {'$/hr':>8} {'ETA(h)':>7} {'Total $':>9} {'SLO':>5} {'Avail':>10}"
+        )
+        lines.append(
+            f"  {'─' * 12} {'─' * 12} {'─' * 18} {'─' * 7} {'─' * 8} {'─' * 7} {'─' * 9} {'─' * 5} {'─' * 10}"
+        )
 
         rows = []
 
         # Debug: exclude GPUs via env var (e.g. KOI_EXCLUDE_GPUS=A100-40GB,A100-80GB)
-        exclude_gpus = set(g.strip() for g in os.environ.get("KOI_EXCLUDE_GPUS", "").split(",") if g.strip())
+        exclude_gpus = set(
+            g.strip()
+            for g in os.environ.get("KOI_EXCLUDE_GPUS", "").split(",")
+            if g.strip()
+        )
 
         # 1. Ground truth outcomes from memory (highest trust)
-        outcomes = self.memory.query_outcomes(model_name=req.model_name, status="succeeded", limit=10)
+        outcomes = self.memory.query_outcomes(
+            model_name=req.model_name, status="succeeded", limit=10
+        )
         for o in outcomes:
             tps = o.get("actual_tps")
             cost_hr = o.get("actual_cost_per_hour")
@@ -572,10 +849,23 @@ class KoiAgent:
             tp, pp, dp = o.get("tp", 1), o.get("pp", 1), o.get("dp", 1)
             meets_slo = eta_h <= (req.slo_deadline_hours or 999)
             resource = rm.get_resource(gpu)
-            rows.append({"total_cost": round(total_cost, 2), "source": "VERIFIED", "gpu_type": gpu,
-                         "instance_type": resource.instance_type if resource else f"unknown-{gpu.lower()}",
-                         "tp": tp, "pp": pp, "dp": dp, "predicted_tps": tps,
-                         "cost_per_hour": cost_hr, "eta_h": eta_h, "meets_slo": meets_slo})
+            rows.append(
+                {
+                    "total_cost": round(total_cost, 2),
+                    "source": "VERIFIED",
+                    "gpu_type": gpu,
+                    "instance_type": resource.instance_type
+                    if resource
+                    else f"unknown-{gpu.lower()}",
+                    "tp": tp,
+                    "pp": pp,
+                    "dp": dp,
+                    "predicted_tps": tps,
+                    "cost_per_hour": cost_hr,
+                    "eta_h": eta_h,
+                    "meets_slo": meets_slo,
+                }
+            )
 
         # 2. PerfDB records for this model — filtered to similar io_ratio
         if self.perfdb:
@@ -620,10 +910,21 @@ class KoiAgent:
                 eta_h = total_tokens / tps / 3600
                 total_cost = cost_hr * eta_h
                 meets_slo = eta_h <= (req.slo_deadline_hours or 999)
-                rows.append({"total_cost": round(total_cost, 2), "source": "PerfDB", "gpu_type": gpu,
-                             "instance_type": resource.instance_type,
-                             "tp": tp, "pp": pp, "dp": dp, "predicted_tps": tps,
-                             "cost_per_hour": cost_hr, "eta_h": eta_h, "meets_slo": meets_slo})
+                rows.append(
+                    {
+                        "total_cost": round(total_cost, 2),
+                        "source": "PerfDB",
+                        "gpu_type": gpu,
+                        "instance_type": resource.instance_type,
+                        "tp": tp,
+                        "pp": pp,
+                        "dp": dp,
+                        "predicted_tps": tps,
+                        "cost_per_hour": cost_hr,
+                        "eta_h": eta_h,
+                        "meets_slo": meets_slo,
+                    }
+                )
 
         # Sort by total cost
         rows.sort(key=lambda r: r["total_cost"])
@@ -632,11 +933,16 @@ class KoiAgent:
         _avail_cache: Dict[str, Dict] = {}
         for row in rows:
             gpu = row["gpu_type"]
-            if gpu not in _avail_cache:
-                _avail_cache[gpu] = self.memory.get_failure_summary(gpu)
-            s = _avail_cache[gpu]
+            cache_key = f"{gpu}|{req.preferred_market or 'any'}"
+            if cache_key not in _avail_cache:
+                _avail_cache[cache_key] = self.memory.get_failure_summary(
+                    gpu,
+                    market=req.preferred_market,
+                )
+            s = _avail_cache[cache_key]
             row["avail_pct"] = s["availability_pct"]
             row["avail_unc"] = s["uncertainty_pct"]
+            row["planned_market"] = req.preferred_market or "on_demand"
 
         for row in rows[:15]:
             slo_str = "✓" if row["meets_slo"] else "✗"
@@ -664,7 +970,11 @@ class KoiAgent:
         total = req.total_tokens
         required_tps = req.required_tps
         io_ratio = req.prefill_decode_ratio
-        exclude_gpus = set(g.strip() for g in os.environ.get("KOI_EXCLUDE_GPUS", "").split(",") if g.strip())
+        exclude_gpus = set(
+            g.strip()
+            for g in os.environ.get("KOI_EXCLUDE_GPUS", "").split(",")
+            if g.strip()
+        )
 
         resources_text = get_resources(rm)
 
@@ -680,14 +990,20 @@ class KoiAgent:
             f"  Total tokens: {total:,}" if total else "  Total tokens: unknown",
             f"  SLO: {req.slo_deadline_hours}h" if req.slo_deadline_hours else "",
             f"  Required TPS: ≥{required_tps:.0f} tok/s" if required_tps else "",
+            f"  Preferred market: {req.preferred_market}"
+            if req.preferred_market
+            else "  Preferred market: none specified",
             f"  Quantization: {req.quantization or 'fp16 (default)'}",
             "",
             resources_text,
             "",
             cost_table,
             "",
-            f"EXCLUDED GPU TYPES (do not use): {', '.join(exclude_gpus)}" if exclude_gpus else "",
+            f"EXCLUDED GPU TYPES (do not use): {', '.join(exclude_gpus)}"
+            if exclude_gpus
+            else "",
             "Use your tools to query PerfDB, memory, and physics to VERIFY the cost table above.",
+            "If market choice matters, call get_quota_status_tool before recommending spot. Missing quota rows mean ZERO quota.",
             "The cost table is pre-computed — pick the cheapest total_cost row that meets SLO, then verify it.",
             "",
             "Return your decision as a JSON block:",
@@ -698,6 +1014,7 @@ class KoiAgent:
             '  "tp": <int>,',
             '  "pp": <int>,',
             '  "dp": <int>,',
+            '  "planned_market": "<spot|on_demand>",',
             '  "predicted_tps": <float>,',
             '  "predicted_cost_per_hour": <float>,',
             '  "reasoning": "<why this config>",',
@@ -711,11 +1028,15 @@ class KoiAgent:
     def _build_trigger_prompt(self, trigger: MonitoringTrigger) -> str:
         """Build the user message for a monitoring trigger."""
         tracker = trigger.job_tracker
-        config = tracker.get('config', {})
-        group_id = tracker.get('group_id') or trigger.job_id
-        predicted_tps = tracker.get('predicted_tps', 0)
-        actual_tps = tracker.get('smoothed_tps', 0)
-        delta_pct = ((actual_tps - predicted_tps) / predicted_tps * 100) if predicted_tps > 0 else 0
+        config = tracker.get("config", {})
+        group_id = tracker.get("group_id") or trigger.job_id
+        predicted_tps = tracker.get("predicted_tps", 0)
+        actual_tps = tracker.get("smoothed_tps", 0)
+        delta_pct = (
+            ((actual_tps - predicted_tps) / predicted_tps * 100)
+            if predicted_tps > 0
+            else 0
+        )
 
         sections = [
             f"MONITORING TRIGGER: {trigger.trigger_type.value}",
@@ -725,6 +1046,7 @@ class KoiAgent:
             f"Config:",
             f"  GPU: {config.get('gpu_type', '?')} TP={config.get('tp', '?')} PP={config.get('pp', '?')} DP={config.get('dp', '?')}",
             f"  Instance: {config.get('instance_type', '?')}",
+            f"  Region/market: {config.get('region', '?')} / {config.get('market', '?')}",
             f"  SLO: {tracker.get('slo_deadline_hours', '?')}h",
             f"  Total tokens: {tracker.get('total_tokens', 0):,}",
             f"",
@@ -739,60 +1061,116 @@ class KoiAgent:
         ]
 
         # Per-replica TPS breakdown (so agent can identify sick/dead replicas)
-        if self.monitor and tracker.get('group_id'):
-            group_chains = self.monitor.get_group_chains(tracker['group_id'])
+        if self.monitor and tracker.get("group_id"):
+            group_chains = self.monitor.get_group_chains(tracker["group_id"])
             if len(group_chains) > 1:
                 sections.append(f"\nPer-replica TPS:")
                 for rid, t in group_chains.items():
-                    status_icon = "💀" if t.status.value == "failed" else "⚠" if t.smoothed_tps < 100 else "✓"
-                    sections.append(f"  {status_icon} {rid}: TPS={t.smoothed_tps:.0f} ({t.status.value})")
+                    status_icon = (
+                        "💀"
+                        if t.status.value == "failed"
+                        else "⚠"
+                        if t.smoothed_tps < 100
+                        else "✓"
+                    )
+                    sections.append(
+                        f"  {status_icon} {rid}: TPS={t.smoothed_tps:.0f} ({t.status.value})"
+                    )
                 agg = sum(t.smoothed_tps for t in group_chains.values())
-                sections.append(f"  Aggregate: {agg:.0f} TPS ({len(group_chains)} replicas)")
+                sections.append(
+                    f"  Aggregate: {agg:.0f} TPS ({len(group_chains)} replicas)"
+                )
 
         if trigger.diagnosis_hint:
             sections.append(f"\nDiagnosis: {trigger.diagnosis_hint}")
 
         # Tool usage instructions — always use group_id for Orca API calls
-        sections.append(f"\nIMPORTANT: When calling scale_chain_tool, kill_replica_tool, or get_job_metrics_tool, "
-                       f"use job_id='{group_id}' (the parent/group ID), NOT the chain ID.")
+        sections.append(
+            f"\nIMPORTANT: When calling scale_chain_tool, kill_replica_tool, or get_job_metrics_tool, "
+            f"use job_id='{group_id}' (the parent/group ID), NOT the chain ID."
+        )
 
         if trigger.trigger_type == MonitoringStatus.FALLING_BEHIND:
             sections.append("\nAction:")
-            sections.append("1. Check per-replica TPS above. If any replica is producing <10% of the group average, it's degraded — kill it with kill_replica_tool(job_id, [replica_id]) to free resources.")
+            sections.append(
+                "1. Check per-replica TPS above. If any replica is producing <10% of the group average, it's degraded — kill it with kill_replica_tool(job_id, [replica_id]) to free resources."
+            )
             sections.append("2. Use get_job_metrics_tool to check live state.")
-            sections.append("3. If SLO is at risk after removing sick replicas, use scale_chain_tool to add replacements.")
-            sections.append("Do NOT use record_outcome_tool — this job is still RUNNING.")
+            sections.append(
+                "3. If SLO is at risk after removing sick replicas, use scale_chain_tool to add replacements."
+            )
+            sections.append(
+                "Do NOT use record_outcome_tool — this job is still RUNNING."
+            )
         elif trigger.trigger_type == MonitoringStatus.OVER_PROVISIONED:
-            sections.append("\nAction: Use scale_chain_tool with negative count to kill excess replicas.")
-            sections.append("Do NOT use record_outcome_tool — this job is still RUNNING.")
+            sections.append(
+                "\nAction: Use scale_chain_tool with negative count to kill excess replicas."
+            )
+            sections.append(
+                "Do NOT use record_outcome_tool — this job is still RUNNING."
+            )
         elif trigger.trigger_type == MonitoringStatus.COMPLETED:
-            sections.append("\nJob completed. Outcome has been recorded automatically by the webhook. "
-                           "Do NOT call record_outcome_tool.")
+            sections.append(
+                "\nJob completed. Outcome has been recorded automatically by the webhook. "
+                "Do NOT call record_outcome_tool."
+            )
         elif trigger.trigger_type == MonitoringStatus.FAILED:
             # Pre-inject failure context so agent sees it immediately
             gpu_type = config.get("gpu_type")
             if gpu_type and self.memory:
-                summary = self.memory.get_failure_summary(gpu_type)
+                summary = self.memory.get_failure_summary(
+                    gpu_type,
+                    region=config.get("region")
+                    if config.get("region") != "unknown"
+                    else None,
+                    market=config.get("market")
+                    if config.get("market") != "unknown"
+                    else None,
+                )
                 sections.append(f"\nFAILURE CONTEXT:")
-                sections.append(f"  Availability for {gpu_type}: {summary['availability_pct']}% ± {summary['uncertainty_pct']}% "
-                               f"(n={summary['effective_observations']})")
+                sections.append(
+                    f"  Availability for {gpu_type}: {summary['availability_pct']}% ± {summary['uncertainty_pct']}% "
+                    f"(n={summary['effective_observations']})"
+                )
                 if summary["spot_preemptions_6h"]:
-                    sections.append(f"  Spot preemptions (last 6h): {summary['spot_preemptions_6h']}")
+                    sections.append(
+                        f"  Spot preemptions (last 6h): {summary['spot_preemptions_6h']}"
+                    )
                 if summary["no_capacity_6h"]:
-                    sections.append(f"  No-capacity failures (last 6h): {summary['no_capacity_6h']}")
+                    sections.append(
+                        f"  No-capacity failures (last 6h): {summary['no_capacity_6h']}"
+                    )
                 if summary["last_failure_at"]:
                     sections.append(f"  Last failure: {summary['last_failure_at']}")
-            sections.append("\nA replica FAILED (not the whole job). Other replicas may still be running.")
-            sections.append("1. Diagnose why: check the diagnosis_hint for failure category.")
-            sections.append("2. BEFORE replacing, call get_failure_summary_tool for this GPU type to check "
-                           "recent failure patterns. Look at availability_pct and uncertainty.")
-            sections.append("3. If same (gpu_type, market) has failed ≥2 times recently:")
-            sections.append("   - spot_preemption: retry with on_demand=True in scale_chain_tool")
+            sections.append(
+                "\nA replica FAILED (not the whole job). Other replicas may still be running."
+            )
+            sections.append(
+                "1. Diagnose why: check the diagnosis_hint for failure category."
+            )
+            sections.append(
+                "2. BEFORE replacing, call get_quota_status_tool for this GPU type. Missing quota rows mean ZERO quota."
+            )
+            sections.append(
+                "3. Then call get_failure_summary_tool for this GPU type/market to inspect recent failure patterns."
+            )
+            sections.append(
+                "4. If same (gpu_type, market) has failed ≥2 times recently:"
+            )
+            sections.append(
+                "   - spot_preemption: retry with on_demand=True in scale_chain_tool"
+            )
             sections.append("   - no_capacity: try a DIFFERENT gpu_type")
             sections.append("   - oom: try higher TP (more VRAM per shard)")
-            sections.append("4. Use get_job_metrics_tool to check if remaining replicas can still meet SLO.")
-            sections.append("5. If SLO at risk, use scale_chain_tool to add replacement replicas.")
-            sections.append("6. Do NOT call record_outcome_tool — the job is still running.")
+            sections.append(
+                "5. Use get_job_metrics_tool to check if remaining replicas can still meet SLO."
+            )
+            sections.append(
+                "6. If SLO at risk, use scale_chain_tool to add replacement replicas."
+            )
+            sections.append(
+                "7. Do NOT call record_outcome_tool — the job is still running."
+            )
 
         return "\n".join(sections)
 
@@ -801,8 +1179,12 @@ class KoiAgent:
     # ------------------------------------------------------------------
 
     def _parse_decision(
-        self, text: str, req: JobRequest, rm: ResourceMap,
-        tool_calls: int, elapsed: float,
+        self,
+        text: str,
+        req: JobRequest,
+        rm: ResourceMap,
+        tool_calls: int,
+        elapsed: float,
     ) -> AgentDecision:
         """Extract structured decision from agent's text response."""
         import json
@@ -837,8 +1219,15 @@ class KoiAgent:
             cost_per_hour = num_instances * resource.cost_per_instance_hour_usd
 
         predicted_tps = float(data.get("predicted_tps", 0.0))
+        planned_market = (
+            data.get("planned_market") or req.preferred_market or "on_demand"
+        )
+        if planned_market not in {"spot", "on_demand"}:
+            planned_market = req.preferred_market or "on_demand"
         total_tokens = req.total_tokens or 0
-        runtime_hours = (total_tokens / max(predicted_tps, 1) / 3600) if predicted_tps > 0 else None
+        runtime_hours = (
+            (total_tokens / max(predicted_tps, 1) / 3600) if predicted_tps > 0 else None
+        )
         total_cost = (cost_per_hour * runtime_hours) if runtime_hours else None
 
         # Map data_source string to enum
@@ -849,28 +1238,36 @@ class KoiAgent:
             "analytical": DataSource.ANALYTICAL,
             "cross_gpu": DataSource.CROSS_GPU,
         }
-        data_source = ds_map.get(data.get("data_source", "analytical"), DataSource.ANALYTICAL)
+        data_source = ds_map.get(
+            data.get("data_source", "analytical"), DataSource.ANALYTICAL
+        )
 
-        num_instances = max(1, -(-num_gpus // (resource.gpus_per_instance if resource else 8)))
+        num_instances = max(
+            1, -(-num_gpus // (resource.gpus_per_instance if resource else 8))
+        )
 
         config = PlacementConfig(
             gpu_type=gpu_type,
             instance_type=instance_type,
             num_gpus=num_gpus,
             num_instances=num_instances,
-            tp=tp, pp=pp, dp=dp,
+            tp=tp,
+            pp=pp,
+            dp=dp,
             region=rm.region,
             engine_config=EngineConfig(
                 tensor_parallel_size=tp,
                 pipeline_parallel_size=pp,
                 quantization=req.quantization,
             ),
+            market=planned_market,
         )
 
         return AgentDecision(
             job_id=req.job_id,
             model_name=req.model_name,
             config=config,
+            planned_market=planned_market,
             predicted_tps=predicted_tps,
             predicted_cost_per_hour=cost_per_hour,
             predicted_total_cost=total_cost,

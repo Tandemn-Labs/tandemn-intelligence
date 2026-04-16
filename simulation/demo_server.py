@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
@@ -18,6 +19,16 @@ from pydantic import BaseModel, Field
 
 from koi.event_tap import read_recent_events
 from simulation.demo_runtime import DemoSessionManager
+from simulation.orca_webhooks import (
+    build_complete_payload,
+    build_config_attempt_payload,
+    build_launch_failed_payload,
+    build_launch_heartbeat_payload,
+    build_launching_payload,
+    build_replica_failed_payload,
+    build_started_payload,
+    heartbeat_message,
+)
 from simulation.demo_scenarios import (
     get_quota_preset,
     get_scenario,
@@ -27,15 +38,26 @@ from simulation.demo_scenarios import (
 from simulation.model_registry import resolve_model_spec
 from simulation.perf_model import DemoPerfModel
 
+try:
+    from simulation.demo_preview import get_preview_snapshot, list_preview_scenes
+except Exception:  # pragma: no cover - local-only design tooling
+    get_preview_snapshot = None
+    list_preview_scenes = None
+
 
 app = FastAPI(title="Koi Demo Server", version="0.1")
+logger = logging.getLogger(__name__)
 PERF_MODEL = DemoPerfModel()
 SESSION_MANAGER = DemoSessionManager()
+REPO_ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static" / "demo"
 app.mount("/demo/static", StaticFiles(directory=str(STATIC_DIR)), name="demo-static")
 DEMO_KOI_URL = os.environ.get("KOI_DEMO_URL", "http://localhost:8090")
-DEMO_KOI_EVENT_LOG = os.environ.get("KOI_EVENT_TAP_PATH", "")
+DEMO_KOI_EVENT_LOG = os.environ.get(
+    "KOI_EVENT_TAP_PATH", str(REPO_ROOT / "data" / "koi_events.jsonl")
+)
 HEARTBEAT_INTERVAL_S = 3.0
+LAUNCH_TASKS: set[asyncio.Task] = set()
 
 
 class DemoLaunchRequest(BaseModel):
@@ -93,13 +115,28 @@ async def _request_koi_decision(
             "task_type": "batch",
             "avg_input_tokens": req.avg_input_tokens,
             "avg_output_tokens": req.avg_output_tokens,
-            "num_requests": req.total_chunks * 10,
+            "num_requests": req.total_chunks,
             "slo_deadline_hours": req.slo_deadline_hours,
             "objective": "cheapest",
         },
         "resource_map": resource_map,
     }
-    return await _post_koi("/decide", payload, timeout=90.0)
+    return await _post_koi("/decide", payload, timeout=180.0)
+
+
+def _track_launch_task(task: asyncio.Task) -> None:
+    LAUNCH_TASKS.add(task)
+
+    def _done(completed: asyncio.Task) -> None:
+        LAUNCH_TASKS.discard(completed)
+        try:
+            completed.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("demo_launch_task_failed")
+
+    task.add_done_callback(_done)
 
 
 def _pick_launch_config(
@@ -115,11 +152,19 @@ def _pick_launch_config(
 ) -> dict:
     decision_config = (koi_decision or {}).get("config", {}) or {}
     chosen_instance = next(
-        (instance for instance in quota.instances if instance.gpu_type == preferred_gpu),
+        (
+            instance
+            for instance in quota.instances
+            if instance.gpu_type == preferred_gpu
+        ),
         quota.instances[0],
     )
     chosen_quota = next(
-        (item for item in quota.quotas if item["family"] == chosen_instance.quota_family),
+        (
+            item
+            for item in quota.quotas
+            if item["family"] == chosen_instance.quota_family
+        ),
         quota.quotas[0],
     )
     return {
@@ -127,35 +172,33 @@ def _pick_launch_config(
         "group_id": session_id,
         "decision_id": (koi_decision or {}).get("_decision_id"),
         "gpu_type": decision_config.get("gpu_type", preferred_gpu),
-        "instance_type": decision_config.get("instance_type", chosen_instance.instance_type),
+        "instance_type": decision_config.get(
+            "instance_type", chosen_instance.instance_type
+        ),
         "tp": int(decision_config.get("tp", tp)),
         "pp": int(decision_config.get("pp", pp)),
         "dp": int(decision_config.get("dp", 1) or 1),
         "region": decision_config.get("region", chosen_quota["region"]),
         "market": decision_config.get("market", chosen_quota["market"]),
         "total_tokens": int(total_tokens),
-        "predicted_tps": float((koi_decision or {}).get("predicted_tps") or baseline_tps),
+        "predicted_tps": float(
+            (koi_decision or {}).get("predicted_tps") or baseline_tps
+        ),
     }
-
-
-def _heartbeat_message(phase: str) -> str:
-    messages = {
-        "searching_capacity": "Searching quota and trying candidate capacity.",
-        "provisioning": "Instances requested and provisioning is in progress.",
-        "bootstrapping": "Replica booted and is finishing runtime setup.",
-        "waiting_model_ready": "Replica provisioned, waiting for model_ready.",
-    }
-    return messages.get(phase, phase.replace("_", " "))
 
 
 def _filter_session_koi_jobs(session_id: str, jobs_payload: dict) -> dict:
     jobs = [
-        job for job in jobs_payload.get("jobs", [])
-        if job.get("job_id", "").startswith(f"{session_id}-") or job.get("job_id") == session_id
+        job
+        for job in jobs_payload.get("jobs", [])
+        if job.get("job_id", "").startswith(f"{session_id}-")
+        or job.get("job_id") == session_id
     ]
     return {
         "tracked_jobs": len([job for job in jobs if job.get("status") != "launching"]),
-        "pending_launches": len([job for job in jobs if job.get("status") == "launching"]),
+        "pending_launches": len(
+            [job for job in jobs if job.get("status") == "launching"]
+        ),
         "jobs": jobs,
     }
 
@@ -171,7 +214,7 @@ async def _fetch_koi_live_state(session_id: str) -> dict:
     }
 
 
-def _read_session_koi_events(session_id: str, limit: int = 40) -> list[dict[str, Any]]:
+def _read_session_koi_events(session_id: str, limit: int = 120) -> list[dict[str, Any]]:
     if not DEMO_KOI_EVENT_LOG:
         return []
     events = read_recent_events(DEMO_KOI_EVENT_LOG, limit=200)
@@ -179,58 +222,148 @@ def _read_session_koi_events(session_id: str, limit: int = 40) -> list[dict[str,
     for event in events:
         job_id = str(event.get("job_id", ""))
         group_id = str(event.get("group_id", ""))
-        if job_id == session_id or job_id.startswith(f"{session_id}-") or group_id == session_id:
+        if (
+            job_id == session_id
+            or job_id.startswith(f"{session_id}-")
+            or group_id == session_id
+        ):
             filtered.append(event)
     return filtered[-limit:]
 
 
-def _build_replica_payloads(session_id: str, snapshot: dict, replica: dict) -> tuple[dict, dict, dict]:
-    launch_config = SESSION_MANAGER.sessions[session_id]["launch_config"]
-    base = {
-        "job_id": replica["replica_id"],
-        "decision_id": launch_config["decision_id"],
-        "group_id": session_id,
-        "gpu_type": replica["gpu_type"],
-        "instance_type": replica["instance_type"],
-        "tp": replica["tp"],
-        "pp": replica["pp"],
-        "region": replica["region"],
-        "market": replica["market"],
-        "attempt_index": 0,
-    }
-    heartbeat_payload = {
-        **base,
-        "phase": replica["launch_phase"],
-        "message": _heartbeat_message(replica["launch_phase"]),
-        "timestamp": time.time(),
-    }
-    started_payload = {
-        **{key: value for key, value in base.items() if key != "attempt_index"},
-        "dp": 1,
-        "slo_deadline_hours": snapshot["request"]["slo_deadline_hours"],
-        "total_tokens": launch_config["total_tokens"],
-        "predicted_tps": launch_config["predicted_tps"],
-        "is_fallback": False,
-    }
-    return heartbeat_payload, base, started_payload
+def _build_replica_payloads(
+    session_id: str, snapshot: dict, replica: dict
+) -> tuple[dict, dict, dict, dict]:
+    session = SESSION_MANAGER.sessions[session_id]
+    launch_config = session["launch_config"]
+    decision_id = (
+        replica["decision_id"]
+        if "decision_id" in replica
+        else launch_config.get("decision_id")
+    )
+    attempt_index = int(
+        replica.get("config_index", launch_config.get("candidate_index", 0)) or 0
+    )
+    time_to_launch = max(
+        0.0,
+        time.time() - float(session.get("launch_started_at") or session["created_at"]),
+    )
+    config_attempt_payload = build_config_attempt_payload(
+        job_id=session_id,
+        decision_id=decision_id,
+        instance_type=replica["instance_type"],
+        gpu_type=replica["gpu_type"],
+        region=replica["region"],
+        market=replica["market"],
+        launched=True,
+        attempt_index=attempt_index,
+        time_to_launch=time_to_launch,
+    )
+    launching_payload = build_launching_payload(
+        job_id=replica["replica_id"],
+        decision_id=decision_id,
+        group_id=session_id,
+        gpu_type=replica["gpu_type"],
+        instance_type=replica["instance_type"],
+        tp=replica["tp"],
+        pp=replica["pp"],
+        region=replica["region"],
+        market=replica["market"],
+        attempt_index=attempt_index,
+    )
+    heartbeat_payload = build_launch_heartbeat_payload(
+        job_id=replica["replica_id"],
+        decision_id=decision_id,
+        group_id=session_id,
+        gpu_type=replica["gpu_type"],
+        instance_type=replica["instance_type"],
+        tp=replica["tp"],
+        pp=replica["pp"],
+        region=replica["region"],
+        market=replica["market"],
+        attempt_index=attempt_index,
+        phase=replica["launch_phase"],
+        message=heartbeat_message(replica["launch_phase"]),
+        timestamp=time.time(),
+    )
+    started_payload = build_started_payload(
+        job_id=replica["replica_id"],
+        decision_id=decision_id,
+        group_id=session_id,
+        gpu_type=replica["gpu_type"],
+        instance_type=replica["instance_type"],
+        tp=replica["tp"],
+        pp=replica["pp"],
+        dp=1,
+        region=replica["region"],
+        market=replica["market"],
+        slo_deadline_hours=snapshot["request"]["slo_deadline_hours"],
+        total_tokens=launch_config["total_tokens"],
+        predicted_tps=float(replica.get("base_tps") or launch_config["predicted_tps"]),
+        is_fallback=attempt_index > 0,
+    )
+    return config_attempt_payload, heartbeat_payload, launching_payload, started_payload
 
 
 async def _sync_session_with_koi(session_id: str, snapshot: dict) -> dict:
     session = SESSION_MANAGER.sessions[session_id]
+    if session.get("koi", {}).get("decision_status") == "pending":
+        return {"status": "decision_pending"}
     if not session.get("koi", {}).get("decision"):
         return {"status": "no_decision"}
 
     bridge = session["_bridge"]
     now = time.time()
+    attempts_sent = 0
     launches_sent = 0
     starts_sent = 0
     heartbeats_sent = 0
+    replica_failures_sent = 0
+    completes_sent = 0
+    launch_failed_sent = 0
     try:
+        while bridge["pending_config_attempts"]:
+            item = bridge["pending_config_attempts"].pop(0)
+            payload = (
+                item["payload"]
+                if isinstance(item, dict) and "payload" in item
+                else item
+            )
+            await _post_koi("/job/config-attempted", payload)
+            attempts_sent += 1
+
+        if (
+            session.get("launch_failure")
+            and bridge.get("launch_failed_payload")
+            and not bridge.get("launch_failed_sent")
+        ):
+            await _post_koi(
+                "/job/launch-failed",
+                build_launch_failed_payload(**bridge["launch_failed_payload"]),
+            )
+            bridge["launch_failed_sent"] = True
+            launch_failed_sent += 1
+
         for replica in snapshot["runtime"]["replicas"]:
             replica_id = replica["replica_id"]
-            heartbeat_payload, launching_payload, started_payload = _build_replica_payloads(session_id, snapshot, replica)
+            (
+                config_attempt_payload,
+                heartbeat_payload,
+                launching_payload,
+                started_payload,
+            ) = _build_replica_payloads(session_id, snapshot, replica)
             if replica["phase"] in {"launching", "provisioned"}:
-                if replica["phase"] == "provisioned" and replica_id not in bridge["launching_sent"]:
+                if (
+                    replica["phase"] == "provisioned"
+                    and replica_id not in bridge["config_attempted_sent"]
+                ):
+                    await _post_koi("/job/config-attempted", config_attempt_payload)
+                    bridge["config_attempted_sent"].add(replica_id)
+                    attempts_sent += 1
+                if (
+                    replica["phase"] == "provisioned"
+                    and replica_id not in bridge["launching_sent"]
+                ):
                     await _post_koi("/job/launching", launching_payload)
                     bridge["launching_sent"].add(replica_id)
                     launches_sent += 1
@@ -248,6 +381,10 @@ async def _sync_session_with_koi(session_id: str, snapshot: dict) -> dict:
                     bridge["last_heartbeat_at"][replica_id] = now
                     heartbeats_sent += 1
             elif replica["phase"] == "running":
+                if replica_id not in bridge["config_attempted_sent"]:
+                    await _post_koi("/job/config-attempted", config_attempt_payload)
+                    bridge["config_attempted_sent"].add(replica_id)
+                    attempts_sent += 1
                 if replica_id not in bridge["launching_sent"]:
                     await _post_koi("/job/launching", launching_payload)
                     bridge["launching_sent"].add(replica_id)
@@ -256,6 +393,35 @@ async def _sync_session_with_koi(session_id: str, snapshot: dict) -> dict:
                     await _post_koi("/job/started", started_payload)
                     bridge["started_sent"].add(replica_id)
                     starts_sent += 1
+            elif replica["phase"] in {"dead", "killed", "failed"}:
+                if replica_id not in bridge["replica_failed_sent"]:
+                    reason = bridge["replica_failure_reasons"].get(
+                        replica_id, f"Replica entered {replica['phase']}"
+                    )
+                    await _post_koi(
+                        "/job/replica-failed",
+                        build_replica_failed_payload(
+                            job_id=replica_id,
+                            group_id=session_id,
+                            reason=reason,
+                        ),
+                    )
+                    bridge["replica_failed_sent"].add(replica_id)
+                    replica_failures_sent += 1
+
+        if snapshot["runtime"]["status"] == "completed" and not bridge["complete_sent"]:
+            throughput_tps = max(
+                float(session["_orca"].get("last_nonzero_aggregate_tps", 0.0)),
+                float(snapshot["runtime"].get("aggregate_tps", 0.0)),
+            )
+            await _post_koi(
+                "/job/complete",
+                build_complete_payload(
+                    job_id=session_id, throughput_tps=throughput_tps
+                ),
+            )
+            bridge["complete_sent"] = True
+            completes_sent += 1
 
         session["koi"]["sync_error"] = None
         if starts_sent:
@@ -264,13 +430,27 @@ async def _sync_session_with_koi(session_id: str, snapshot: dict) -> dict:
             status = "launching_sent"
         elif heartbeats_sent:
             status = "heartbeat_sent"
+        elif attempts_sent:
+            status = "config_attempted_sent"
+        elif replica_failures_sent:
+            status = "replica_failed_sent"
+        elif completes_sent:
+            status = "complete_sent"
+        elif launch_failed_sent:
+            status = "launch_failed_sent"
+        elif session.get("launch_failure"):
+            status = "launch_rejected"
         else:
             status = "noop"
         return {
             "status": status,
+            "attempts_sent": attempts_sent,
             "launches_sent": launches_sent,
             "starts_sent": starts_sent,
             "heartbeats_sent": heartbeats_sent,
+            "replica_failures_sent": replica_failures_sent,
+            "completes_sent": completes_sent,
+            "launch_failed_sent": launch_failed_sent,
         }
     except Exception as exc:
         session["koi"]["sync_error"] = str(exc)
@@ -314,34 +494,41 @@ def _resolve_session_id_from_replica(replica_id: str) -> str:
     raise HTTPException(status_code=404, detail=f"unknown replica: {replica_id}")
 
 
-def _pick_instance_for_gpu(session: dict, gpu_type: str, market: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    instances = session["resource_map"]["instances"]
-    instance = next((item for item in instances if item["gpu_type"] == gpu_type), instances[0])
-    quotas = session["resource_map"]["quotas"]
-    quota = next(
-        (
-            item for item in quotas
-            if item["family"] == instance["quota_family"] and item["market"] == market
-        ),
-        quotas[0],
-    )
-    return instance, quota
-
-
 def _scale_launch_timing_for_session(session: dict, gpu_type: str) -> dict[str, float]:
     capacity_pressure = 0.8 if session["scenario"]["slug"] == "slow_launch" else 0.2
-    launch_timing = PERF_MODEL.estimate_launch_timing(gpu_type=gpu_type, capacity_pressure=capacity_pressure)
+    launch_timing = PERF_MODEL.estimate_launch_timing(
+        gpu_type=gpu_type, capacity_pressure=capacity_pressure
+    )
     multiplier = session["scenario"]["launch_timing_multiplier"] * 0.75
     return {
         "searching_capacity": round(launch_timing.searching_capacity_s * multiplier, 1),
         "provisioning": round(launch_timing.provisioning_s * multiplier, 1),
         "bootstrapping": round(launch_timing.bootstrapping_s * multiplier, 1),
-        "waiting_model_ready": round(launch_timing.waiting_model_ready_s * multiplier, 1),
+        "waiting_model_ready": round(
+            launch_timing.waiting_model_ready_s * multiplier, 1
+        ),
         "total": round(launch_timing.total_seconds * multiplier, 1),
     }
 
 
-def _estimate_replica_tps_for_session(session: dict, gpu_type: str, tp: int, pp: int) -> float:
+def _assess_replica_config_for_session(session: dict, gpu_type: str, tp: int, pp: int):
+    request = session["request"]
+    return PERF_MODEL.assess_replica_config(
+        model_name=session["model"]["model_name"],
+        gpu_type=gpu_type,
+        tp=tp,
+        pp=pp,
+        dtype=request.get("dtype", "fp16"),
+        overrides=request.get("model_overrides"),
+    )
+
+
+def _estimate_replica_tps_for_session(
+    session: dict, gpu_type: str, tp: int, pp: int
+) -> float:
+    assessment = _assess_replica_config_for_session(session, gpu_type, tp, pp)
+    if not assessment.feasible:
+        raise ValueError(assessment.reason or "invalid placement")
     request = session["request"]
     return PERF_MODEL.estimate_replica_tps(
         model_name=session["model"]["model_name"],
@@ -352,6 +539,271 @@ def _estimate_replica_tps_for_session(session: dict, gpu_type: str, tp: int, pp:
         output_tokens=request["avg_output_tokens"],
         dtype=request.get("dtype", "fp16"),
         overrides=request.get("model_overrides"),
+    )
+
+
+def _normalize_candidate_pref(value: Optional[Any]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "unknown":
+        return None
+    return text
+
+
+def _launch_timing_for_candidate(
+    req: DemoLaunchRequest, scenario, gpu_type: str
+) -> dict[str, float]:
+    launch_timing = PERF_MODEL.estimate_launch_timing(
+        gpu_type=gpu_type,
+        capacity_pressure=0.8 if req.scenario == "slow_launch" else 0.2,
+    )
+    return {
+        "searching_capacity": round(
+            launch_timing.searching_capacity_s * scenario.launch_timing_multiplier, 1
+        ),
+        "provisioning": round(
+            launch_timing.provisioning_s * scenario.launch_timing_multiplier, 1
+        ),
+        "bootstrapping": round(
+            launch_timing.bootstrapping_s * scenario.launch_timing_multiplier, 1
+        ),
+        "waiting_model_ready": round(
+            launch_timing.waiting_model_ready_s * scenario.launch_timing_multiplier, 1
+        ),
+        "total": round(
+            launch_timing.total_seconds * scenario.launch_timing_multiplier, 1
+        ),
+    }
+
+
+def _build_launch_candidates(
+    *,
+    req: DemoLaunchRequest,
+    quota,
+    scenario,
+    koi_decision: Optional[dict],
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+
+    def _append_candidate(
+        raw: dict[str, Any],
+        *,
+        predicted_tps: Optional[float],
+        is_fallback: bool,
+        source: str,
+        candidate_index: int,
+        decision_id: Optional[str],
+    ) -> None:
+        gpu_type = raw.get("gpu_type")
+        if not gpu_type:
+            return
+        tp = int(raw.get("tp", 4) or 4)
+        pp = int(raw.get("pp", 1) or 1)
+        assessment = PERF_MODEL.assess_replica_config(
+            model_name=req.model_name,
+            gpu_type=gpu_type,
+            tp=tp,
+            pp=pp,
+            dtype=req.dtype,
+            overrides=req.model_overrides,
+        )
+        if not assessment.feasible:
+            return
+        resolved_tps = float(
+            predicted_tps
+            or raw.get("predicted_tps")
+            or PERF_MODEL.estimate_replica_tps(
+                model_name=req.model_name,
+                gpu_type=gpu_type,
+                tp=tp,
+                pp=pp,
+                input_tokens=req.avg_input_tokens,
+                output_tokens=req.avg_output_tokens,
+                dtype=req.dtype,
+                overrides=req.model_overrides,
+            )
+        )
+        candidates.append(
+            {
+                "gpu_type": gpu_type,
+                "instance_type": raw.get("instance_type"),
+                "tp": tp,
+                "pp": pp,
+                "dp": int(raw.get("dp", 1) or 1),
+                "region": _normalize_candidate_pref(raw.get("region")),
+                "market": _normalize_candidate_pref(raw.get("market")),
+                "predicted_tps": resolved_tps,
+                "launch_timing_s": _launch_timing_for_candidate(
+                    req, scenario, gpu_type
+                ),
+                "is_fallback": is_fallback,
+                "source": source,
+                "candidate_index": candidate_index,
+                "decision_id": decision_id,
+            }
+        )
+
+    if koi_decision:
+        primary = (koi_decision.get("config") or {}) or {}
+        _append_candidate(
+            primary,
+            predicted_tps=koi_decision.get("predicted_tps"),
+            is_fallback=False,
+            source="koi_primary",
+            candidate_index=0,
+            decision_id=koi_decision.get("_decision_id"),
+        )
+        for idx, alt in enumerate(koi_decision.get("alternatives") or [], start=1):
+            _append_candidate(
+                alt,
+                predicted_tps=alt.get("predicted_tps")
+                if isinstance(alt, dict)
+                else None,
+                is_fallback=True,
+                source="koi_alternative",
+                candidate_index=idx,
+                decision_id=koi_decision.get("_decision_id"),
+            )
+        return candidates
+
+    for idx, instance in enumerate(quota.instances):
+        quota_row = next(
+            (item for item in quota.quotas if item["family"] == instance.quota_family),
+            None,
+        )
+        _append_candidate(
+            {
+                "gpu_type": instance.gpu_type,
+                "instance_type": instance.instance_type,
+                "tp": min(4, int(instance.gpus_per_instance)),
+                "pp": 1,
+                "region": quota_row["region"] if quota_row else None,
+                "market": quota_row["market"] if quota_row else None,
+            },
+            predicted_tps=None,
+            is_fallback=False,
+            source="demo_fallback",
+            candidate_index=idx,
+            decision_id=None,
+        )
+    return candidates
+
+
+def _compute_launch_artifacts(
+    *,
+    session_id: str,
+    req: DemoLaunchRequest,
+    quota,
+    scenario,
+    koi_decision: Optional[dict],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    preferred_gpu = (koi_decision or {}).get("config", {}).get(
+        "gpu_type"
+    ) or quota.instances[0].gpu_type
+    launch_timing = PERF_MODEL.estimate_launch_timing(
+        gpu_type=preferred_gpu,
+        capacity_pressure=0.8 if req.scenario == "slow_launch" else 0.2,
+    )
+    baseline_tps = (koi_decision or {}).get(
+        "predicted_tps"
+    ) or PERF_MODEL.estimate_replica_tps(
+        model_name=req.model_name,
+        gpu_type=preferred_gpu,
+        tp=((koi_decision or {}).get("config", {}) or {}).get("tp", 4),
+        pp=((koi_decision or {}).get("config", {}) or {}).get("pp", 1),
+        input_tokens=req.avg_input_tokens,
+        output_tokens=req.avg_output_tokens,
+        dtype=req.dtype,
+        overrides=req.model_overrides,
+    )
+
+    tp = ((koi_decision or {}).get("config", {}) or {}).get("tp", 4)
+    pp = ((koi_decision or {}).get("config", {}) or {}).get("pp", 1)
+    launch_config = _pick_launch_config(
+        session_id=session_id,
+        quota=quota,
+        preferred_gpu=preferred_gpu,
+        tp=tp,
+        pp=pp,
+        total_tokens=req.total_chunks * (req.avg_input_tokens + req.avg_output_tokens),
+        baseline_tps=baseline_tps,
+        koi_decision=koi_decision,
+    )
+    launch_preview = {
+        "baseline_replica_tps": round(baseline_tps, 1),
+        "launch_timing_s": {
+            "searching_capacity": round(
+                launch_timing.searching_capacity_s * scenario.launch_timing_multiplier,
+                1,
+            ),
+            "provisioning": round(
+                launch_timing.provisioning_s * scenario.launch_timing_multiplier, 1
+            ),
+            "bootstrapping": round(
+                launch_timing.bootstrapping_s * scenario.launch_timing_multiplier, 1
+            ),
+            "waiting_model_ready": round(
+                launch_timing.waiting_model_ready_s * scenario.launch_timing_multiplier,
+                1,
+            ),
+            "total": round(
+                launch_timing.total_seconds * scenario.launch_timing_multiplier, 1
+            ),
+        },
+        "preferred_gpu": preferred_gpu,
+        "instance_type": launch_config["instance_type"],
+        "region": launch_config["region"],
+        "market": launch_config["market"],
+        "tp": tp,
+        "pp": pp,
+    }
+    return launch_preview, launch_config
+
+
+async def _resolve_session_launch(
+    *,
+    session_id: str,
+    req: DemoLaunchRequest,
+    quota,
+    scenario,
+    resource_map: dict[str, Any],
+) -> None:
+    koi_decision = None
+    koi_error = None
+    try:
+        live_resource_map = SESSION_MANAGER.aggregate_resources()
+        koi_decision = await _request_koi_decision(
+            session_id,
+            req,
+            live_resource_map if live_resource_map.get("instances") else resource_map,
+        )
+    except Exception as exc:
+        koi_error = str(exc)
+
+    launch_preview, launch_config = _compute_launch_artifacts(
+        session_id=session_id,
+        req=req,
+        quota=quota,
+        scenario=scenario,
+        koi_decision=koi_decision,
+    )
+
+    session = _require_session(session_id)
+    session["koi"]["decision"] = koi_decision
+    session["koi"]["error"] = koi_error
+    session["koi"]["decision_status"] = "ready" if koi_decision else "fallback"
+    session["launch_preview"] = launch_preview
+    session["launch_config"] = launch_config
+    SESSION_MANAGER.activate_session_with_candidates(
+        session_id,
+        now=time.time(),
+        candidates=_build_launch_candidates(
+            req=req,
+            quota=quota,
+            scenario=scenario,
+            koi_decision=koi_decision,
+        ),
     )
 
 
@@ -370,17 +822,40 @@ async def demo_catalog():
     return serialize_catalog()
 
 
+@app.get("/demo/preview/catalog")
+async def demo_preview_catalog():
+    payload = serialize_catalog()
+    payload["preview_scenes"] = list_preview_scenes() if list_preview_scenes else []
+    return payload
+
+
+@app.get("/demo/preview/scene/{scene_slug}")
+async def demo_preview_scene(scene_slug: str):
+    if get_preview_snapshot is None:
+        raise HTTPException(status_code=404, detail="preview generator unavailable")
+    try:
+        return get_preview_snapshot(scene_slug)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"unknown preview scene: {scene_slug}"
+        ) from exc
+
+
 @app.post("/demo/launch")
 async def demo_launch(req: DemoLaunchRequest):
     try:
         quota = get_quota_preset(req.quota_preset)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"unknown quota preset: {req.quota_preset}") from exc
+        raise HTTPException(
+            status_code=404, detail=f"unknown quota preset: {req.quota_preset}"
+        ) from exc
 
     try:
         scenario = get_scenario(req.scenario)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"unknown scenario: {req.scenario}") from exc
+        raise HTTPException(
+            status_code=404, detail=f"unknown scenario: {req.scenario}"
+        ) from exc
 
     model_spec = resolve_model_spec(
         req.model_name,
@@ -390,51 +865,18 @@ async def demo_launch(req: DemoLaunchRequest):
 
     session_id = f"demo-{uuid.uuid4().hex[:10]}"
     resource_map = quota_preset_to_resource_map(req.quota_preset)
-    koi_decision = None
-    koi_error = None
-    try:
-        koi_decision = await _request_koi_decision(session_id, req, resource_map)
-    except Exception as exc:
-        koi_error = str(exc)
-
-    preferred_gpu = (
-        (koi_decision or {}).get("config", {}).get("gpu_type")
-        or quota.instances[0].gpu_type
-    )
-    launch_timing = PERF_MODEL.estimate_launch_timing(
-        gpu_type=preferred_gpu,
-        capacity_pressure=0.8 if req.scenario == "slow_launch" else 0.2,
-    )
-    baseline_tps = (
-        (koi_decision or {}).get("predicted_tps")
-        or PERF_MODEL.estimate_replica_tps(
-            model_name=req.model_name,
-            gpu_type=preferred_gpu,
-            tp=((koi_decision or {}).get("config", {}) or {}).get("tp", 4),
-            pp=((koi_decision or {}).get("config", {}) or {}).get("pp", 1),
-            input_tokens=req.avg_input_tokens,
-            output_tokens=req.avg_output_tokens,
-            dtype=req.dtype,
-            overrides=req.model_overrides,
-        )
-    )
-
-    tp = ((koi_decision or {}).get("config", {}) or {}).get("tp", 4)
-    pp = ((koi_decision or {}).get("config", {}) or {}).get("pp", 1)
-    launch_config = _pick_launch_config(
+    launch_preview, launch_config = _compute_launch_artifacts(
         session_id=session_id,
+        req=req,
         quota=quota,
-        preferred_gpu=preferred_gpu,
-        tp=tp,
-        pp=pp,
-        total_tokens=req.total_chunks * (req.avg_input_tokens + req.avg_output_tokens),
-        baseline_tps=baseline_tps,
-        koi_decision=koi_decision,
+        scenario=scenario,
+        koi_decision=None,
     )
     payload = {
         "session_id": session_id,
         "status": "created",
         "created_at": time.time(),
+        "launch_started_at": None,
         "request": req.model_dump(mode="json"),
         "model": model_spec.__dict__,
         "scenario": {
@@ -453,30 +895,27 @@ async def demo_launch(req: DemoLaunchRequest):
         "resource_map": resource_map,
         "koi": {
             "configured_url": DEMO_KOI_URL,
-            "decision": koi_decision,
-            "error": koi_error,
+            "decision": None,
+            "decision_status": "pending",
+            "error": None,
             "sync_error": None,
             "live": None,
         },
-        "launch_preview": {
-            "baseline_replica_tps": round(baseline_tps, 1),
-            "launch_timing_s": {
-                "searching_capacity": round(launch_timing.searching_capacity_s * scenario.launch_timing_multiplier, 1),
-                "provisioning": round(launch_timing.provisioning_s * scenario.launch_timing_multiplier, 1),
-                "bootstrapping": round(launch_timing.bootstrapping_s * scenario.launch_timing_multiplier, 1),
-                "waiting_model_ready": round(launch_timing.waiting_model_ready_s * scenario.launch_timing_multiplier, 1),
-                "total": round(launch_timing.total_seconds * scenario.launch_timing_multiplier, 1),
-            },
-            "preferred_gpu": preferred_gpu,
-            "instance_type": launch_config["instance_type"],
-            "region": launch_config["region"],
-            "market": launch_config["market"],
-            "tp": tp,
-            "pp": pp,
-        },
+        "launch_preview": launch_preview,
         "launch_config": launch_config,
     }
     created = SESSION_MANAGER.create_session(payload)
+    _track_launch_task(
+        asyncio.create_task(
+            _resolve_session_launch(
+                session_id=session_id,
+                req=req,
+                quota=quota,
+                scenario=scenario,
+                resource_map=resource_map,
+            )
+        )
+    )
     return await _attach_live_koi(session_id, created)
 
 
@@ -536,12 +975,16 @@ async def demo_orca_replicas(job_id: str, now: Optional[float] = None):
 
 
 @app.get("/demo/orca/job/{job_id}/replicas/{replica_id}/metrics")
-async def demo_orca_replica_metrics(job_id: str, replica_id: str, now: Optional[float] = None):
+async def demo_orca_replica_metrics(
+    job_id: str, replica_id: str, now: Optional[float] = None
+):
     session_id = _resolve_session_id_from_job(job_id)
     try:
         return SESSION_MANAGER.get_orca_replica_metrics(session_id, replica_id, now=now)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"unknown replica: {replica_id}") from exc
+        raise HTTPException(
+            status_code=404, detail=f"unknown replica: {replica_id}"
+        ) from exc
 
 
 @app.post("/demo/orca/job/{job_id}/scale")
@@ -549,46 +992,68 @@ async def demo_orca_scale(job_id: str, req: ScaleRequest, now: Optional[float] =
     session_id = _resolve_session_id_from_job(job_id)
     session = _require_session(session_id)
     market = "on_demand" if req.on_demand else "spot"
-    instance, quota = _pick_instance_for_gpu(session, req.gpu_type, market)
+    try:
+        base_tps = _estimate_replica_tps_for_session(
+            session, req.gpu_type, req.tp_size, req.pp_size
+        )
+    except ValueError as exc:
+        return {
+            "status": "error",
+            "reason": "invalid_placement",
+            "message": str(exc),
+        }
     launch_timing_s = _scale_launch_timing_for_session(session, req.gpu_type)
     request_now = now or time.time()
-    new_replicas = SESSION_MANAGER.scale_job(
+    result = SESSION_MANAGER.scale_job(
         session_id,
         now=request_now,
         count=req.count,
         gpu_type=req.gpu_type,
-        instance_type=instance["instance_type"],
         tp=req.tp_size,
         pp=req.pp_size,
-        region=quota["region"],
-        market=market,
-        base_tps=_estimate_replica_tps_for_session(session, req.gpu_type, req.tp_size, req.pp_size),
+        preferred_region=None,
+        preferred_market=market,
+        preferred_instance_type=None,
+        base_tps=base_tps,
         launch_timing_s=launch_timing_s,
     )
-    return {"status": "scaling", "new_replicas": new_replicas}
+    return result
 
 
 @app.post("/demo/orca/job/{job_id}/kill")
 async def demo_orca_kill(job_id: str, req: KillRequest, now: Optional[float] = None):
     session_id = _resolve_session_id_from_job(job_id)
-    killed = SESSION_MANAGER.kill_replicas(session_id, req.replica_ids, now=now or time.time(), reason="Killed by demo Orca")
+    killed = SESSION_MANAGER.kill_replicas(
+        session_id,
+        req.replica_ids,
+        now=now or time.time(),
+        reason="Killed by demo Orca",
+    )
     return {"killed": killed}
 
 
 @app.post("/demo/orca/sim/kill-replica/{replica_id}")
 async def demo_orca_kill_replica(replica_id: str, now: Optional[float] = None):
     session_id = _resolve_session_id_from_replica(replica_id)
-    killed = SESSION_MANAGER.kill_replicas(session_id, [replica_id], now=now or time.time(), reason="Simulated failure")
+    killed = SESSION_MANAGER.kill_replicas(
+        session_id, [replica_id], now=now or time.time(), reason="Simulated failure"
+    )
     if not killed:
         raise HTTPException(status_code=404, detail=f"unknown replica: {replica_id}")
     return {"status": "killed", "replica_id": replica_id}
 
 
 @app.post("/demo/orca/sim/set-tps/{replica_id}")
-async def demo_orca_set_tps(replica_id: str, req: ReplicaTpsRequest, now: Optional[float] = None):
+async def demo_orca_set_tps(
+    replica_id: str, req: ReplicaTpsRequest, now: Optional[float] = None
+):
     session_id = _resolve_session_id_from_replica(replica_id)
     try:
-        value = SESSION_MANAGER.set_replica_tps(session_id, replica_id, target_tps=req.target_tps, now=now or time.time())
+        value = SESSION_MANAGER.set_replica_tps(
+            session_id, replica_id, target_tps=req.target_tps, now=now or time.time()
+        )
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"unknown replica: {replica_id}") from exc
+        raise HTTPException(
+            status_code=404, detail=f"unknown replica: {replica_id}"
+        ) from exc
     return {"status": "updated", "replica_id": replica_id, "tps": value}

@@ -84,6 +84,14 @@ select:focus {
   box-shadow: 0 0 0 3px rgba(63, 166, 240, 0.16);
 }
 
+.field-hint {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
 button {
   padding: 10px 14px;
   border-color: var(--accent);
@@ -522,9 +530,14 @@ button:hover {
   padding: 7px 8px;
 }
 
-.inline-control input {
+.inline-control input,
+.inline-control select {
   width: 70px;
   padding: 7px 8px;
+}
+
+.inline-control-wide select {
+  width: 140px;
 }
 
 .detail-list {
@@ -725,6 +738,115 @@ button:hover {
   font-weight: 650;
 }
 
+.reasoning-panel {
+  margin-top: 16px;
+  overflow: hidden;
+}
+
+.reasoning-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+  cursor: pointer;
+  list-style: none;
+  padding: 18px 20px;
+}
+
+.reasoning-summary::-webkit-details-marker {
+  display: none;
+}
+
+.reasoning-summary-copy h2,
+.reasoning-summary-copy p {
+  margin: 0;
+}
+
+.reasoning-summary-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.reasoning-summary-copy p {
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.reasoning-panel[open] .reasoning-summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.reasoning-body {
+  display: grid;
+  gap: 12px;
+  padding: 14px 18px 18px;
+}
+
+.reasoning-copy {
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-2);
+  padding: 12px 14px;
+  font-size: 0.84rem;
+  line-height: 1.55;
+}
+
+.koi-log-feed {
+  max-height: 340px;
+  overflow: auto;
+  display: grid;
+  gap: 10px;
+}
+
+.koi-log-line {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-2);
+  padding: 10px 12px;
+}
+
+.koi-log-line-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.koi-log-time {
+  color: var(--muted);
+  font-size: 0.74rem;
+  white-space: nowrap;
+}
+
+.koi-log-event {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.75rem;
+  color: var(--accent-strong);
+}
+
+.koi-log-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.koi-log-copy .console-title {
+  margin: 0;
+}
+
+.koi-log-copy .console-detail {
+  margin: 0;
+}
+
+.koi-log-meta {
+  color: var(--muted);
+  font-size: 0.74rem;
+  line-height: 1.45;
+}
+
 body.preview-mode .status-pill {
   background: #f6ead6;
   color: #8f5800;
@@ -774,6 +896,11 @@ body.preview-mode .status-pill {
   }
 
   .stage-header {
+    flex-direction: column;
+  }
+
+  .reasoning-summary {
+    align-items: flex-start;
     flex-direction: column;
   }
 }

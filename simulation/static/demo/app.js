@@ -7,6 +7,13 @@ const launchStatus = document.getElementById("launch-status");
 const sessionLabel = document.getElementById("session-label");
 const activityConsole = document.getElementById("activity-console");
 const replicaGrid = document.getElementById("replica-grid");
+const koiReasoningPanel = document.getElementById("koi-reasoning-panel");
+const koiReasoningStatus = document.getElementById("koi-reasoning-status");
+const koiReasoningMeta = document.getElementById("koi-reasoning-meta");
+const koiReasoningText = document.getElementById("koi-reasoning-text");
+const manualGpuType = document.getElementById("manual-gpu-type");
+const manualTpSize = document.getElementById("manual-tp-size");
+const manualPpSize = document.getElementById("manual-pp-size");
 const manualReplicaCount = document.getElementById("manual-replica-count");
 const addReplicaButton = document.getElementById("add-replica-button");
 const killOldestButton = document.getElementById("kill-oldest-button");
@@ -22,6 +29,7 @@ let activeSource = null;
 let catalog = null;
 let currentSnapshot = null;
 let previewScenes = [];
+let manualControlSessionId = null;
 const pageQuery = new URLSearchParams(window.location.search);
 const previewMode = pageQuery.get("preview") === "1";
 let previewReplicaCounter = 0;
@@ -128,6 +136,7 @@ function renderCatalog(data) {
 
   renderSelectedQuota();
   renderSelectedScenario();
+  syncManualScaleControls();
 }
 
 const QUOTA_GPU_ORDER = ["A100", "L40", "L4", "A10G"];
@@ -143,9 +152,26 @@ function normalizeQuotaGpuName(rawGpu) {
   return null;
 }
 
-function renderSelectedQuota() {
+function liveQuotaViewForSnapshot(snapshot) {
+  const liveResources = (((snapshot || {}).koi || {}).live || {}).resources || {};
+  if (Array.isArray(liveResources.instances) && Array.isArray(liveResources.quotas)
+    && (liveResources.instances.length || liveResources.quotas.length)) {
+    return liveResources;
+  }
+  return null;
+}
+
+function baseQuotaViewForSnapshot(snapshot) {
+  if (snapshot && snapshot.resource_map) {
+    return snapshot.resource_map;
+  }
+  return catalog.quota_presets.find((item) => item.slug === quotaSelect.value) || null;
+}
+
+function renderSelectedQuota(snapshot = null) {
   if (!catalog) return;
-  const quota = catalog.quota_presets.find((item) => item.slug === quotaSelect.value);
+  const quota = baseQuotaViewForSnapshot(snapshot);
+  const liveQuota = liveQuotaViewForSnapshot(snapshot);
   const quotaRoot = document.getElementById("quota-details");
   if (!quotaRoot) return;
   if (!quota) {
@@ -158,8 +184,9 @@ function renderSelectedQuota() {
       gpu,
       total: 0,
       used: 0,
-      regions: new Set(),
-      markets: new Set(),
+      displayRegion: null,
+      displayMarket: null,
+      displayScore: -1,
     }]),
   );
 
@@ -171,6 +198,15 @@ function renderSelectedQuota() {
     }
   }
 
+  const liveQuotaByKey = new Map();
+  for (const quotaEntry of (liveQuota || {}).quotas || []) {
+    const family = String(quotaEntry.family || "").toUpperCase();
+    const region = String(quotaEntry.region || "");
+    const market = String(quotaEntry.market || "");
+    if (!family || !region || !market) continue;
+    liveQuotaByKey.set(`${family}|${region}|${market}`, quotaEntry);
+  }
+
   for (const quotaEntry of quota.quotas || []) {
     const family = String(quotaEntry.family || "").toUpperCase();
     const instance = familyToInstance.get(family);
@@ -180,7 +216,9 @@ function renderSelectedQuota() {
     if (!gpu || !rows.has(gpu)) continue;
 
     const baselineVcpus = Number(quotaEntry.baseline_vcpus || 0);
-    const usedVcpus = Number(quotaEntry.used_vcpus || 0);
+    const liveKey = `${family}|${String(quotaEntry.region || "")}|${String(quotaEntry.market || "")}`;
+    const liveQuotaEntry = liveQuotaByKey.get(liveKey);
+    const usedVcpus = Number((liveQuotaEntry || quotaEntry).used_vcpus || 0);
     const instanceVcpus = Number(instance.vcpus || 0);
     const gpusPerInstance = Number(instance.gpus_per_instance || 0);
 
@@ -190,8 +228,14 @@ function renderSelectedQuota() {
       const row = rows.get(gpu);
       row.total += totalGpu;
       row.used += Math.min(usedGpu, totalGpu);
-      if (quotaEntry.region) row.regions.add(String(quotaEntry.region));
-      if (quotaEntry.market) row.markets.add(String(quotaEntry.market).replaceAll("_", " "));
+
+      // Prefer the live in-use location, otherwise the largest quota row.
+      const displayScore = (usedGpu > 0 ? 1_000_000 : 0) + totalGpu;
+      if (displayScore > row.displayScore) {
+        row.displayScore = displayScore;
+        row.displayRegion = quotaEntry.region ? String(quotaEntry.region) : row.displayRegion;
+        row.displayMarket = quotaEntry.market ? String(quotaEntry.market).replaceAll("_", " ") : row.displayMarket;
+      }
     }
   }
 
@@ -209,8 +253,8 @@ function renderSelectedQuota() {
     .filter((row) => row && (row.total > 0 || row.used > 0))
     .map((row) => {
       const pct = row.total > 0 ? Math.max(0, Math.min(100, (row.used / row.total) * 100)) : 0;
-      const region = [...row.regions][0] || "us-east-1";
-      const market = [...row.markets][0] || "on demand";
+      const region = row.displayRegion || "us-east-1";
+      const market = row.displayMarket || "on demand";
       return `
         <div class="quota-item">
           <div class="quota-item-header">
@@ -249,6 +293,86 @@ function renderSelectedScenario() {
   `;
 }
 
+function getManualResourceMap(snapshot = null) {
+  if (snapshot && snapshot.resource_map) {
+    return snapshot.resource_map;
+  }
+  const preset = (catalog?.quota_presets || []).find((item) => item.slug === quotaSelect.value);
+  return preset || {instances: [], quotas: []};
+}
+
+function getManualGpuOptions(snapshot = null) {
+  const resourceMap = getManualResourceMap(snapshot);
+  const seen = new Set();
+  return (resourceMap.instances || []).filter((instance) => {
+    const gpuType = String(instance.gpu_type || "");
+    if (!gpuType || seen.has(gpuType)) return false;
+    seen.add(gpuType);
+    return true;
+  });
+}
+
+function getManualInstanceForGpu(snapshot, gpuType) {
+  return getManualGpuOptions(snapshot).find((instance) => instance.gpu_type === gpuType) || null;
+}
+
+function getManualQuotaForGpu(snapshot, gpuType) {
+  const instance = getManualInstanceForGpu(snapshot, gpuType);
+  if (!instance) return null;
+  const family = String(instance.quota_family || "").toUpperCase();
+  return (getManualResourceMap(snapshot).quotas || []).find((quota) => String(quota.family || "").toUpperCase() === family) || null;
+}
+
+function getDefaultManualConfig(snapshot = null) {
+  const launchConfig = (snapshot || {}).launch_config || {};
+  const fallback = getCurrentConfig(snapshot || currentSnapshot || {
+    launch_preview: {preferred_gpu: getManualGpuOptions(snapshot)[0]?.gpu_type || "L40S", tp: 4, pp: 1},
+    koi: {},
+  });
+  return {
+    gpu_type: launchConfig.gpu_type || fallback.gpu_type,
+    tp: Number(launchConfig.tp || fallback.tp || 4),
+    pp: Number(launchConfig.pp || fallback.pp || 1),
+  };
+}
+
+function syncManualScaleControls(snapshot = null) {
+  if (!manualGpuType || !manualTpSize || !manualPpSize || !manualReplicaCount) return;
+  const options = getManualGpuOptions(snapshot);
+  const optionMarkup = options.length
+    ? options.map((instance) => `<option value="${escapeHtml(instance.gpu_type)}">${escapeHtml(instance.gpu_type)}</option>`).join("")
+    : '<option value="">No GPU options</option>';
+  const previousGpu = manualGpuType.value;
+  const sessionId = (snapshot || {}).session_id || "catalog";
+  const sessionChanged = sessionId !== manualControlSessionId;
+  const defaults = getDefaultManualConfig(snapshot);
+
+  manualGpuType.innerHTML = optionMarkup;
+  const validGpuValues = options.map((instance) => instance.gpu_type);
+  const nextGpu = (!sessionChanged && validGpuValues.includes(previousGpu))
+    ? previousGpu
+    : (validGpuValues.includes(defaults.gpu_type) ? defaults.gpu_type : (validGpuValues[0] || ""));
+  manualGpuType.value = nextGpu;
+
+  if (sessionChanged) {
+    manualTpSize.value = String(Math.max(1, defaults.tp));
+    manualPpSize.value = String(Math.max(1, defaults.pp));
+    manualReplicaCount.value = String(Math.max(1, Number(manualReplicaCount.value || 1)));
+    manualControlSessionId = sessionId;
+  }
+}
+
+function getManualScaleConfig(snapshot = null) {
+  const activeSnapshot = snapshot || currentSnapshot;
+  const defaults = getDefaultManualConfig(activeSnapshot);
+  return {
+    gpu_type: manualGpuType?.value || defaults.gpu_type,
+    tp: Math.max(1, Number(manualTpSize?.value || defaults.tp || 4)),
+    pp: Math.max(1, Number(manualPpSize?.value || defaults.pp || 1)),
+    count: Math.max(1, Number(manualReplicaCount?.value || 1)),
+  };
+}
+
 function renderSession(snapshot) {
   currentSnapshot = snapshot;
   previewReplicaCounter = Math.max(
@@ -260,11 +384,11 @@ function renderSession(snapshot) {
   );
   const runtime = snapshot.runtime;
   sessionLabel.textContent = `${snapshot.session_id} · ${snapshot.model.model_name}`;
+  syncManualScaleControls(snapshot);
 
-  const koiDecisionPending = snapshot.koi && snapshot.koi.decision_status === "pending";
-  const runtimePending = String(runtime.status || "").toLowerCase() === "koi_deciding";
+  const koiBusy = isKoiBusy(snapshot);
   if (koiThinkingBanner) {
-    koiThinkingBanner.hidden = !(koiDecisionPending || runtimePending);
+    koiThinkingBanner.hidden = !koiBusy;
   }
 
   document.getElementById("runtime-status").textContent = runtime.status;
@@ -303,7 +427,7 @@ function renderSession(snapshot) {
     const liveResources = (((snapshot.koi || {}).live || {}).resources) || {};
     const liveSummary = snapshot.koi.live
       ? `
-        <p class="quota-meta">Live Koi jobs: ${liveJobs.length} · Pending reservations: ${liveResources.pending_count ?? 0}</p>
+        <p class="quota-meta">Live Koi jobs: ${liveJobs.length} · Pending launch reservations: ${liveResources.pending_count ?? 0}</p>
         ${liveJobs.length ? `<p class="quota-meta">Tracked job IDs: ${escapeHtml(liveJobs.map((job) => job.job_id).join(", "))}</p>` : ""}
       `
       : "";
@@ -329,8 +453,10 @@ function renderSession(snapshot) {
     koiRoot.innerHTML = "<p>Live Koi decision not attached. Using demo runtime defaults.</p>";
   }
 
+  renderSelectedQuota(snapshot);
   renderReplicaFleet(snapshot);
   renderActivityConsole(snapshot);
+  renderKoiReasoningPanel(snapshot);
 }
 
 function renderKoiEventDetails(event) {
@@ -342,6 +468,55 @@ function renderKoiEventDetails(event) {
   if (event.phase) parts.push(`phase ${event.phase}`);
   if (event.response) parts.push(event.response);
   return parts.join(" · ");
+}
+
+function isKoiBusy(snapshot) {
+  const koi = (snapshot || {}).koi || {};
+  if (koi.decision_status === "pending") {
+    return true;
+  }
+  const events = koi.events || [];
+  if (!events.length) {
+    return false;
+  }
+  const lastEvent = String(events[events.length - 1].event || "");
+  return ["agent_deciding", "tool_call", "trigger_handling"].includes(lastEvent);
+}
+
+function renderKoiReasoningPanel(snapshot) {
+  if (!koiReasoningText || !koiReasoningMeta || !koiReasoningStatus) {
+    return;
+  }
+
+  const events = ((((snapshot || {}).koi || {}).events) || []).slice(-80);
+  const decision = (((snapshot || {}).koi || {}).decision) || null;
+  const busy = isKoiBusy(snapshot);
+  const latestActivity = events.length
+    ? describeKoiEvent(events[events.length - 1]).title
+    : "";
+
+  if (decision && decision.reasoning) {
+    koiReasoningText.textContent = decision.reasoning;
+    koiReasoningMeta.textContent = latestActivity
+      ? `${decision._decision_id || "decision"} · Latest activity: ${latestActivity}`
+      : (decision._decision_id || "Decision ready");
+  } else if (busy) {
+    koiReasoningText.textContent = latestActivity
+      ? `Koi is actively working. Latest step: ${latestActivity}.`
+      : "Koi is actively deciding.";
+    koiReasoningMeta.textContent = `${events.length} recent event${events.length === 1 ? "" : "s"}`;
+  } else {
+    koiReasoningText.textContent = "Launch a session to inspect Koi's decision narrative here.";
+    koiReasoningMeta.textContent = "No Koi reasoning yet.";
+  }
+
+  koiReasoningStatus.textContent = busy
+    ? "Thinking"
+    : (decision ? "Ready" : "Idle");
+
+  if (koiReasoningPanel && busy && !koiReasoningPanel.hasAttribute("open")) {
+    koiReasoningPanel.setAttribute("open", "open");
+  }
 }
 
 function describeRuntimeEvent(event) {
@@ -361,10 +536,13 @@ function describeKoiEvent(event) {
     };
   }
   if (eventName === "tool_call") {
-    const toolName = event.label || event.tool || "tool";
+    const toolName = event.tool || event.label || "tool";
+    const detail = event.call_number
+      ? `Tool call #${event.call_number}${toolName ? ` (${toolName})` : ""}.`
+      : "Inspecting the workload and cluster state.";
     return {
-      title: `Koi called ${toolName}`,
-      detail: event.call_number ? `Tool call #${event.call_number}.` : "Inspecting the workload and cluster state.",
+      title: `Koi called ${event.label || "decide"}`,
+      detail,
     };
   }
   if (eventName === "agent_decided") {
@@ -650,17 +828,19 @@ async function addReplica() {
     launchStatus.textContent = "Wait for Koi to finish deciding first";
     return;
   }
-  const cfg = getCurrentConfig(currentSnapshot);
-  const count = Math.max(1, Number(manualReplicaCount.value || 1));
+  const cfg = getManualScaleConfig(currentSnapshot);
   launchStatus.textContent = "Adding replica...";
-  await postJson(`/demo/orca/job/${currentSnapshot.session_id}/scale`, {
-    count,
+  const result = await postJson(`/demo/orca/job/${currentSnapshot.session_id}/scale`, {
+    count: cfg.count,
     gpu_type: cfg.gpu_type,
     tp_size: cfg.tp,
     pp_size: cfg.pp,
     on_demand: true,
   });
-  launchStatus.textContent = `${count} replica${count > 1 ? "s" : ""} requested`;
+  if (result.status !== "scaling") {
+    throw new Error(result.message || result.reason || "Scale request failed");
+  }
+  launchStatus.textContent = `${cfg.count} ${cfg.gpu_type} replica${cfg.count > 1 ? "s" : ""} requested`;
 }
 
 async function killReplica(replicaId) {
@@ -755,8 +935,10 @@ function pushPreviewConsoleEvent(snapshot, source, kind, title, detail = "") {
 function previewAddReplica() {
   if (!currentSnapshot) return;
   const snapshot = cloneSnapshot();
-  const cfg = getCurrentConfig(snapshot);
-  const count = Math.max(1, Number(manualReplicaCount.value || 1));
+  const cfg = getManualScaleConfig(snapshot);
+  const instance = getManualInstanceForGpu(snapshot, cfg.gpu_type);
+  const quota = getManualQuotaForGpu(snapshot, cfg.gpu_type);
+  const count = cfg.count;
   for (let i = 0; i < count; i += 1) {
     const replicaId = `${snapshot.session_id}-r${previewReplicaCounter}`;
     previewReplicaCounter += 1;
@@ -765,15 +947,15 @@ function previewAddReplica() {
       phase: "running",
       launch_phase: "running",
       gpu_type: cfg.gpu_type,
-      instance_type: snapshot.launch_preview.instance_type,
+      instance_type: instance?.instance_type || snapshot.launch_preview.instance_type,
       tp: cfg.tp,
       pp: cfg.pp,
-      region: snapshot.launch_preview.region,
-      market: snapshot.launch_preview.market,
+      region: quota?.region || snapshot.launch_preview.region,
+      market: quota?.market || snapshot.launch_preview.market,
       tps: Number(snapshot.launch_preview.baseline_replica_tps || 0),
     });
   }
-  pushPreviewConsoleEvent(snapshot, "sim", "scale_up", "Manual scale up", `Added ${count} replica${count > 1 ? "s" : ""} in preview mode.`);
+  pushPreviewConsoleEvent(snapshot, "sim", "scale_up", "Manual scale up", `Added ${count} ${cfg.gpu_type} replica${count > 1 ? "s" : ""} (TP ${cfg.tp}, PP ${cfg.pp}) in preview mode.`);
   currentSnapshot = recalcPreviewSnapshot(snapshot);
   renderSession(currentSnapshot);
 }
@@ -803,7 +985,10 @@ function previewSetReplicaTps(replicaId, targetTps) {
   renderSession(currentSnapshot);
 }
 
-quotaSelect.addEventListener("change", renderSelectedQuota);
+quotaSelect.addEventListener("change", () => {
+  renderSelectedQuota();
+  syncManualScaleControls(currentSnapshot);
+});
 scenarioSelect.addEventListener("change", renderSelectedScenario);
 
 form.addEventListener("submit", async (event) => {

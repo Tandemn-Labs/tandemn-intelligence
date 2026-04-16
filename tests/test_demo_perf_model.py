@@ -139,3 +139,49 @@ class TestDemoPerfModel:
         )
 
         assert pp1 > pp2
+
+    def test_invalid_memory_fit_returns_zero_tps(self):
+        model = DemoPerfModel(prefer_perfdb=False)
+        overrides = {
+            "num_params_billions": 227.27,
+            "num_layers": 62,
+            "hidden_dim": 3072,
+            "num_attention_heads": 48,
+            "num_kv_heads": 8,
+            "vocab_size": 200064,
+            "is_moe": True,
+            "num_experts": 256,
+            "active_experts": 8,
+            "architecture_family": "unknown",
+        }
+
+        a100 = model.estimate_replica_tps(
+            model_name="acme/HugeMoE",
+            gpu_type="A100-80GB",
+            tp=8,
+            pp=1,
+            input_tokens=800,
+            output_tokens=2000,
+            overrides=overrides,
+        )
+        l40s = model.estimate_replica_tps(
+            model_name="acme/HugeMoE",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            input_tokens=800,
+            output_tokens=2000,
+            overrides=overrides,
+        )
+        assessment = model.assess_replica_config(
+            model_name="acme/HugeMoE",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            overrides=overrides,
+        )
+
+        assert a100 > 0
+        assert l40s == 0.0
+        assert assessment.feasible is False
+        assert "not feasible" in (assessment.reason or "")

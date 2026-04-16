@@ -105,10 +105,17 @@ class TestLegacyResourceShape:
         assert body["quotas"], "expected non-empty quotas list"
 
         inst = body["instances"][0]
-        assert {"instance_type", "gpu_type", "gpus_per_instance", "cost_per_instance_hour_usd"} <= set(inst.keys())
+        assert {
+            "instance_type",
+            "gpu_type",
+            "gpus_per_instance",
+            "cost_per_instance_hour_usd",
+        } <= set(inst.keys())
 
         quota = body["quotas"][0]
-        assert {"family", "region", "market", "baseline_vcpus", "used_vcpus"} <= set(quota.keys())
+        assert {"family", "region", "market", "baseline_vcpus", "used_vcpus"} <= set(
+            quota.keys()
+        )
 
     def test_mock_orca_script_help_runs_from_repo_root(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -121,6 +128,19 @@ class TestLegacyResourceShape:
         )
         assert result.returncode == 0, result.stderr
         assert "Mock Orca server for Koi testing" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_resources_overlay_live_used_vcpus(self, client, seeded_job):
+        resp = await client.get("/resources")
+        assert resp.status_code == 200
+        quota = next(
+            item
+            for item in resp.json()["quotas"]
+            if item["family"] == "G6E"
+            and item["region"] == "us-east-1"
+            and item["market"] == "on_demand"
+        )
+        assert quota["used_vcpus"] == 96
 
 
 class TestLegacyJobEndpoints:
@@ -171,14 +191,28 @@ class TestLegacyJobEndpoints:
         sim_body = state.json()
         assert seeded_job.job_id in sim_body
         job_state = sim_body[seeded_job.job_id]
-        assert {"status", "model", "chunks", "aggregate_tps", "replicas_alive", "replicas_total", "replicas"} <= set(job_state.keys())
+        assert {
+            "status",
+            "model",
+            "chunks",
+            "aggregate_tps",
+            "replicas_alive",
+            "replicas_total",
+            "replicas",
+        } <= set(job_state.keys())
         assert job_state["chunks"].startswith("125/500")
         assert job_state["replicas_alive"] == 2
-        assert {"phase", "tps", "gpu", "tp", "pp"} <= set(job_state["replicas"]["mo-qwen32b-sim-r0"].keys())
+        assert {"phase", "tps", "gpu", "tp", "pp"} <= set(
+            job_state["replicas"]["mo-qwen32b-sim-r0"].keys()
+        )
 
     @pytest.mark.asyncio
-    async def test_submit_batch_returns_existing_job_launching(self, client, seeded_job):
-        resp = await client.post("/submit/batch", json={"model_name": seeded_job.model_name})
+    async def test_submit_batch_returns_existing_job_launching(
+        self, client, seeded_job
+    ):
+        resp = await client.post(
+            "/submit/batch", json={"model_name": seeded_job.model_name}
+        )
         assert resp.status_code == 200
         assert resp.json() == {
             "job_id": seeded_job.job_id,
@@ -189,7 +223,9 @@ class TestLegacyJobEndpoints:
 
 class TestLegacyMutations:
     @pytest.mark.asyncio
-    async def test_scale_returns_scaling_and_creates_launching_replicas(self, client, seeded_job, monkeypatch):
+    async def test_scale_returns_scaling_and_creates_launching_replicas(
+        self, client, seeded_job, monkeypatch
+    ):
         def fake_create_task(coro):
             coro.close()
             return _DummyTask()
@@ -198,7 +234,13 @@ class TestLegacyMutations:
 
         resp = await client.post(
             f"/job/{seeded_job.job_id}/scale",
-            json={"count": 2, "gpu_type": "A100", "tp_size": 8, "pp_size": 1, "on_demand": True},
+            json={
+                "count": 2,
+                "gpu_type": "A100",
+                "tp_size": 8,
+                "pp_size": 1,
+                "on_demand": True,
+            },
         )
         assert resp.status_code == 200
         body = resp.json()

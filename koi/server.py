@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from koi.agent import KoiAgent
 from koi.event_tap import emit_event
@@ -53,12 +53,17 @@ KOI_PORT = int(os.environ.get("KOI_PORT", "8090"))
 # Request / response models
 # ---------------------------------------------------------------------------
 
+
 class DecideRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     job_request: Dict[str, Any]
     resource_map: Any  # Shape A, B, or C
 
 
 class JobCompleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     job_id: str
     status: str
     metrics: Dict[str, Any] = {}
@@ -80,7 +85,11 @@ class _FixedTestAgent:
         resource = resource_map.get_resource(self.preferred_gpu)
         if resource is None:
             resource = next(
-                (r for r in resource_map.resources if r.available_gpus >= self.required_gpus),
+                (
+                    r
+                    for r in resource_map.resources
+                    if r.available_gpus >= self.required_gpus
+                ),
                 None,
             )
 
@@ -93,8 +102,14 @@ class _FixedTestAgent:
         cost_per_hour = resource.cost_per_instance_hour_usd * num_instances
         total_tokens = job_request.total_tokens or 0
         predicted_tps = float(os.environ.get("KOI_TEST_PREDICTED_TPS", "1200"))
-        runtime_hours = (total_tokens / predicted_tps / 3600) if total_tokens and predicted_tps > 0 else None
-        total_cost = cost_per_hour * runtime_hours if runtime_hours is not None else None
+        runtime_hours = (
+            (total_tokens / predicted_tps / 3600)
+            if total_tokens and predicted_tps > 0
+            else None
+        )
+        total_cost = (
+            cost_per_hour * runtime_hours if runtime_hours is not None else None
+        )
 
         return AgentDecision(
             job_id=job_request.job_id or f"test-job-{uuid.uuid4().hex[:8]}",
@@ -131,13 +146,16 @@ class _FixedTestAgent:
 # Lifespan
 # ---------------------------------------------------------------------------
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging()
 
     perfdb_path = os.environ.get("KOI_PERFDB_PATH", "./perfdb/perfdb_all.csv")
     memory_path = os.environ.get("KOI_MEMORY_PATH", "./data/koi_memory.db")
-    runtime_state_path = os.environ.get("KOI_RUNTIME_STATE_PATH", "./data/koi_runtime.db")
+    runtime_state_path = os.environ.get(
+        "KOI_RUNTIME_STATE_PATH", "./data/koi_runtime.db"
+    )
     orca_url = os.environ.get("ORCA_URL", "")
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     model = os.environ.get("KOI_LLM_MODEL", "claude-sonnet-4-6")
@@ -145,16 +163,23 @@ async def lifespan(app: FastAPI):
     # PerfDB
     try:
         app.state.perfdb = PerfDB(perfdb_path)
-        logger.info("perfdb_loaded", records=app.state.perfdb.record_count,
-                     models=app.state.perfdb.models, gpus=app.state.perfdb.gpu_types)
+        logger.info(
+            "perfdb_loaded",
+            records=app.state.perfdb.record_count,
+            models=app.state.perfdb.models,
+            gpus=app.state.perfdb.gpu_types,
+        )
     except Exception as e:
         logger.warning("perfdb_load_failed", error=str(e))
         app.state.perfdb = None
 
     # Memory
     app.state.memory = AgenticMemory(db_path=memory_path)
-    logger.info("memory_loaded", decisions=app.state.memory.decision_count(),
-                outcomes=app.state.memory.outcome_count())
+    logger.info(
+        "memory_loaded",
+        decisions=app.state.memory.decision_count(),
+        outcomes=app.state.memory.outcome_count(),
+    )
 
     # Resource ledger (pending GPU reservations)
     app.state.runtime_state = RuntimeStateStore(runtime_state_path)
@@ -163,7 +188,9 @@ async def lifespan(app: FastAPI):
 
     # Orca client
     app.state.session = aiohttp.ClientSession()
-    app.state.orca = OrcaClient(orca_url, session=app.state.session) if orca_url else None
+    app.state.orca = (
+        OrcaClient(orca_url, session=app.state.session) if orca_url else None
+    )
     if orca_url:
         logger.info("orca_client_ready", url=orca_url)
     else:
@@ -172,14 +199,18 @@ async def lifespan(app: FastAPI):
     # Agent
     if os.environ.get("KOI_TEST_FAKE_DECIDE") == "1":
         app.state.agent = _FixedTestAgent(model=model)
-        logger.warning("agent_ready_test_mode", model=app.state.agent.model,
-                       required_gpus=app.state.agent.required_gpus,
-                       preferred_gpu=app.state.agent.preferred_gpu)
+        logger.warning(
+            "agent_ready_test_mode",
+            model=app.state.agent.model,
+            required_gpus=app.state.agent.required_gpus,
+            preferred_gpu=app.state.agent.preferred_gpu,
+        )
     else:
         app.state.agent = KoiAgent(
             perfdb=app.state.perfdb,
             memory=app.state.memory,
             orca=app.state.orca,
+            ledger=app.state.ledger,
             api_key=api_key,
             model=model,
         )
@@ -268,6 +299,7 @@ def _classify_failure(reason: str) -> str:
 # Endpoints
 # ---------------------------------------------------------------------------
 
+
 @app.get("/health")
 async def health():
     return {
@@ -290,17 +322,52 @@ async def decide(req: DecideRequest):
     # Parse job request
     try:
         from koi.schemas import TaskType, Objective
+
         d = req.job_request
-        job_request = JobRequest(
-            model_name=str(d.get("model_name", "unknown")),
-            task_type=TaskType(d.get("task_type", "batch")),
-            avg_input_tokens=int(d.get("avg_input_tokens", 512)),
-            avg_output_tokens=int(d.get("avg_output_tokens", 256)),
-            num_requests=int(d["num_requests"]) if d.get("num_requests") else None,
-            slo_deadline_hours=float(d["slo_deadline_hours"]) if d.get("slo_deadline_hours") else None,
-            objective=Objective(d.get("objective", "cheapest")),
-            quantization=d.get("quantization"),
-        )
+        allowed_job_request_keys = {
+            "job_id",
+            "model_name",
+            "task_type",
+            "avg_input_tokens",
+            "avg_output_tokens",
+            "num_requests",
+            "expected_concurrency",
+            "slo_deadline_hours",
+            "slo_tpot_ms",
+            "slo_ttft_ms",
+            "objective",
+            "preferred_gpu_types",
+            "max_total_gpus",
+            "region",
+            "preferred_market",
+            "quantization",
+        }
+        unknown_job_request_keys = sorted(set(d.keys()) - allowed_job_request_keys)
+        if unknown_job_request_keys:
+            raise ValueError(
+                "Unknown job_request fields: " + ", ".join(unknown_job_request_keys)
+            )
+        job_request_payload = {
+            "model_name": str(d.get("model_name", "unknown")),
+            "task_type": TaskType(d.get("task_type", "batch")),
+            "avg_input_tokens": int(d.get("avg_input_tokens", 512)),
+            "avg_output_tokens": int(d.get("avg_output_tokens", 256)),
+            "num_requests": int(d["num_requests"]) if d.get("num_requests") else None,
+            "slo_deadline_hours": float(d["slo_deadline_hours"])
+            if d.get("slo_deadline_hours")
+            else None,
+            "objective": Objective(d.get("objective", "cheapest")),
+            "preferred_gpu_types": d.get("preferred_gpu_types"),
+            "max_total_gpus": int(d["max_total_gpus"])
+            if d.get("max_total_gpus") is not None
+            else None,
+            "region": d.get("region"),
+            "preferred_market": d.get("preferred_market"),
+            "quantization": d.get("quantization"),
+        }
+        if d.get("job_id"):
+            job_request_payload["job_id"] = str(d["job_id"])
+        job_request = JobRequest(**job_request_payload)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid job_request: {e}")
 
@@ -334,7 +401,9 @@ async def decide(req: DecideRequest):
             model_name=decision.model_name,
             instance_type=decision.config.instance_type,
             gpu_type=decision.config.gpu_type,
-            tp=decision.config.tp, pp=decision.config.pp, dp=decision.config.dp,
+            tp=decision.config.tp,
+            pp=decision.config.pp,
+            dp=decision.config.dp,
             num_gpus=decision.config.num_gpus,
             predicted_tps=decision.predicted_tps,
             predicted_cost_per_hour=decision.predicted_cost_per_hour,
@@ -348,6 +417,7 @@ async def decide(req: DecideRequest):
             avg_output_tokens=job_request.avg_output_tokens,
             num_requests=job_request.num_requests,
             triggered_by="user",
+            market=decision.planned_market,
         )
 
         # Reserve GPUs in ledger (pending until /job/started confirms)
@@ -369,9 +439,11 @@ async def decide(req: DecideRequest):
 
 
 class JobStartedRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     job_id: str
     decision_id: Optional[str] = None
-    group_id: Optional[str] = None      # parent job ID for chunked replicas
+    group_id: Optional[str] = None  # parent job ID for chunked replicas
     gpu_type: str
     instance_type: str
     region: str = "unknown"
@@ -382,10 +454,12 @@ class JobStartedRequest(BaseModel):
     slo_deadline_hours: float
     total_tokens: int
     predicted_tps: float = 0.0
-    is_fallback: bool = False           # True if Orca used a fallback config (not primary)
+    is_fallback: bool = False  # True if Orca used a fallback config (not primary)
 
 
 class JobLaunchingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     job_id: str
     decision_id: Optional[str] = None
     group_id: Optional[str] = None
@@ -394,11 +468,13 @@ class JobLaunchingRequest(BaseModel):
     tp: int = 1
     pp: int = 1
     region: str = "unknown"
-    market: str = "on_demand"
+    market: str = "unknown"
     attempt_index: int = 0
 
 
 class JobLaunchHeartbeatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     job_id: str
     decision_id: Optional[str] = None
     group_id: Optional[str] = None
@@ -407,7 +483,7 @@ class JobLaunchHeartbeatRequest(BaseModel):
     tp: int = 1
     pp: int = 1
     region: str = "unknown"
-    market: str = "on_demand"
+    market: str = "unknown"
     attempt_index: int = 0
     phase: str
     message: str = ""
@@ -424,23 +500,38 @@ async def job_launching(req: JobLaunchingRequest):
     now = time.time()
     if req.decision_id:
         app.state.ledger.touch(req.decision_id)
-    monitor.track_pending_launch(req.job_id, {
-        "decision_id": req.decision_id,
-        "group_id": req.group_id,
-        "gpu_type": req.gpu_type,
-        "instance_type": req.instance_type,
-        "tp": req.tp, "pp": req.pp,
-        "region": req.region, "market": req.market,
-        "attempt_index": req.attempt_index,
-        "launch_phase": "waiting_model_ready",
-        "launch_message": "Replica provisioned, waiting for model_ready",
-        "launched_at": now,
-        "last_heartbeat_at": now,
-    })
-    logger.info("job_launching", job_id=req.job_id, group_id=req.group_id,
-                gpu_type=req.gpu_type, instance_type=req.instance_type)
-    emit_event("job_launching", job_id=req.job_id, group_id=req.group_id,
-               gpu_type=req.gpu_type, instance_type=req.instance_type)
+    monitor.track_pending_launch(
+        req.job_id,
+        {
+            "decision_id": req.decision_id,
+            "group_id": req.group_id,
+            "gpu_type": req.gpu_type,
+            "instance_type": req.instance_type,
+            "tp": req.tp,
+            "pp": req.pp,
+            "region": req.region,
+            "market": req.market,
+            "attempt_index": req.attempt_index,
+            "launch_phase": "waiting_model_ready",
+            "launch_message": "Replica provisioned, waiting for model_ready",
+            "launched_at": now,
+            "last_heartbeat_at": now,
+        },
+    )
+    logger.info(
+        "job_launching",
+        job_id=req.job_id,
+        group_id=req.group_id,
+        gpu_type=req.gpu_type,
+        instance_type=req.instance_type,
+    )
+    emit_event(
+        "job_launching",
+        job_id=req.job_id,
+        group_id=req.group_id,
+        gpu_type=req.gpu_type,
+        instance_type=req.instance_type,
+    )
     return {"status": "tracked", "job_id": req.job_id}
 
 
@@ -452,24 +543,39 @@ async def job_launch_heartbeat(req: JobLaunchHeartbeatRequest):
     refreshed = False
     if req.decision_id:
         refreshed = app.state.ledger.touch(req.decision_id)
-    monitor.track_pending_launch(req.job_id, {
-        "decision_id": req.decision_id,
-        "group_id": req.group_id,
-        "gpu_type": req.gpu_type,
-        "instance_type": req.instance_type,
-        "tp": req.tp,
-        "pp": req.pp,
-        "region": req.region,
-        "market": req.market,
-        "attempt_index": req.attempt_index,
-        "launch_phase": req.phase,
-        "launch_message": req.message,
-        "last_heartbeat_at": heartbeat_at,
-    })
-    logger.info("job_launch_heartbeat", job_id=req.job_id, group_id=req.group_id,
-                phase=req.phase, attempt_index=req.attempt_index, refreshed=refreshed)
-    emit_event("job_launch_heartbeat", job_id=req.job_id, group_id=req.group_id,
-               phase=req.phase, attempt_index=req.attempt_index, refreshed=refreshed)
+    monitor.track_pending_launch(
+        req.job_id,
+        {
+            "decision_id": req.decision_id,
+            "group_id": req.group_id,
+            "gpu_type": req.gpu_type,
+            "instance_type": req.instance_type,
+            "tp": req.tp,
+            "pp": req.pp,
+            "region": req.region,
+            "market": req.market,
+            "attempt_index": req.attempt_index,
+            "launch_phase": req.phase,
+            "launch_message": req.message,
+            "last_heartbeat_at": heartbeat_at,
+        },
+    )
+    logger.info(
+        "job_launch_heartbeat",
+        job_id=req.job_id,
+        group_id=req.group_id,
+        phase=req.phase,
+        attempt_index=req.attempt_index,
+        refreshed=refreshed,
+    )
+    emit_event(
+        "job_launch_heartbeat",
+        job_id=req.job_id,
+        group_id=req.group_id,
+        phase=req.phase,
+        attempt_index=req.attempt_index,
+        refreshed=refreshed,
+    )
     return {"status": "tracked", "job_id": req.job_id, "lease_refreshed": refreshed}
 
 
@@ -480,8 +586,16 @@ async def job_started(req: JobStartedRequest):
     memory: AgenticMemory = app.state.memory
 
     pending_launch = monitor.get_pending_launch(req.job_id)
-    resolved_region = req.region if req.region != "unknown" else pending_launch.get("region", "unknown")
-    resolved_market = req.market if req.market != "unknown" else pending_launch.get("market", "unknown")
+    resolved_region = (
+        req.region
+        if req.region != "unknown"
+        else pending_launch.get("region", "unknown")
+    )
+    resolved_market = (
+        req.market
+        if req.market != "unknown"
+        else pending_launch.get("market", "unknown")
+    )
 
     # Clear pending launch tracking — replica reached model_ready
     monitor.clear_pending_launch(req.job_id)
@@ -512,10 +626,13 @@ async def job_started(req: JobStartedRequest):
                 model_name=original["model_name"],
                 instance_type=req.instance_type,
                 gpu_type=req.gpu_type,
-                tp=req.tp, pp=req.pp, dp=req.dp,
+                tp=req.tp,
+                pp=req.pp,
+                dp=req.dp,
                 num_gpus=req.tp * req.pp * req.dp,
                 predicted_tps=req.predicted_tps or 0,
-                predicted_cost_per_hour=original.get("predicted_cost_per_hour", 0.0) or 0.0,
+                predicted_cost_per_hour=original.get("predicted_cost_per_hour", 0.0)
+                or 0.0,
                 slo_deadline_hours=req.slo_deadline_hours,
                 objective=original.get("objective", "cheapest"),
                 avg_input_tokens=original.get("avg_input_tokens", 0),
@@ -523,18 +640,29 @@ async def job_started(req: JobStartedRequest):
                 num_requests=original.get("num_requests"),
                 triggered_by="fallback",
                 parent_decision_id=req.decision_id,
-                market=resolved_market if resolved_market != "unknown" else "on_demand",
+                market=(
+                    resolved_market
+                    if resolved_market != "unknown"
+                    else original.get("market", "unknown")
+                ),
             )
-            logger.info("fallback_detected", original_decision=req.decision_id,
-                       actual_decision=actual_decision_id, gpu_type=req.gpu_type,
-                       tp=req.tp, pp=req.pp)
+            logger.info(
+                "fallback_detected",
+                original_decision=req.decision_id,
+                actual_decision=actual_decision_id,
+                gpu_type=req.gpu_type,
+                tp=req.tp,
+                pp=req.pp,
+            )
 
     config = PlacementConfig(
         gpu_type=req.gpu_type,
         instance_type=req.instance_type,
         num_gpus=req.tp * req.pp * req.dp,
         num_instances=max(1, (req.tp * req.pp * req.dp) // 8),
-        tp=req.tp, pp=req.pp, dp=req.dp,
+        tp=req.tp,
+        pp=req.pp,
+        dp=req.dp,
         region=resolved_region,
         engine_config=EngineConfig(
             tensor_parallel_size=req.tp,
@@ -560,24 +688,45 @@ async def job_started(req: JobStartedRequest):
                 tracker.action_in_progress = False
                 tracker.action_freeze_until = None
                 monitor.persist_job(tracker.job_id)
-                logger.info("anti_windup_unfrozen", tracker_job=tracker.job_id, new_replica=req.job_id)
+                logger.info(
+                    "anti_windup_unfrozen",
+                    tracker_job=tracker.job_id,
+                    new_replica=req.job_id,
+                )
 
     # Update availability prior (success observation)
-    success_market = resolved_market
-    if success_market == "unknown":
-        success_market = "on_demand" if req.is_fallback else "spot"
-    memory.update_availability(
-        gpu_type=req.gpu_type,
-        region=resolved_region,
-        market=success_market,
-        launched=True,
-    )
+    if resolved_region != "unknown" and resolved_market != "unknown":
+        memory.update_availability(
+            gpu_type=req.gpu_type,
+            region=resolved_region,
+            market=resolved_market,
+            launched=True,
+        )
+    else:
+        logger.warning(
+            "job_started_missing_launch_context",
+            job_id=req.job_id,
+            region=resolved_region,
+            market=resolved_market,
+        )
 
-    logger.info("job_started", job_id=req.job_id, gpu_type=req.gpu_type,
-                tp=req.tp, pp=req.pp, group_id=req.group_id, is_fallback=req.is_fallback,
-                region=resolved_region, market=resolved_market)
-    return {"status": "registered", "job_id": req.job_id, "group_id": req.group_id,
-            "decision_id": actual_decision_id}
+    logger.info(
+        "job_started",
+        job_id=req.job_id,
+        gpu_type=req.gpu_type,
+        tp=req.tp,
+        pp=req.pp,
+        group_id=req.group_id,
+        is_fallback=req.is_fallback,
+        region=resolved_region,
+        market=resolved_market,
+    )
+    return {
+        "status": "registered",
+        "job_id": req.job_id,
+        "group_id": req.group_id,
+        "decision_id": actual_decision_id,
+    }
 
 
 @app.post("/job/complete")
@@ -609,7 +758,12 @@ async def job_complete(req: JobCompleteRequest):
                 slo_met=req.status == "succeeded",
                 slo_headroom_pct=tracker.slo_headroom_pct,
             )
-            logger.info("outcome_recorded", outcome_id=outcome_id, job_id=req.job_id, status=req.status)
+            logger.info(
+                "outcome_recorded",
+                outcome_id=outcome_id,
+                job_id=req.job_id,
+                status=req.status,
+            )
 
         monitor.unregister_job(req.job_id)
         return {"status": "recorded", "job_id": req.job_id}
@@ -618,7 +772,9 @@ async def job_complete(req: JobCompleteRequest):
     group_chains = monitor.get_group_chains(req.job_id)
     if group_chains:
         total_tps = sum(t.smoothed_tps for t in group_chains.values())
-        max_elapsed = max(t.elapsed_hours for t in group_chains.values()) if group_chains else 0
+        max_elapsed = (
+            max(t.elapsed_hours for t in group_chains.values()) if group_chains else 0
+        )
 
         # Record PER-CHAIN outcomes so the learning signal stays clean.
         # For single-chain groups, use Orca's aggregate TPS (true average over whole run).
@@ -642,10 +798,20 @@ async def job_complete(req: JobCompleteRequest):
             )
             outcomes_recorded += 1
 
-        logger.info("group_completed", job_id=req.job_id, outcomes=outcomes_recorded,
-                    aggregate_tps=round(total_tps), status=req.status)
-        emit_event("group_completed", job_id=req.job_id, outcomes=outcomes_recorded,
-                   aggregate_tps=round(total_tps), status=req.status)
+        logger.info(
+            "group_completed",
+            job_id=req.job_id,
+            outcomes=outcomes_recorded,
+            aggregate_tps=round(total_tps),
+            status=req.status,
+        )
+        emit_event(
+            "group_completed",
+            job_id=req.job_id,
+            outcomes=outcomes_recorded,
+            aggregate_tps=round(total_tps),
+            status=req.status,
+        )
 
         # Unregister all chains in the group
         monitor.unregister_group(req.job_id)
@@ -662,8 +828,14 @@ async def job_complete(req: JobCompleteRequest):
 
 
 class ReplicaFailedRequest(BaseModel):
-    job_id: str          # replica chain ID
-    group_id: str        # parent job ID
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str  # replica chain ID
+    group_id: str  # parent job ID
+    decision_id: Optional[str] = None
+    instance_type: str = "unknown"
+    region: str = "unknown"
+    market: str = "unknown"
     status: str = "failed"
     reason: str = ""
 
@@ -700,11 +872,21 @@ async def replica_failed(req: ReplicaFailedRequest):
     tracker.smoothed_tps = 0
     if req.job_id not in tracker.dead_replicas:
         tracker.dead_replicas.append(req.job_id)
+
+    if req.instance_type != "unknown":
+        tracker.config.instance_type = req.instance_type
+    if req.region != "unknown":
+        tracker.config.region = req.region
+    if req.market != "unknown":
+        tracker.config.market = req.market
+
     monitor.persist_job(req.job_id)
+
     failure_category = _classify_failure(req.reason)
-    market = tracker.config.market
-    if market == "unknown":
-        market = "spot" if failure_category == "spot_preemption" else "on_demand"
+    region = req.region if req.region != "unknown" else tracker.config.region
+    market = req.market if req.market != "unknown" else tracker.config.market
+    if market == "unknown" and failure_category == "spot_preemption":
+        market = "spot"
     # Record failure outcome in memory for learning (with actual TPS if available)
     memory: AgenticMemory = app.state.memory
     if tracker.decision_id:
@@ -717,12 +899,21 @@ async def replica_failed(req: ReplicaFailedRequest):
             diagnosis=req.reason[:200],
         )
     # Update availability prior (failure observation)
-    memory.update_availability(
-        gpu_type=tracker.config.gpu_type,
-        region=tracker.config.region,
-        market=market,
-        launched=False,
-    )
+    if region != "unknown" and market != "unknown":
+        memory.update_availability(
+            gpu_type=tracker.config.gpu_type,
+            region=region,
+            market=market,
+            launched=False,
+        )
+    else:
+        logger.warning(
+            "replica_failed_missing_launch_context",
+            job_id=req.job_id,
+            region=region,
+            market=market,
+            failure_category=failure_category,
+        )
     # Emit FAILED trigger to agent
     trigger = MonitoringTrigger(
         trigger_type=MonitoringStatus.FAILED,
@@ -731,20 +922,30 @@ async def replica_failed(req: ReplicaFailedRequest):
         diagnosis_hint=f"Replica died: {req.reason[:200]}",
     )
     await monitor._trigger_queue.put(trigger)
-    logger.info("replica_failed", job_id=req.job_id, group_id=req.group_id,
-                reason=req.reason[:100])
-    emit_event("replica_failed", job_id=req.job_id, group_id=req.group_id,
-               reason=req.reason[:100])
+    logger.info(
+        "replica_failed",
+        job_id=req.job_id,
+        group_id=req.group_id,
+        reason=req.reason[:100],
+    )
+    emit_event(
+        "replica_failed",
+        job_id=req.job_id,
+        group_id=req.group_id,
+        reason=req.reason[:100],
+    )
     return {"status": "trigger_emitted", "job_id": req.job_id}
 
 
 class ConfigAttemptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     job_id: str
     decision_id: Optional[str] = None
     instance_type: str
     gpu_type: str
     region: str
-    market: str = "on_demand"
+    market: str = "unknown"
     launched: bool
     failure_reason: str = ""
     time_to_launch: float = 0
@@ -766,18 +967,39 @@ async def config_attempted(req: ConfigAttemptRequest):
         launched=req.launched,
         time_to_launch=req.time_to_launch if req.launched else None,
         failure_reason=req.failure_reason if not req.launched else None,
-        failure_category=_classify_failure(req.failure_reason) if not req.launched else None,
+        failure_category=_classify_failure(req.failure_reason)
+        if not req.launched
+        else None,
     )
-    memory.update_availability(
-        gpu_type=req.gpu_type, region=req.region, market=req.market, launched=req.launched,
-    )
+    if req.region != "unknown" and req.market != "unknown":
+        memory.update_availability(
+            gpu_type=req.gpu_type,
+            region=req.region,
+            market=req.market,
+            launched=req.launched,
+        )
+    else:
+        logger.warning(
+            "config_attempt_missing_launch_context",
+            job_id=req.job_id,
+            region=req.region,
+            market=req.market,
+            launched=req.launched,
+        )
     status = "success" if req.launched else "failed"
-    logger.info("config_attempt", gpu_type=req.gpu_type, market=req.market,
-                region=req.region, launched=req.launched)
+    logger.info(
+        "config_attempt",
+        gpu_type=req.gpu_type,
+        market=req.market,
+        region=req.region,
+        launched=req.launched,
+    )
     return {"status": "recorded", "job_id": req.job_id, "launched": req.launched}
 
 
 class LaunchFailedRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     job_id: str
     decision_id: Optional[str] = None
     configs_tried: List[Dict[str, Any]] = []
@@ -799,23 +1021,39 @@ async def job_launch_failed(req: LaunchFailedRequest):
         reason = req.failure_reasons[i] if i < len(req.failure_reasons) else "unknown"
         gpu = config.get("gpu_type", "unknown")
         rgn = config.get("region", "unknown")
-        mkt = config.get("market", "on_demand")
+        mkt = config.get("market", "unknown")
         memory.record_launch_attempt(
             decision_id=decision_id or f"unknown-{req.job_id}",
             job_id=req.job_id,
             instance_type=config.get("instance_type", "unknown"),
-            gpu_type=gpu, region=rgn, market=mkt,
+            gpu_type=gpu,
+            region=rgn,
+            market=mkt,
             count=1,
             launched=False,
             failure_reason=reason,
             failure_category=_classify_failure(reason),
         )
-        memory.update_availability(gpu_type=gpu, region=rgn, market=mkt, launched=False)
+        if rgn != "unknown" and mkt != "unknown":
+            memory.update_availability(
+                gpu_type=gpu,
+                region=rgn,
+                market=mkt,
+                launched=False,
+            )
 
-    logger.info("launch_failed", job_id=req.job_id, configs_tried=len(req.configs_tried),
-                total_time_s=round(req.total_time_seconds))
-    emit_event("launch_failed", job_id=req.job_id, configs_tried=len(req.configs_tried),
-               total_time_s=round(req.total_time_seconds))
+    logger.info(
+        "launch_failed",
+        job_id=req.job_id,
+        configs_tried=len(req.configs_tried),
+        total_time_s=round(req.total_time_seconds),
+    )
+    emit_event(
+        "launch_failed",
+        job_id=req.job_id,
+        configs_tried=len(req.configs_tried),
+        total_time_s=round(req.total_time_seconds),
+    )
 
     # Release pending reservation (never launched)
     if decision_id:
@@ -842,51 +1080,79 @@ async def list_jobs():
     monitor: MonitoringLoop = app.state.monitor
     jobs = []
     for job_id, tracker in monitor.tracked_jobs.items():
-        jobs.append({
-            "job_id": job_id,
-            "status": tracker.status.value,
-            "gpu_type": tracker.config.gpu_type,
-            "tp": tracker.config.tp,
-            "pp": tracker.config.pp,
-            "dp": tracker.config.dp,
-            "smoothed_tps": round(tracker.smoothed_tps, 1),
-            "slo_headroom_pct": round(tracker.slo_headroom_pct, 1),
-            "elapsed_hours": round(tracker.elapsed_hours, 2),
-            "tokens_completed": tracker.tokens_completed,
-            "tokens_remaining": tracker.tokens_remaining,
-        })
+        jobs.append(
+            {
+                "job_id": job_id,
+                "status": tracker.status.value,
+                "gpu_type": tracker.config.gpu_type,
+                "tp": tracker.config.tp,
+                "pp": tracker.config.pp,
+                "dp": tracker.config.dp,
+                "smoothed_tps": round(tracker.smoothed_tps, 1),
+                "slo_headroom_pct": round(tracker.slo_headroom_pct, 1),
+                "elapsed_hours": round(tracker.elapsed_hours, 2),
+                "tokens_completed": tracker.tokens_completed,
+                "tokens_remaining": tracker.tokens_remaining,
+            }
+        )
     # Include pending launches (provisioned but not yet serving)
     for job_id, info in monitor._pending_launches.items():
         if job_id not in monitor.tracked_jobs:  # avoid duplicates
-            last_heartbeat_at = info.get("last_heartbeat_at", info.get("launched_at", time.time()))
-            jobs.append({
-                "job_id": job_id,
-                "status": "launching",
-                "launch_phase": info.get("launch_phase", "launching"),
-                "launch_message": info.get("launch_message", ""),
-                "attempt_index": info.get("attempt_index", 0),
-                "gpu_type": info.get("gpu_type", "unknown"),
-                "tp": info.get("tp", 1),
-                "pp": info.get("pp", 1),
-                "dp": 1,
-                "smoothed_tps": 0,
-                "slo_headroom_pct": 0,
-                "elapsed_hours": round((time.time() - info.get("launched_at", time.time())) / 3600, 2),
-                "last_heartbeat_seconds_ago": round(time.time() - last_heartbeat_at, 1),
-                "tokens_completed": 0,
-                "tokens_remaining": 0,
-            })
-    return {"tracked_jobs": len(monitor.tracked_jobs), "pending_launches": len(monitor._pending_launches), "jobs": jobs}
+            last_heartbeat_at = info.get(
+                "last_heartbeat_at", info.get("launched_at", time.time())
+            )
+            jobs.append(
+                {
+                    "job_id": job_id,
+                    "status": "launching",
+                    "launch_phase": info.get("launch_phase", "launching"),
+                    "launch_message": info.get("launch_message", ""),
+                    "attempt_index": info.get("attempt_index", 0),
+                    "gpu_type": info.get("gpu_type", "unknown"),
+                    "tp": info.get("tp", 1),
+                    "pp": info.get("pp", 1),
+                    "dp": 1,
+                    "smoothed_tps": 0,
+                    "slo_headroom_pct": 0,
+                    "elapsed_hours": round(
+                        (time.time() - info.get("launched_at", time.time())) / 3600, 2
+                    ),
+                    "last_heartbeat_seconds_ago": round(
+                        time.time() - last_heartbeat_at, 1
+                    ),
+                    "tokens_completed": 0,
+                    "tokens_remaining": 0,
+                }
+            )
+    return {
+        "tracked_jobs": len(monitor.tracked_jobs),
+        "pending_launches": len(monitor._pending_launches),
+        "jobs": jobs,
+    }
 
 
 @app.get("/resources")
 async def get_live_resources():
-    """Live resource map: total, active (from Orca), pending (from ledger), available."""
+    """Live resource map: Orca quota usage plus pending Koi reservations."""
     ledger: ResourceLedger = app.state.ledger
+    orca: Optional[OrcaClient] = getattr(app.state, "orca", None)
+    live_resources: Dict[str, Any] = {}
+    orca_error: Optional[str] = None
+
+    if orca is not None:
+        try:
+            live_resources = await asyncio.wait_for(orca.get_resources(), timeout=2.0)
+        except Exception as exc:
+            orca_error = str(exc)
+            logger.warning("resources_fetch_failed", error=orca_error)
+
     return {
+        "instances": live_resources.get("instances", []),
+        "quotas": live_resources.get("quotas", []),
         "pending_reservations": ledger.summary(),
         "pending_gpus": ledger.get_pending_by_type(),
         "pending_count": ledger.pending_count,
+        "orca_error": orca_error,
     }
 
 
@@ -896,5 +1162,6 @@ async def get_live_resources():
 
 if __name__ == "__main__":
     import uvicorn
+
     setup_logging()
     uvicorn.run(app, host="0.0.0.0", port=KOI_PORT)

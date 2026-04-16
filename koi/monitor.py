@@ -17,7 +17,10 @@ from typing import Callable, Coroutine, Dict, List, Optional
 from koi.logging_config import get_logger, bind_context, clear_context
 from koi.runtime_state import RuntimeStateStore
 from koi.schemas import (
-    JobTracker, MonitoringStatus, MonitoringTrigger, PlacementConfig,
+    JobTracker,
+    MonitoringStatus,
+    MonitoringTrigger,
+    PlacementConfig,
 )
 from koi.tools.orca_api import OrcaClient
 
@@ -25,15 +28,23 @@ logger = get_logger("koi.monitor")
 
 # Thresholds
 WARMUP_MINUTES = float(os.environ.get("KOI_WARMUP_MINUTES", "5.0"))
-EMA_ALPHA = 0.3                   # exponential moving average smoothing
+EMA_ALPHA = 0.3  # exponential moving average smoothing
 
 # Hysteresis thresholds (enter/exit pairs prevent oscillation)
-FALLING_BEHIND_ENTER = 10.0       # headroom < 10% → enter FALLING_BEHIND
-FALLING_BEHIND_EXIT = 20.0        # headroom > 20% → exit FALLING_BEHIND
-ON_TRACK_THRESHOLD = 30.0         # headroom > 30% → ON_TRACK
-OVER_PROVISIONED_ENTER = 70.0     # headroom > 70% → enter OVER_PROVISIONED
-OVER_PROVISIONED_EXIT = 50.0      # headroom < 50% → exit OVER_PROVISIONED
-OVER_PROVISIONED_MIN_ELAPSED = float(os.environ.get("KOI_OVERPROV_MIN_ELAPSED", "0.20"))  # fraction of SLO
+FALLING_BEHIND_ENTER = 10.0  # headroom < 10% → enter FALLING_BEHIND
+FALLING_BEHIND_EXIT = 20.0  # headroom > 20% → exit FALLING_BEHIND
+ON_TRACK_THRESHOLD = 30.0  # headroom > 30% → ON_TRACK
+OVER_PROVISIONED_ENTER = 70.0  # headroom > 70% → enter OVER_PROVISIONED
+OVER_PROVISIONED_EXIT = 50.0  # headroom < 50% → exit OVER_PROVISIONED
+OVER_PROVISIONED_MIN_ELAPSED = float(
+    os.environ.get("KOI_OVERPROV_MIN_ELAPSED", "0.20")
+)  # fraction of SLO
+OVER_PROVISIONED_MAX_WAIT_HOURS = float(
+    os.environ.get("KOI_OVERPROV_MAX_WAIT_HOURS", "0.05")
+)
+OVER_PROVISIONED_MIN_LIVE_REPLICAS = int(
+    os.environ.get("KOI_OVERPROV_MIN_LIVE_REPLICAS", "1")
+)
 
 
 class MonitoringLoop:
@@ -63,10 +74,16 @@ class MonitoringLoop:
         self._trigger_queue: asyncio.Queue = asyncio.Queue()
         self._tasks: List[asyncio.Task] = []
         self._running = False
-        self._group_trigger_cooldown: Dict[str, float] = {}  # "group_id:status" → last_emit_time
+        self._group_trigger_cooldown: Dict[
+            str, float
+        ] = {}  # "group_id:status" → last_emit_time
         self._koi_initiated_kills: set = set()  # replica IDs killed by scale_chain_tool
-        self._pending_launches: Dict[str, dict] = {}  # replica_id → launch info (pre-model_ready)
-        self._pending_scale_decisions: Dict[str, List[dict]] = {}  # group_id -> FIFO queue
+        self._pending_launches: Dict[
+            str, dict
+        ] = {}  # replica_id → launch info (pre-model_ready)
+        self._pending_scale_decisions: Dict[
+            str, List[dict]
+        ] = {}  # group_id -> FIFO queue
 
     # ------------------------------------------------------------------
     # Job registration
@@ -97,8 +114,13 @@ class MonitoringLoop:
         )
         self.tracked_jobs[job_id] = tracker
         self.persist_job(job_id)
-        logger.info("job_registered", job_id=job_id, slo_hours=slo_deadline_hours,
-                     total_tokens=total_tokens, group_id=group_id)
+        logger.info(
+            "job_registered",
+            job_id=job_id,
+            slo_hours=slo_deadline_hours,
+            total_tokens=total_tokens,
+            group_id=group_id,
+        )
 
     def unregister_job(self, job_id: str):
         self.tracked_jobs.pop(job_id, None)
@@ -108,7 +130,9 @@ class MonitoringLoop:
 
     def get_group_chains(self, group_id: str) -> Dict[str, JobTracker]:
         """Get all tracked chains that belong to a job group."""
-        return {jid: t for jid, t in self.tracked_jobs.items() if t.group_id == group_id}
+        return {
+            jid: t for jid, t in self.tracked_jobs.items() if t.group_id == group_id
+        }
 
     def unregister_group(self, group_id: str) -> List[JobTracker]:
         """Unregister all chains in a group. Returns the trackers for aggregation."""
@@ -232,7 +256,9 @@ class MonitoringLoop:
             job_id: entry["launch"]
             for job_id, entry in self.runtime_state.load_pending_launches().items()
         }
-        self._pending_scale_decisions = self.runtime_state.load_pending_scale_decisions()
+        self._pending_scale_decisions = (
+            self.runtime_state.load_pending_scale_decisions()
+        )
 
         summary = {
             "tracked_jobs": len(self.tracked_jobs),
@@ -258,8 +284,11 @@ class MonitoringLoop:
                         tracker = self.tracked_jobs.get(job_id)
                         if tracker:
                             tracker.consecutive_fetch_failures += 1
-                            logger.warning("poll_job_timeout", job_id=job_id,
-                                           failures=tracker.consecutive_fetch_failures)
+                            logger.warning(
+                                "poll_job_timeout",
+                                job_id=job_id,
+                                failures=tracker.consecutive_fetch_failures,
+                            )
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -294,37 +323,58 @@ class MonitoringLoop:
                 try:
                     replicas_resp = await self.orca.get_replicas(tracker.group_id)
                     for r in replicas_resp.get("replicas", []):
-                        if r["replica_id"] == job_id and r.get("phase") in ("dead", "failed", "killed"):
+                        if r["replica_id"] == job_id and r.get("phase") in (
+                            "dead",
+                            "failed",
+                            "killed",
+                        ):
                             tracker.smoothed_tps = 0
                             tracker.dead_replicas.append(job_id)
                             # Intentional kills (from scale_chain_tool) don't trigger FAILED
                             if job_id in self._koi_initiated_kills:
-                                tracker.status = MonitoringStatus.COMPLETED  # clean exit
+                                tracker.status = (
+                                    MonitoringStatus.COMPLETED
+                                )  # clean exit
                                 self._koi_initiated_kills.discard(job_id)
                                 logger.info("intentional_kill_cleanup", job_id=job_id)
                             else:
                                 tracker.status = MonitoringStatus.FAILED
-                                logger.warning("replica_dead", job_id=job_id, phase=r["phase"])
-                                await self._emit_trigger(job_id, MonitoringStatus.FAILED,
-                                                         f"Orca reports replica {r['phase']}")
+                                logger.warning(
+                                    "replica_dead", job_id=job_id, phase=r["phase"]
+                                )
+                                await self._emit_trigger(
+                                    job_id,
+                                    MonitoringStatus.FAILED,
+                                    f"Orca reports replica {r['phase']}",
+                                )
                             return
                 except Exception as e:
                     tracker.consecutive_fetch_failures += 1
-                    logger.warning("replica_check_failed", job_id=job_id, error=str(e),
-                                   failures=tracker.consecutive_fetch_failures)
+                    logger.warning(
+                        "replica_check_failed",
+                        job_id=job_id,
+                        error=str(e),
+                        failures=tracker.consecutive_fetch_failures,
+                    )
 
             # Fetch metrics from Orca
             try:
                 # Per-replica throughput (individual chain), job-level chunk progress
                 if tracker.group_id:
-                    metrics = await self.orca.get_replica_metrics(tracker.group_id, job_id)
+                    metrics = await self.orca.get_replica_metrics(
+                        tracker.group_id, job_id
+                    )
                 else:
                     metrics = await self.orca.get_job_metrics(orca_job_id)
                 progress = await self.orca.get_chunk_progress(orca_job_id)
             except Exception as e:
                 tracker.consecutive_fetch_failures += 1
-                logger.warning("metrics_fetch_failed", job_id=job_id, error=str(e),
-                               failures=tracker.consecutive_fetch_failures)
+                logger.warning(
+                    "metrics_fetch_failed",
+                    job_id=job_id,
+                    error=str(e),
+                    failures=tracker.consecutive_fetch_failures,
+                )
                 return
 
             # Metrics fetched successfully — reset failure counter
@@ -350,7 +400,9 @@ class MonitoringLoop:
                 completion_frac = (completed_chunks + failed_chunks) / total_chunks
                 new_completed = int(tracker.total_tokens * completion_frac)
                 tracker.tokens_completed = max(tracker.tokens_completed, new_completed)
-                tracker.tokens_remaining = tracker.total_tokens - tracker.tokens_completed
+                tracker.tokens_remaining = (
+                    tracker.total_tokens - tracker.tokens_completed
+                )
 
             # Time tracking
             elapsed_s = (datetime.utcnow() - tracker.started_at).total_seconds()
@@ -363,17 +415,23 @@ class MonitoringLoop:
 
             # SLO projection
             tracker.slo_headroom_pct = compute_slo_headroom(
-                tracker.slo_deadline_hours, tracker.elapsed_hours,
-                tracker.tokens_remaining, tracker.smoothed_tps,
+                tracker.slo_deadline_hours,
+                tracker.elapsed_hours,
+                tracker.tokens_remaining,
+                tracker.smoothed_tps,
             )
             if tracker.smoothed_tps > 0:
-                tracker.projected_eta_hours = tracker.tokens_remaining / tracker.smoothed_tps / 3600
+                tracker.projected_eta_hours = (
+                    tracker.tokens_remaining / tracker.smoothed_tps / 3600
+                )
             else:
                 tracker.projected_eta_hours = float("inf")
 
             # Check for completion — don't emit trigger, /job/complete webhook handles outcome recording
             all_done = progress.get("all_done", False)
-            if all_done or (total_chunks > 0 and (completed_chunks + failed_chunks) >= total_chunks):
+            if all_done or (
+                total_chunks > 0 and (completed_chunks + failed_chunks) >= total_chunks
+            ):
                 tracker.status = MonitoringStatus.COMPLETED
                 logger.info("chunks_completed", job_id=job_id)
                 return
@@ -383,15 +441,23 @@ class MonitoringLoop:
                 job_status = await self.orca.get_job_status(orca_job_id)
                 if job_status.get("status") in ("failed", "cancelled"):
                     tracker.status = MonitoringStatus.FAILED
-                    await self._emit_trigger(job_id, MonitoringStatus.FAILED,
-                                             f"Orca reports status={job_status.get('status')}")
+                    await self._emit_trigger(
+                        job_id,
+                        MonitoringStatus.FAILED,
+                        f"Orca reports status={job_status.get('status')}",
+                    )
                     return
             except Exception as e:
                 tracker.consecutive_fetch_failures += 1
-                logger.warning("job_status_check_failed", job_id=job_id, error=str(e),
-                               failures=tracker.consecutive_fetch_failures)
+                logger.warning(
+                    "job_status_check_failed",
+                    job_id=job_id,
+                    error=str(e),
+                    failures=tracker.consecutive_fetch_failures,
+                )
 
             # Classify status — for grouped chains, use aggregate TPS for SLO check
+            live_replica_count = None
             if tracker.group_id:
                 group_chains = self.get_group_chains(tracker.group_id)
                 if not group_chains:
@@ -399,42 +465,78 @@ class MonitoringLoop:
                     return
                 # Exclude dead/completed replicas from aggregate — they contribute 0 TPS
                 # and drag down headroom calculation unnecessarily
-                live_chains = {k: v for k, v in group_chains.items()
-                              if v.status not in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED)}
-                aggregate_tps = sum(t.smoothed_tps for t in live_chains.values()) if live_chains else 0
+                live_chains = {
+                    k: v
+                    for k, v in group_chains.items()
+                    if v.status
+                    not in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED)
+                }
+                live_replica_count = len(live_chains)
+                aggregate_tps = (
+                    sum(t.smoothed_tps for t in live_chains.values())
+                    if live_chains
+                    else 0
+                )
                 # Recompute headroom using aggregate throughput and full job tokens
                 # All replicas share the same chunk pool — use max, not sum
                 total_job_tokens = max(t.total_tokens for t in group_chains.values())
-                total_remaining = max(0, total_job_tokens - int(
-                    total_job_tokens * ((completed_chunks + failed_chunks) / max(total_chunks, 1))
-                )) if total_chunks > 0 else total_job_tokens
+                total_remaining = (
+                    max(
+                        0,
+                        total_job_tokens
+                        - int(
+                            total_job_tokens
+                            * (
+                                (completed_chunks + failed_chunks)
+                                / max(total_chunks, 1)
+                            )
+                        ),
+                    )
+                    if total_chunks > 0
+                    else total_job_tokens
+                )
                 tracker.slo_headroom_pct = compute_slo_headroom(
-                    tracker.slo_deadline_hours, tracker.elapsed_hours,
-                    total_remaining, aggregate_tps,
+                    tracker.slo_deadline_hours,
+                    tracker.elapsed_hours,
+                    total_remaining,
+                    aggregate_tps,
                 )
 
             prev_status = tracker.status
-            new_status = _classify_status(tracker)
+            new_status = _classify_status(tracker, active_replicas=live_replica_count)
             tracker.status = new_status
 
             # Handle warmup transition
-            if not tracker.warmup_complete and new_status != MonitoringStatus.WARMING_UP:
+            if (
+                not tracker.warmup_complete
+                and new_status != MonitoringStatus.WARMING_UP
+            ):
                 tracker.warmup_complete = True
-                logger.info("warmup_complete", job_id=job_id, tps=round(tracker.smoothed_tps))
+                logger.info(
+                    "warmup_complete", job_id=job_id, tps=round(tracker.smoothed_tps)
+                )
 
             # Emit triggers on state transitions (anti-windup: skip if action in progress)
             if new_status != prev_status:
-                frozen = (tracker.action_in_progress and
-                          tracker.action_freeze_until and
-                          time.time() < tracker.action_freeze_until)
+                frozen = (
+                    tracker.action_in_progress
+                    and tracker.action_freeze_until
+                    and time.time() < tracker.action_freeze_until
+                )
                 if frozen:
                     logger.debug("anti_windup_skip", job_id=job_id)
                 elif new_status == MonitoringStatus.FALLING_BEHIND:
-                    await self._emit_trigger(job_id, MonitoringStatus.FALLING_BEHIND,
-                                             f"Headroom={tracker.slo_headroom_pct:.1f}%, TPS={tracker.smoothed_tps:.0f}")
+                    await self._emit_trigger(
+                        job_id,
+                        MonitoringStatus.FALLING_BEHIND,
+                        f"Headroom={tracker.slo_headroom_pct:.1f}%, TPS={tracker.smoothed_tps:.0f}",
+                    )
                 elif new_status == MonitoringStatus.OVER_PROVISIONED:
-                    await self._emit_trigger(job_id, MonitoringStatus.OVER_PROVISIONED,
-                                             f"Headroom={tracker.slo_headroom_pct:.0f}%, can shed replicas")
+                    await self._emit_trigger(
+                        job_id,
+                        MonitoringStatus.OVER_PROVISIONED,
+                        f"Headroom={tracker.slo_headroom_pct:.0f}%, can shed replicas",
+                    )
         finally:
             if job_id in self.tracked_jobs:
                 self.persist_job(job_id)
@@ -446,7 +548,10 @@ class MonitoringLoop:
             return
         # Don't emit non-FAILED triggers for replicas already marked FAILED
         # (prevents FALLING_BEHIND racing ahead of FAILED webhook)
-        if tracker.status == MonitoringStatus.FAILED and status != MonitoringStatus.FAILED:
+        if (
+            tracker.status == MonitoringStatus.FAILED
+            and status != MonitoringStatus.FAILED
+        ):
             return
         # Group-level dedup: at most one trigger per group per status per 30s
         if tracker.group_id:
@@ -473,20 +578,28 @@ class MonitoringLoop:
         """Wait for trigger events and dispatch to agent callback."""
         while self._running:
             try:
-                trigger = await asyncio.wait_for(
-                    self._trigger_queue.get(), timeout=5.0
-                )
+                trigger = await asyncio.wait_for(self._trigger_queue.get(), timeout=5.0)
                 if self.on_trigger:
-                    logger.info("trigger_dispatching", job_id=trigger.job_id,
-                                trigger_type=trigger.trigger_type.value)
+                    logger.info(
+                        "trigger_dispatching",
+                        job_id=trigger.job_id,
+                        trigger_type=trigger.trigger_type.value,
+                    )
                     try:
                         result = await self.on_trigger(trigger)
-                        logger.info("trigger_handled", job_id=trigger.job_id,
-                                    response=str(result)[:200])
+                        logger.info(
+                            "trigger_handled",
+                            job_id=trigger.job_id,
+                            response=str(result)[:200],
+                        )
                     except Exception as e:
-                        logger.error("trigger_handler_error", job_id=trigger.job_id, error=str(e))
+                        logger.error(
+                            "trigger_handler_error", job_id=trigger.job_id, error=str(e)
+                        )
                 else:
-                    logger.warning("no_trigger_callback", trigger_type=trigger.trigger_type.value)
+                    logger.warning(
+                        "no_trigger_callback", trigger_type=trigger.trigger_type.value
+                    )
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -499,6 +612,7 @@ class MonitoringLoop:
 # Pure functions (no state, testable)
 # ---------------------------------------------------------------------------
 
+
 def _ema(prev: float, new: float, alpha: float) -> float:
     """Exponential moving average."""
     if prev == 0:
@@ -506,7 +620,25 @@ def _ema(prev: float, new: float, alpha: float) -> float:
     return alpha * new + (1 - alpha) * prev
 
 
-def _classify_status(tracker: JobTracker) -> MonitoringStatus:
+def _required_overprovision_elapsed_hours(slo_deadline_hours: float) -> float:
+    """How long to wait before considering a job safely overprovisioned.
+
+    The old 20%-of-SLO gate was far too conservative for long-deadline jobs.
+    Cap it to a small absolute maximum so downscale triggers can still happen on
+    practical timescales.
+    """
+    return max(
+        WARMUP_MINUTES / 60,
+        min(
+            slo_deadline_hours * OVER_PROVISIONED_MIN_ELAPSED,
+            OVER_PROVISIONED_MAX_WAIT_HOURS,
+        ),
+    )
+
+
+def _classify_status(
+    tracker: JobTracker, active_replicas: Optional[int] = None
+) -> MonitoringStatus:
     """Classify job status with hysteresis to prevent oscillation.
 
     Enter/exit thresholds differ: entering FALLING_BEHIND requires headroom < 10%,
@@ -522,15 +654,22 @@ def _classify_status(tracker: JobTracker) -> MonitoringStatus:
 
     prev = tracker.status
     h = tracker.slo_headroom_pct
+    can_shed_replicas = (
+        active_replicas is None or active_replicas >= OVER_PROVISIONED_MIN_LIVE_REPLICAS
+    )
 
     # OVER_PROVISIONED: enter at 70%, exit at 50%
     if prev == MonitoringStatus.OVER_PROVISIONED:
-        if h < OVER_PROVISIONED_EXIT:
+        if not can_shed_replicas or h < OVER_PROVISIONED_EXIT:
             pass  # fall through to normal classification
         else:
             return MonitoringStatus.OVER_PROVISIONED
-    elif (h > OVER_PROVISIONED_ENTER and
-          tracker.elapsed_hours > tracker.slo_deadline_hours * OVER_PROVISIONED_MIN_ELAPSED):
+    elif (
+        can_shed_replicas
+        and h > OVER_PROVISIONED_ENTER
+        and tracker.elapsed_hours
+        >= _required_overprovision_elapsed_hours(tracker.slo_deadline_hours)
+    ):
         return MonitoringStatus.OVER_PROVISIONED
 
     # FALLING_BEHIND: enter at 10%, exit at 20%
@@ -555,9 +694,20 @@ def compute_slo_headroom(
     tokens_remaining: int,
     smoothed_tps: float,
 ) -> float:
-    """Compute SLO headroom percentage. >0 means on track, <0 means behind."""
-    if smoothed_tps <= 0:
-        return -100.0 if tokens_remaining > 0 else 0.0
-    remaining_hours = tokens_remaining / smoothed_tps / 3600
+    """Compute SLO headroom as a percentage of time left.
+
+    0% means the current throughput is exactly enough to finish on time.
+    Positive means slack remains; negative means the job is projected to miss.
+    """
+    if tokens_remaining <= 0:
+        return 0.0
+
     time_left = slo_deadline_hours - elapsed_hours
-    return ((time_left - remaining_hours) / max(slo_deadline_hours, 0.01)) * 100
+    if time_left <= 0:
+        return -100.0
+    if smoothed_tps <= 0:
+        return -100.0
+
+    remaining_hours = tokens_remaining / smoothed_tps / 3600
+    headroom = ((time_left - remaining_hours) / max(time_left, 0.01)) * 100
+    return max(-100.0, headroom)

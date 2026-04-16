@@ -76,8 +76,9 @@
           <form id="launch-form" class="control-grid">
             <label>
               <span>Model</span>
-              <input id="model-input" name="model_name" list="model-options" placeholder="Qwen/Qwen3-32B">
+              <input id="model-input" name="model_name" list="model-options" placeholder="meta-llama/Llama-3.1-70B-Instruct">
               <datalist id="model-options"></datalist>
+              <small class="field-hint">Type any Hugging Face model ID. The list is just suggestions.</small>
             </label>
 
             <label>
@@ -192,8 +193,20 @@
                   <span class="section-note">Manual actions update the current demo world immediately.</span>
                 </div>
                 <div class="control-strip">
+                  <label class="inline-control inline-control-wide">
+                    <span>GPU</span>
+                    <select id="manual-gpu-type"></select>
+                  </label>
                   <label class="inline-control">
-                    <span>Manual Replicas</span>
+                    <span>TP</span>
+                    <input id="manual-tp-size" type="number" min="1" value="4">
+                  </label>
+                  <label class="inline-control">
+                    <span>PP</span>
+                    <input id="manual-pp-size" type="number" min="1" value="1">
+                  </label>
+                  <label class="inline-control">
+                    <span>Replicas</span>
                     <input id="manual-replica-count" type="number" min="1" value="1">
                   </label>
                   <button id="add-replica-button" type="button" class="secondary-button">Add Replica</button>
@@ -227,6 +240,26 @@
             </div>
           </div>
         </section>
+
+        <details id="koi-reasoning-panel" class="panel reasoning-panel" open>
+          <summary class="reasoning-summary">
+            <div class="reasoning-summary-copy">
+              <h2>Koi Reasoning</h2>
+              <p>Expand to inspect Koi's current decision narrative for this session.</p>
+            </div>
+            <span id="koi-reasoning-status" class="status-pill">Idle</span>
+          </summary>
+
+          <div class="reasoning-body">
+            <section class="surface compact-surface">
+              <div class="section-heading">
+                <h3>Decision Reasoning</h3>
+                <span id="koi-reasoning-meta" class="section-note">No Koi reasoning yet.</span>
+              </div>
+              <div id="koi-reasoning-text" class="reasoning-copy">Launch a session to inspect Koi's decision narrative here.</div>
+            </section>
+          </div>
+        </details>
       </section>
     </main>
   </div>

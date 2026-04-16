@@ -61,7 +61,7 @@ class AgenticMemory:
                 num_requests         INTEGER,
                 triggered_by         TEXT DEFAULT 'user',
                 parent_decision_id   TEXT,
-                market               TEXT DEFAULT 'on_demand'
+                market               TEXT DEFAULT 'unknown'
             );
 
             CREATE TABLE IF NOT EXISTS outcomes (
@@ -126,11 +126,21 @@ class AgenticMemory:
     # ------------------------------------------------------------------
 
     def record_decision(
-        self, job_id: str, model_name: str,
-        instance_type: str, gpu_type: str, tp: int, pp: int, dp: int,
-        num_gpus: int, predicted_tps: float, predicted_cost_per_hour: float,
-        slo_deadline_hours: float, objective: str,
-        avg_input_tokens: int, avg_output_tokens: int,
+        self,
+        job_id: str,
+        model_name: str,
+        instance_type: str,
+        gpu_type: str,
+        tp: int,
+        pp: int,
+        dp: int,
+        num_gpus: int,
+        predicted_tps: float,
+        predicted_cost_per_hour: float,
+        slo_deadline_hours: float,
+        objective: str,
+        avg_input_tokens: int,
+        avg_output_tokens: int,
         num_requests: Optional[int] = None,
         predicted_total_cost: Optional[float] = None,
         predicted_runtime_hours: Optional[float] = None,
@@ -139,11 +149,12 @@ class AgenticMemory:
         quantization: Optional[str] = None,
         triggered_by: str = "user",
         parent_decision_id: Optional[str] = None,
-        market: str = "on_demand",
+        market: str = "unknown",
     ) -> str:
         decision_id = f"dec-{uuid.uuid4().hex[:8]}"
         conn = self._conn()
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO decisions (
                 decision_id, job_id, model_name, instance_type, gpu_type,
                 tp, pp, dp, num_gpus, quantization,
@@ -152,19 +163,42 @@ class AgenticMemory:
                 slo_deadline_hours, objective, avg_input_tokens, avg_output_tokens,
                 num_requests, triggered_by, parent_decision_id, market
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            decision_id, job_id, model_name, instance_type, gpu_type,
-            tp, pp, dp, num_gpus, quantization,
-            predicted_tps, predicted_cost_per_hour, predicted_total_cost,
-            predicted_runtime_hours, prediction_confidence, prediction_source,
-            slo_deadline_hours, objective, avg_input_tokens, avg_output_tokens,
-            num_requests, triggered_by, parent_decision_id, market,
-        ))
+        """,
+            (
+                decision_id,
+                job_id,
+                model_name,
+                instance_type,
+                gpu_type,
+                tp,
+                pp,
+                dp,
+                num_gpus,
+                quantization,
+                predicted_tps,
+                predicted_cost_per_hour,
+                predicted_total_cost,
+                predicted_runtime_hours,
+                prediction_confidence,
+                prediction_source,
+                slo_deadline_hours,
+                objective,
+                avg_input_tokens,
+                avg_output_tokens,
+                num_requests,
+                triggered_by,
+                parent_decision_id,
+                market,
+            ),
+        )
         conn.commit()
         return decision_id
 
     def record_outcome(
-        self, decision_id: str, job_id: str, status: str,
+        self,
+        decision_id: str,
+        job_id: str,
+        status: str,
         actual_tps: Optional[float] = None,
         actual_cost_per_hour: Optional[float] = None,
         actual_total_cost: Optional[float] = None,
@@ -184,14 +218,21 @@ class AgenticMemory:
         conn = self._conn()
         row = conn.execute(
             "SELECT predicted_tps, predicted_cost_per_hour FROM decisions WHERE decision_id = ?",
-            (decision_id,)
+            (decision_id,),
         ).fetchone()
         if row and actual_tps and row["predicted_tps"]:
-            delta_tps_pct = (actual_tps - row["predicted_tps"]) / max(row["predicted_tps"], 1) * 100
+            delta_tps_pct = (
+                (actual_tps - row["predicted_tps"]) / max(row["predicted_tps"], 1) * 100
+            )
         if row and actual_cost_per_hour and row["predicted_cost_per_hour"]:
-            delta_cost_pct = (actual_cost_per_hour - row["predicted_cost_per_hour"]) / max(row["predicted_cost_per_hour"], 0.01) * 100
+            delta_cost_pct = (
+                (actual_cost_per_hour - row["predicted_cost_per_hour"])
+                / max(row["predicted_cost_per_hour"], 0.01)
+                * 100
+            )
 
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO outcomes (
                 outcome_id, decision_id, job_id, status,
                 actual_tps, actual_cost_per_hour, actual_total_cost,
@@ -199,22 +240,39 @@ class AgenticMemory:
                 delta_tps_pct, delta_cost_pct, slo_met, slo_headroom_pct,
                 failure_category, diagnosis, bottleneck, diff_from_parent
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            outcome_id, decision_id, job_id, status,
-            actual_tps, actual_cost_per_hour, actual_total_cost,
-            actual_runtime_hours,
-            delta_tps_pct, delta_cost_pct,
-            int(slo_met) if slo_met is not None else None,
-            slo_headroom_pct,
-            failure_category, diagnosis, bottleneck, diff_from_parent,
-        ))
+        """,
+            (
+                outcome_id,
+                decision_id,
+                job_id,
+                status,
+                actual_tps,
+                actual_cost_per_hour,
+                actual_total_cost,
+                actual_runtime_hours,
+                delta_tps_pct,
+                delta_cost_pct,
+                int(slo_met) if slo_met is not None else None,
+                slo_headroom_pct,
+                failure_category,
+                diagnosis,
+                bottleneck,
+                diff_from_parent,
+            ),
+        )
         conn.commit()
         return outcome_id
 
     def record_launch_attempt(
-        self, decision_id: str, job_id: str,
-        instance_type: str, gpu_type: str, region: str, market: str,
-        count: int, launched: bool,
+        self,
+        decision_id: str,
+        job_id: str,
+        instance_type: str,
+        gpu_type: str,
+        region: str,
+        market: str,
+        count: int,
+        launched: bool,
         time_to_launch: Optional[float] = None,
         failure_reason: Optional[str] = None,
         failure_category: Optional[str] = None,
@@ -223,20 +281,32 @@ class AgenticMemory:
     ) -> str:
         attempt_id = f"att-{uuid.uuid4().hex[:8]}"
         conn = self._conn()
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO launch_attempts (
                 attempt_id, decision_id, job_id,
                 instance_type, gpu_type, region, market, count,
                 launched, time_to_launch, failure_reason, failure_category,
                 quota_available, other_jobs_in_region
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            attempt_id, decision_id, job_id,
-            instance_type, gpu_type, region, market, count,
-            int(launched), time_to_launch, failure_reason, failure_category,
-            quota_available,
-            json.dumps(other_jobs_in_region) if other_jobs_in_region else None,
-        ))
+        """,
+            (
+                attempt_id,
+                decision_id,
+                job_id,
+                instance_type,
+                gpu_type,
+                region,
+                market,
+                count,
+                int(launched),
+                time_to_launch,
+                failure_reason,
+                failure_category,
+                quota_available,
+                json.dumps(other_jobs_in_region) if other_jobs_in_region else None,
+            ),
+        )
         conn.commit()
         return attempt_id
 
@@ -247,11 +317,14 @@ class AgenticMemory:
     def get_decision(self, decision_id: str) -> Optional[Dict[str, Any]]:
         """Look up a single decision by ID."""
         conn = self._conn()
-        row = conn.execute("SELECT * FROM decisions WHERE decision_id = ?", (decision_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM decisions WHERE decision_id = ?", (decision_id,)
+        ).fetchone()
         return dict(row) if row else None
 
     def query_decisions(
-        self, model_name: Optional[str] = None,
+        self,
+        model_name: Optional[str] = None,
         gpu_type: Optional[str] = None,
         job_id: Optional[str] = None,
         limit: int = 20,
@@ -281,7 +354,8 @@ class AgenticMemory:
         return [dict(r) for r in rows]
 
     def query_outcomes(
-        self, model_name: Optional[str] = None,
+        self,
+        model_name: Optional[str] = None,
         status: Optional[str] = None,
         job_id: Optional[str] = None,
         limit: int = 20,
@@ -317,7 +391,11 @@ class AgenticMemory:
     _DECAY_RATE = 0.95  # per-hour decay → ~30% weight after 24h
 
     def update_availability(
-        self, gpu_type: str, region: str, market: str, launched: bool,
+        self,
+        gpu_type: str,
+        region: str,
+        market: str,
+        launched: bool,
     ) -> None:
         """Bayesian update: success → α+=1, failure → β+=1 (with time decay)."""
         key = f"{gpu_type}|{region}|{market}"
@@ -331,7 +409,7 @@ class AgenticMemory:
         if row:
             last_decay = datetime.fromisoformat(row["last_decay"])
             hours = (now - last_decay).total_seconds() / 3600
-            decay = self._DECAY_RATE ** hours
+            decay = self._DECAY_RATE**hours
             alpha = row["alpha"] * decay
             beta_val = row["beta"] * decay
         else:
@@ -342,24 +420,41 @@ class AgenticMemory:
         else:
             beta_val += 1
 
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO availability_priors (key, gpu_type, region, market, alpha, beta, last_updated, last_decay)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET
                 alpha=excluded.alpha, beta=excluded.beta,
                 last_updated=excluded.last_updated, last_decay=excluded.last_decay
-        """, (key, gpu_type, region, market, alpha, beta_val, now.isoformat(), now.isoformat()))
+        """,
+            (
+                key,
+                gpu_type,
+                region,
+                market,
+                alpha,
+                beta_val,
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
         conn.commit()
 
     def get_failure_summary(
-        self, gpu_type: str, region: Optional[str] = None, market: Optional[str] = None,
+        self,
+        gpu_type: str,
+        region: Optional[str] = None,
+        market: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Return availability posterior + recent failure context."""
         conn = self._conn()
         now = datetime.utcnow()
 
         # 1. Beta posterior (apply decay at read time)
-        query = "SELECT alpha, beta, last_decay FROM availability_priors WHERE gpu_type = ?"
+        query = (
+            "SELECT alpha, beta, last_decay FROM availability_priors WHERE gpu_type = ?"
+        )
         params: list = [gpu_type]
         if region:
             query += " AND region = ?"
@@ -374,15 +469,19 @@ class AgenticMemory:
         for r in rows:
             last_decay = datetime.fromisoformat(r["last_decay"])
             hours = (now - last_decay).total_seconds() / 3600
-            decay = self._DECAY_RATE ** hours
-            total_alpha += (r["alpha"] - 1.0) * decay  # subtract base prior, add decayed
+            decay = self._DECAY_RATE**hours
+            total_alpha += (
+                r["alpha"] - 1.0
+            ) * decay  # subtract base prior, add decayed
             total_beta += (r["beta"] - 1.0) * decay
 
         total_alpha = max(total_alpha, 1.0)
         total_beta = max(total_beta, 1.0)
         mean = total_alpha / (total_alpha + total_beta)
         n = total_alpha + total_beta - 2  # effective observations
-        variance = (total_alpha * total_beta) / ((total_alpha + total_beta) ** 2 * (total_alpha + total_beta + 1))
+        variance = (total_alpha * total_beta) / (
+            (total_alpha + total_beta) ** 2 * (total_alpha + total_beta + 1)
+        )
         uncertainty = math.sqrt(variance)
 
         # 2. Recent failures (last 6h) for context
@@ -412,9 +511,15 @@ class AgenticMemory:
         outcome_params: list = [gpu_type, cutoff]
         outcome_failures = conn.execute(outcome_q, outcome_params).fetchall()
 
-        all_recent = [dict(r) for r in recent_launches] + [dict(r) for r in outcome_failures]
-        spot_preemptions = sum(1 for r in all_recent if r.get("failure_category") == "spot_preemption")
-        no_capacity = sum(1 for r in all_recent if r.get("failure_category") == "no_capacity")
+        all_recent = [dict(r) for r in recent_launches] + [
+            dict(r) for r in outcome_failures
+        ]
+        spot_preemptions = sum(
+            1 for r in all_recent if r.get("failure_category") == "spot_preemption"
+        )
+        no_capacity = sum(
+            1 for r in all_recent if r.get("failure_category") == "no_capacity"
+        )
         last_failure = max((r.get("timestamp", "") for r in all_recent), default=None)
 
         return {
@@ -446,6 +551,7 @@ class AgenticMemory:
 # Agent tool functions
 # ---------------------------------------------------------------------------
 
+
 def query_memory(
     memory: AgenticMemory,
     model_name: Optional[str] = None,
@@ -458,27 +564,41 @@ def query_memory(
     lines = []
 
     # Past outcomes (ground truth from completed jobs)
-    outcomes = memory.query_outcomes(model_name=model_name, status=status, job_id=job_id, limit=limit)
+    outcomes = memory.query_outcomes(
+        model_name=model_name, status=status, job_id=job_id, limit=limit
+    )
     if outcomes:
-        lines.append(f"PAST OUTCOMES ({len(outcomes)} found — ground truth from completed jobs):")
+        lines.append(
+            f"PAST OUTCOMES ({len(outcomes)} found — ground truth from completed jobs):"
+        )
         for o in outcomes:
             slo = "SLO met" if o.get("slo_met") else "SLO missed"
-            delta = f"delta={o['delta_tps_pct']:+.1f}%" if o.get("delta_tps_pct") is not None else ""
+            delta = (
+                f"delta={o['delta_tps_pct']:+.1f}%"
+                if o.get("delta_tps_pct") is not None
+                else ""
+            )
             if o.get("status") == "failed":
-                bottleneck = f"[{o.get('bottleneck', '?')}] " if o.get("bottleneck") else ""
+                bottleneck = (
+                    f"[{o.get('bottleneck', '?')}] " if o.get("bottleneck") else ""
+                )
                 fail = f" FAILED: {bottleneck}{o.get('diagnosis', '?')}"
             else:
                 fail = ""
             lines.append(
-                f"  {o.get('model_name','?')} | {o.get('gpu_type','?')} TP={o.get('tp',1)} PP={o.get('pp',1)} | "
-                f"TPS={o.get('actual_tps','?')} (pred={o.get('predicted_tps','?')}) {delta} | "
+                f"  {o.get('model_name', '?')} | {o.get('gpu_type', '?')} TP={o.get('tp', 1)} PP={o.get('pp', 1)} | "
+                f"TPS={o.get('actual_tps', '?')} (pred={o.get('predicted_tps', '?')}) {delta} | "
                 f"{slo}{fail}"
             )
 
     # Past decisions (what Koi previously chose — even if no outcome yet)
-    decisions = memory.query_decisions(model_name=model_name, gpu_type=instance_type, job_id=job_id, limit=limit)
+    decisions = memory.query_decisions(
+        model_name=model_name, gpu_type=instance_type, job_id=job_id, limit=limit
+    )
     if decisions:
-        lines.append(f"\nPAST DECISIONS ({len(decisions)} found — what Koi previously chose):")
+        lines.append(
+            f"\nPAST DECISIONS ({len(decisions)} found — what Koi previously chose):"
+        )
         for dec in decisions:
             outcome_status = dec.get("status")
             outcome_tps = dec.get("actual_tps")
@@ -488,16 +608,22 @@ def query_memory(
                 result = f"→ {outcome_status}"
             else:
                 result = "→ no outcome yet (job may still be running)"
-            triggered = f" [{dec.get('triggered_by', 'user')}]" if dec.get("triggered_by") != "user" else ""
+            triggered = (
+                f" [{dec.get('triggered_by', 'user')}]"
+                if dec.get("triggered_by") != "user"
+                else ""
+            )
             market = f" {dec.get('market', '')}" if dec.get("market") == "spot" else ""
             lines.append(
-                f"  {dec.get('model_name','?')} | {dec.get('gpu_type','?')} TP={dec.get('tp',1)} PP={dec.get('pp',1)} DP={dec.get('dp',1)}{market} | "
-                f"predicted={dec.get('predicted_tps','?')} TPS @ ${dec.get('predicted_cost_per_hour','?')}/hr | "
-                f"conf={dec.get('prediction_confidence','?')} ({dec.get('prediction_source','?')}){triggered} {result}"
+                f"  {dec.get('model_name', '?')} | {dec.get('gpu_type', '?')} TP={dec.get('tp', 1)} PP={dec.get('pp', 1)} DP={dec.get('dp', 1)}{market} | "
+                f"predicted={dec.get('predicted_tps', '?')} TPS @ ${dec.get('predicted_cost_per_hour', '?')}/hr | "
+                f"conf={dec.get('prediction_confidence', '?')} ({dec.get('prediction_source', '?')}){triggered} {result}"
             )
 
     if not outcomes and not decisions:
-        lines.append(f"No memory found for model={model_name or 'any'}. This is the first time Koi has seen this model.")
+        lines.append(
+            f"No memory found for model={model_name or 'any'}. This is the first time Koi has seen this model."
+        )
 
     return "\n".join(lines)
 
@@ -517,9 +643,15 @@ def record_outcome_tool(
 ) -> str:
     """Record job outcome in Koi's memory."""
     outcome_id = memory.record_outcome(
-        decision_id=decision_id, job_id=job_id, status=status,
-        actual_tps=actual_tps, actual_cost_per_hour=actual_cost_per_hour,
-        actual_total_cost=actual_total_cost, actual_runtime_hours=actual_runtime_hours,
-        failure_category=failure_category, diagnosis=diagnosis, bottleneck=bottleneck,
+        decision_id=decision_id,
+        job_id=job_id,
+        status=status,
+        actual_tps=actual_tps,
+        actual_cost_per_hour=actual_cost_per_hour,
+        actual_total_cost=actual_total_cost,
+        actual_runtime_hours=actual_runtime_hours,
+        failure_category=failure_category,
+        diagnosis=diagnosis,
+        bottleneck=bottleneck,
     )
     return f"Outcome recorded: {outcome_id} (status={status})"

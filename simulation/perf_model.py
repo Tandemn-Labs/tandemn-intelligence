@@ -29,6 +29,14 @@ class LaunchTiming:
         )
 
 
+@dataclass(frozen=True)
+class ReplicaConfigAssessment:
+    feasible: bool
+    reason: Optional[str]
+    weight_gb_per_gpu: float
+    vram_headroom_gb: float
+
+
 class LegacyPerfModel:
     """Current mock_orca-style fixed baseline behavior."""
 
@@ -52,10 +60,14 @@ class LegacyPerfModel:
 class DemoPerfModel:
     """PerfDB-seeded, architecture-aware demo throughput model."""
 
+    MIN_VRAM_HEADROOM_GB = 8.0
+
     def __init__(self, perfdb_path: Optional[str] = None, prefer_perfdb: bool = True):
         self.prefer_perfdb = prefer_perfdb
         self.perfdb = None
-        path = perfdb_path or str(Path(__file__).resolve().parents[1] / "perfdb" / "perfdb_all.csv")
+        path = perfdb_path or str(
+            Path(__file__).resolve().parents[1] / "perfdb" / "perfdb_all.csv"
+        )
         perf_path = Path(path)
         if prefer_perfdb and perf_path.exists():
             self.perfdb = PerfDB(str(perf_path))
@@ -82,6 +94,14 @@ class DemoPerfModel:
         overrides: Optional[dict] = None,
     ) -> float:
         spec = self.resolve_model(model_name, dtype=dtype, overrides=overrides)
+        assessment = self._assess_spec(
+            spec=spec,
+            gpu_type=gpu_type,
+            tp=tp,
+            pp=pp,
+        )
+        if not assessment.feasible:
+            return 0.0
 
         if self.perfdb is not None:
             perfdb_tps = self._estimate_from_perfdb(
@@ -126,6 +146,19 @@ class DemoPerfModel:
             bootstrapping_s=1.4 + gpu_penalty * 0.6,
             waiting_model_ready_s=1.3 + gpu_penalty * 0.4,
         )
+
+    def assess_replica_config(
+        self,
+        *,
+        model_name: str,
+        gpu_type: str,
+        tp: int,
+        pp: int,
+        dtype: str = "fp16",
+        overrides: Optional[dict] = None,
+    ) -> ReplicaConfigAssessment:
+        spec = self.resolve_model(model_name, dtype=dtype, overrides=overrides)
+        return self._assess_spec(spec=spec, gpu_type=gpu_type, tp=tp, pp=pp)
 
     def _estimate_from_perfdb(
         self,
@@ -190,17 +223,81 @@ class DemoPerfModel:
         io_pressure = self._io_pressure(input_tokens, output_tokens)
         size_penalty = min(1.25, max(0.65, 80.0 / max(spec.model_size_gb, 1.0)))
 
-        tps = 14.0 * raw_capacity * tp_scale * pp_efficiency * size_penalty / io_pressure
+        tps = (
+            14.0 * raw_capacity * tp_scale * pp_efficiency * size_penalty / io_pressure
+        )
         return max(20.0, tps)
+
+    def _assess_spec(
+        self,
+        *,
+        spec: ModelSpec,
+        gpu_type: str,
+        tp: int,
+        pp: int,
+    ) -> ReplicaConfigAssessment:
+        if tp <= 0 or pp <= 0:
+            return ReplicaConfigAssessment(
+                feasible=False,
+                reason=f"Invalid parallelism for {gpu_type}: TP={tp}, PP={pp}.",
+                weight_gb_per_gpu=0.0,
+                vram_headroom_gb=0.0,
+            )
+
+        if spec.num_attention_heads % tp != 0:
+            return ReplicaConfigAssessment(
+                feasible=False,
+                reason=(
+                    f"{gpu_type} TP={tp} is invalid for {spec.model_name}: "
+                    f"TP must divide {spec.num_attention_heads} attention heads."
+                ),
+                weight_gb_per_gpu=0.0,
+                vram_headroom_gb=0.0,
+            )
+
+        if spec.num_layers % pp != 0:
+            return ReplicaConfigAssessment(
+                feasible=False,
+                reason=(
+                    f"{gpu_type} PP={pp} is invalid for {spec.model_name}: "
+                    f"PP must divide {spec.num_layers} layers."
+                ),
+                weight_gb_per_gpu=0.0,
+                vram_headroom_gb=0.0,
+            )
+
+        gpu = lookup_gpu_spec(gpu_type)
+        gpu_mem_gb = float(gpu.get("mem_gb", 0.0) or 0.0)
+        weight_gb_per_gpu = spec.model_size_gb / max(tp * pp, 1)
+        vram_headroom_gb = gpu_mem_gb - weight_gb_per_gpu
+        if vram_headroom_gb < self.MIN_VRAM_HEADROOM_GB:
+            return ReplicaConfigAssessment(
+                feasible=False,
+                reason=(
+                    f"{gpu_type} TP={tp} PP={pp} is not feasible for {spec.model_name}: "
+                    f"{weight_gb_per_gpu:.1f}GB weights per GPU leaves "
+                    f"{vram_headroom_gb:.1f}GB headroom on {gpu_mem_gb:.1f}GB VRAM "
+                    f"(need at least {self.MIN_VRAM_HEADROOM_GB:.1f}GB)."
+                ),
+                weight_gb_per_gpu=weight_gb_per_gpu,
+                vram_headroom_gb=vram_headroom_gb,
+            )
+
+        return ReplicaConfigAssessment(
+            feasible=True,
+            reason=None,
+            weight_gb_per_gpu=weight_gb_per_gpu,
+            vram_headroom_gb=vram_headroom_gb,
+        )
 
     @staticmethod
     def _tp_scale(tp: int, *, interconnect: str) -> float:
         tp = max(tp, 1)
         if interconnect == "NVLink":
-            return tp ** 0.82
+            return tp**0.82
         if tp <= 4:
-            return tp ** 0.78
-        return (4 ** 0.78) * ((tp / 4) ** 0.25)
+            return tp**0.78
+        return (4**0.78) * ((tp / 4) ** 0.25)
 
     @staticmethod
     def _io_pressure(input_tokens: int, output_tokens: int) -> float:
