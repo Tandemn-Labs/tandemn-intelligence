@@ -1,5 +1,7 @@
 """Tests for the demo-only model registry and performance model."""
 
+import simulation.model_registry as model_registry
+from koi.tools.physics import ModelFeatures as PhysicsModelFeatures
 from simulation.model_registry import resolve_model_spec
 from simulation.perf_model import DemoPerfModel
 
@@ -12,7 +14,11 @@ class TestModelRegistry:
         assert spec.architecture_family == "qwen"
         assert spec.active_params_billions == 32
 
-    def test_unknown_model_with_overrides_is_supported(self):
+    def test_unknown_model_with_overrides_is_supported(self, monkeypatch):
+        def _should_not_fetch(*args, **kwargs):
+            raise AssertionError("override path should not hit Hugging Face")
+
+        monkeypatch.setattr(model_registry, "_fetch_hf_config", _should_not_fetch)
         spec = resolve_model_spec(
             "acme/Custom-13B-Instruct",
             overrides={
@@ -28,6 +34,32 @@ class TestModelRegistry:
         assert spec.source == "override"
         assert spec.num_params_billions == 13
         assert spec.num_layers == 40
+        assert spec.architecture_family == "custom"
+        assert spec.model_size_gb > 0
+
+    def test_unknown_model_can_resolve_from_huggingface_config(self, monkeypatch):
+        monkeypatch.setattr(
+            model_registry,
+            "_fetch_hf_config",
+            lambda model_name, dtype="fp16": PhysicsModelFeatures(
+                model_name=model_name,
+                num_params_billions=34.5,
+                num_layers=48,
+                hidden_dim=6144,
+                num_attention_heads=48,
+                num_kv_heads=8,
+                vocab_size=128000,
+                is_moe=False,
+                architecture_family="custom",
+                dtype=dtype,
+            ),
+        )
+
+        spec = resolve_model_spec("org/Random-34B-Instruct")
+
+        assert spec.source == "huggingface"
+        assert spec.model_name == "org/Random-34B-Instruct"
+        assert spec.num_params_billions == 34.5
         assert spec.architecture_family == "custom"
         assert spec.model_size_gb > 0
 

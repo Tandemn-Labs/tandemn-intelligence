@@ -1,14 +1,19 @@
-"""Offline model resolution for the demo simulator.
+"""Model resolution for the demo simulator.
 
-This layer intentionally avoids depending on live network lookups so the demo
-can accept arbitrary model names and still run offline.
+The demo prefers known registry entries, can use Hugging Face config metadata
+when available, and still falls back to heuristics when it has to run offline.
 """
 
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
-from koi.model_features import ModelFeatures as RawModelFeatures
-from koi.model_features import _KNOWN_MODELS, get_model_features
+from koi.tools.physics import (
+    ModelFeatures as RawModelFeatures,
+    _KNOWN_MODELS,
+    _fetch_hf_config,
+    _infer_from_name,
+    get_model_features,
+)
 
 
 @dataclass(frozen=True)
@@ -33,7 +38,10 @@ class ModelSpec:
 
 def _is_known_model(model_name: str) -> bool:
     lower = model_name.lower()
-    return any(lower == key.lower() or lower in key.lower() or key.lower() in lower for key in _KNOWN_MODELS)
+    return any(
+        lower == key.lower() or lower in key.lower() or key.lower() in lower
+        for key in _KNOWN_MODELS
+    )
 
 
 def _materialize_features(
@@ -41,8 +49,19 @@ def _materialize_features(
     dtype: str = "fp16",
     overrides: Optional[Mapping[str, Any]] = None,
 ) -> tuple[RawModelFeatures, str]:
-    base = get_model_features(model_name, dtype=dtype)
-    source = "registry" if _is_known_model(model_name) else "heuristic"
+    if _is_known_model(model_name):
+        base = get_model_features(model_name, dtype=dtype)
+        source = "registry"
+    else:
+        if overrides:
+            base = _infer_from_name(model_name, dtype)
+            source = "heuristic"
+        else:
+            base = _fetch_hf_config(model_name, dtype=dtype)
+            source = "huggingface" if base is not None else "heuristic"
+            if base is None:
+                base = _infer_from_name(model_name, dtype)
+
     if not overrides:
         return base, source
 
@@ -72,8 +91,15 @@ def resolve_model_spec(
     overrides: Optional[Mapping[str, Any]] = None,
 ) -> ModelSpec:
     """Resolve any model string into a demo-usable ModelSpec."""
-    features, source = _materialize_features(model_name, dtype=dtype, overrides=overrides)
-    active_params = features.num_params_billions * features.active_expert_ratio
+    features, source = _materialize_features(
+        model_name, dtype=dtype, overrides=overrides
+    )
+    active_expert_ratio = (
+        features.active_experts / features.num_experts
+        if features.is_moe and features.num_experts > 0
+        else 1.0
+    )
+    active_params = features.num_params_billions * active_expert_ratio
     return ModelSpec(
         model_name=model_name,
         source=source,
@@ -81,7 +107,7 @@ def resolve_model_spec(
         num_params_billions=features.num_params_billions,
         active_params_billions=active_params,
         model_size_gb=features.model_size_gb,
-        active_expert_ratio=features.active_expert_ratio,
+        active_expert_ratio=active_expert_ratio,
         num_layers=features.num_layers,
         hidden_dim=features.hidden_dim,
         num_attention_heads=features.num_attention_heads,
