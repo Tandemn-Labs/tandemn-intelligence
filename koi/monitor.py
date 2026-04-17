@@ -45,6 +45,11 @@ OVER_PROVISIONED_MAX_WAIT_HOURS = float(
 OVER_PROVISIONED_MIN_LIVE_REPLICAS = int(
     os.environ.get("KOI_OVERPROV_MIN_LIVE_REPLICAS", "1")
 )
+# Group-level health-trigger cooldown window. One FALLING_BEHIND or
+# OVER_PROVISIONED event can leave the monitor's dedup filter per group per
+# this many seconds. Default 30s preserves historical behaviour; bump to
+# ~60s for a live customer demo if the monitor is chatty.
+GROUP_HEALTH_COOLDOWN_S = float(os.environ.get("KOI_GROUP_HEALTH_COOLDOWN_S", "30"))
 
 
 class MonitoringLoop:
@@ -542,7 +547,18 @@ class MonitoringLoop:
                 self.persist_job(job_id)
 
     async def _emit_trigger(self, job_id: str, status: MonitoringStatus, hint: str):
-        """Push a trigger event to Loop 3's queue."""
+        """Push a trigger event to Loop 3's queue.
+
+        For grouped jobs (multi-replica), we treat FALLING_BEHIND and
+        OVER_PROVISIONED as *job-level* events and deliberately emit at most
+        one per group per ``KOI_GROUP_HEALTH_COOLDOWN_S`` seconds (default
+        30s; bump to ~60s for live customer demos where chatter is costly).
+        Per-chain FAILED triggers are still emitted individually because
+        they describe a specific replica's fate, not the job's health. The
+        cooldown is also suppressed when any sibling chain in the same
+        group already has an action in flight (scale/kill), to stop us
+        from piling on top of an in-progress remediation.
+        """
         tracker = self.tracked_jobs.get(job_id)
         if not tracker:
             return
@@ -553,14 +569,46 @@ class MonitoringLoop:
             and status != MonitoringStatus.FAILED
         ):
             return
-        # Group-level dedup: at most one trigger per group per status per 30s
-        if tracker.group_id:
-            key = f"{tracker.group_id}:{status.value}"
+
+        # Group-level dedup only applies to health triggers (not FAILED).
+        is_health_trigger = status in (
+            MonitoringStatus.FALLING_BEHIND,
+            MonitoringStatus.OVER_PROVISIONED,
+        )
+        if tracker.group_id and is_health_trigger:
+            now = time.time()
+
+            # Suppress if any chain in the group is mid-action.
+            group_chains = self.get_group_chains(tracker.group_id)
+            for sibling in group_chains.values():
+                if (
+                    sibling.action_in_progress
+                    and sibling.action_freeze_until
+                    and now < sibling.action_freeze_until
+                ):
+                    logger.debug(
+                        "trigger_dedup_group_action_in_flight",
+                        job_id=job_id,
+                        status=status.value,
+                        sibling=sibling.job_id,
+                    )
+                    return
+
+            # Per-group health cooldown, status-agnostic: one health trigger
+            # per group per window (configurable via KOI_GROUP_HEALTH_COOLDOWN_S,
+            # default 30s).
+            key = f"{tracker.group_id}:health"
             last = self._group_trigger_cooldown.get(key, 0)
-            if time.time() - last < 30:
-                logger.debug("trigger_dedup", job_id=job_id, status=status.value)
+            if now - last < GROUP_HEALTH_COOLDOWN_S:
+                logger.debug(
+                    "trigger_dedup_group_cooldown",
+                    job_id=job_id,
+                    status=status.value,
+                    cooldown_s=GROUP_HEALTH_COOLDOWN_S,
+                )
                 return
-            self._group_trigger_cooldown[key] = time.time()
+            self._group_trigger_cooldown[key] = now
+
         trigger = MonitoringTrigger(
             trigger_type=status,
             job_id=job_id,

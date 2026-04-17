@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from koi.agent import KoiAgent, KOI_SYSTEM_PROMPT
 from koi.schemas import (
     JobRequest,
+    JobTracker,
     ResourceMap,
     GPUResource,
     EngineConfig,
@@ -334,6 +335,162 @@ class TestPromptBuilding:
         prompt = agent._build_trigger_prompt(trigger)
         assert "completed" in prompt
         assert "record_outcome" in prompt.lower() or "Record the outcome" in prompt
+
+    # ----- Area 2 tests: job-headroom-first trigger prompt ------------------
+
+    def _make_chain_tracker(self, job_id, group_id, gpu, tp, pp, tps, status):
+        """Build a live JobTracker for a mocked chain."""
+        return JobTracker(
+            job_id=job_id,
+            group_id=group_id,
+            config=PlacementConfig(
+                gpu_type=gpu,
+                instance_type="dummy",
+                num_gpus=tp * pp,
+                num_instances=1,
+                tp=tp,
+                pp=pp,
+                dp=1,
+                region="us-east-1",
+                engine_config=EngineConfig(
+                    tensor_parallel_size=tp, pipeline_parallel_size=pp
+                ),
+                market="on_demand",
+            ),
+            slo_deadline_hours=1.0,
+            total_tokens=12_000_000,
+            predicted_tps=tps,
+            smoothed_tps=tps,
+            status=status,
+        )
+
+    def test_trigger_prompt_falling_behind_puts_job_headroom_before_chains(self, agent):
+        """Area 2 rule: JOB-LEVEL HEADROOM block must render before CHAINS."""
+        group_id = "demo-job-abc"
+        chains = {
+            "demo-job-abc-r0": self._make_chain_tracker(
+                "demo-job-abc-r0",
+                group_id,
+                "A100-80GB",
+                8,
+                1,
+                1140.0,
+                MonitoringStatus.ON_TRACK,
+            ),
+            "demo-job-abc-r1": self._make_chain_tracker(
+                "demo-job-abc-r1",
+                group_id,
+                "L40S",
+                2,
+                4,
+                210.0,
+                MonitoringStatus.ON_TRACK,
+            ),
+            "demo-job-abc-r2": self._make_chain_tracker(
+                "demo-job-abc-r2",
+                group_id,
+                "L40S",
+                2,
+                4,
+                205.0,
+                MonitoringStatus.ON_TRACK,
+            ),
+        }
+
+        fake_monitor = SimpleNamespace(get_group_chains=lambda _gid: chains)
+        agent.monitor = fake_monitor
+        try:
+            trigger = MonitoringTrigger(
+                trigger_type=MonitoringStatus.FALLING_BEHIND,
+                job_id="demo-job-abc-r0",
+                job_tracker={
+                    "group_id": group_id,
+                    "config": {"gpu_type": "A100-80GB", "tp": 8, "pp": 1, "dp": 1},
+                    "slo_deadline_hours": 1.0,
+                    "elapsed_hours": 0.1,
+                    "tokens_remaining": 10_000_000,
+                    "total_tokens": 12_000_000,
+                    "smoothed_tps": 1140.0,
+                    "predicted_tps": 1140.0,
+                    "slo_headroom_pct": -50.0,
+                },
+                diagnosis_hint="Headroom=-50%, TPS=1555",
+            )
+            prompt = agent._build_trigger_prompt(trigger)
+        finally:
+            agent.monitor = None
+
+        assert "JOB-LEVEL HEADROOM" in prompt
+        assert "CHAINS (informational" in prompt
+        # Order check: job-level block must come first
+        assert prompt.index("JOB-LEVEL HEADROOM") < prompt.index(
+            "CHAINS (informational"
+        )
+        # Aggregate TPS derived from the 3 chains
+        assert "Aggregate TPS: 1,555" in prompt
+        # Required TPS computed from remaining / time_left (tokens=10e6, time=0.9h)
+        # 10_000_000 / (0.9 * 3600) ≈ 3086
+        assert "Required TPS: 3,086" in prompt or "Required TPS: 3,087" in prompt
+        # Median of [210, 205, 1140] sorted = [205, 210, 1140] → median 210
+        assert "Median TPS: 210" in prompt
+
+    def test_trigger_prompt_falling_behind_forbids_killing_above_median(self, agent):
+        """Rule 3: never kill a chain with TPS >= fleet median."""
+        trigger = MonitoringTrigger(
+            trigger_type=MonitoringStatus.FALLING_BEHIND,
+            job_id="job-test",
+            job_tracker={
+                "smoothed_tps": 500,
+                "slo_headroom_pct": 5.0,
+                "elapsed_hours": 0.5,
+                "slo_deadline_hours": 1.0,
+                "tokens_remaining": 1_000_000,
+            },
+            diagnosis_hint="Headroom=5%, TPS=500",
+        )
+        prompt = agent._build_trigger_prompt(trigger)
+        assert "SCALE UP FIRST" in prompt
+        assert "NEVER kill a chain whose TPS is >= the fleet median" in prompt
+        assert "scale_chain_tool" in prompt
+
+    def test_trigger_prompt_falling_behind_handles_deadline_exceeded(self, agent):
+        """When elapsed >= slo, Required TPS must render as 'unattainable'."""
+        trigger = MonitoringTrigger(
+            trigger_type=MonitoringStatus.FALLING_BEHIND,
+            job_id="job-late",
+            job_tracker={
+                "smoothed_tps": 500,
+                "slo_headroom_pct": -100.0,
+                "elapsed_hours": 2.0,
+                "slo_deadline_hours": 1.0,
+                "tokens_remaining": 4_000_000,
+            },
+            diagnosis_hint="Headroom=-100%, TPS=500",
+        )
+        prompt = agent._build_trigger_prompt(trigger)
+        assert "unattainable" in prompt
+        assert "Time left: 0.00h" in prompt
+
+    def test_trigger_prompt_over_provisioned_has_strict_action_framework(self, agent):
+        """OVER_PROVISIONED must forbid scale_up and limit to one kill per trigger."""
+        trigger = MonitoringTrigger(
+            trigger_type=MonitoringStatus.OVER_PROVISIONED,
+            job_id="job-over",
+            job_tracker={
+                "smoothed_tps": 4800,
+                "slo_headroom_pct": 95.0,
+                "elapsed_hours": 0.5,
+                "slo_deadline_hours": 4.0,
+                "tokens_remaining": 2_000_000,
+            },
+            diagnosis_hint="Headroom=95%, can shed replicas",
+        )
+        prompt = agent._build_trigger_prompt(trigger)
+        assert "OVER_PROVISIONED" in prompt or "over_provisioned" in prompt
+        assert "LEAST productive chain" in prompt
+        assert "AT MOST one chain per trigger" in prompt
+        # Explicit ban on positive-count scale
+        assert "Do NOT call scale_chain_tool with a positive count" in prompt
 
 
 class TestParseDecision:

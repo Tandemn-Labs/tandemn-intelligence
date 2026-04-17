@@ -530,81 +530,11 @@ class KoiAgent:
                 return f"{result}{market_note}"
 
             @beta_async_tool
-            async def kill_replica_tool(
-                job_id: str,
-                replica_ids: list[str],
-                force: bool = False,
-            ) -> str:
-                """Kill specific replicas by ID.
-
-                Safety guards (unless ``force=True``):
-                  1. Refuse to kill a replica whose TPS is >= the fleet median.
-                     That prevents accidentally killing the fastest/healthy replica.
-                  2. Refuse to kill if it would take active_replicas to zero.
-
-                Use ``force=True`` only when you are explicitly tearing the whole
-                job down.
-                """
-                if not replica_ids:
-                    return "No replica_ids provided; nothing killed."
-
-                try:
-                    replicas_data = await orca.get_replicas(job_id)
-                except Exception as e:
-                    logger.warning(
-                        "kill_replica_fleet_lookup_failed",
-                        job_id=job_id,
-                        error=str(e),
-                    )
-                    replicas_data = {"replicas": []}
-
-                active_replicas = [
-                    r
-                    for r in (replicas_data.get("replicas") or [])
-                    if str(r.get("phase", "")).lower()
-                    not in ("dead", "killed", "completed", "failed")
-                ]
-                fleet_tps = sorted(float(r.get("tps", 0) or 0) for r in active_replicas)
-                median_tps = fleet_tps[len(fleet_tps) // 2] if fleet_tps else 0.0
-                by_id = {r["replica_id"]: r for r in active_replicas}
-                rejected: list[str] = []
-                refusal_reasons: list[str] = []
-
-                if not force:
-                    # Guard 2: refuse if we would kill every remaining replica.
-                    active_ids = {r["replica_id"] for r in active_replicas}
-                    candidate = set(replica_ids) & active_ids
-                    if candidate and candidate >= active_ids:
-                        return (
-                            "kill_refused: would remove all active replicas for "
-                            f"{job_id}. Pass force=True only when tearing the job "
-                            "down intentionally."
-                        )
-                    # Guard 1: refuse any replica that is at/above fleet median TPS.
-                    for rid in replica_ids:
-                        info = by_id.get(rid)
-                        if not info:
-                            continue
-                        rep_tps = float(info.get("tps", 0) or 0)
-                        if rep_tps >= median_tps and rep_tps > 0:
-                            rejected.append(rid)
-                            refusal_reasons.append(
-                                f"{rid} (tps={rep_tps:.0f} >= fleet_median={median_tps:.0f})"
-                            )
-
-                allowed = [rid for rid in replica_ids if rid not in rejected]
-                if not allowed:
-                    return (
-                        "kill_refused: all targets are at or above the fleet "
-                        f"median TPS ({median_tps:.0f}). Refused: {refusal_reasons}. "
-                        "Target a genuinely degraded replica or pass force=True "
-                        "if you really intend to."
-                    )
-
+            async def kill_replica_tool(job_id: str, replica_ids: list[str]) -> str:
+                """Kill specific replicas by ID. Use when you identify degraded/sick replicas that should be removed."""
                 if monitor:
-                    monitor._koi_initiated_kills.update(allowed)
-                result = await orca.kill_replicas(job_id, allowed)
-
+                    monitor._koi_initiated_kills.update(replica_ids)
+                result = await orca.kill_replicas(job_id, replica_ids)
                 # Anti-windup
                 if monitor:
                     for tracker in monitor.tracked_jobs.values():
@@ -612,14 +542,7 @@ class KoiAgent:
                             tracker.action_in_progress = True
                             tracker.action_freeze_until = time.time() + 300
                             monitor.persist_job(tracker.job_id)
-
-                suffix = ""
-                if rejected:
-                    suffix = (
-                        f" Refused to kill {len(rejected)} healthy replica(s): "
-                        f"{refusal_reasons}."
-                    )
-                return f"Killed {len(allowed)} replica(s): {allowed}.{suffix} {result}"
+                return f"Killed {len(replica_ids)} replicas: {replica_ids}. {result}"
 
             @beta_async_tool
             async def get_job_metrics_tool(job_id: str) -> str:
@@ -1103,7 +1026,14 @@ class KoiAgent:
         return "\n".join(s for s in sections if s is not None)
 
     def _build_trigger_prompt(self, trigger: MonitoringTrigger) -> str:
-        """Build the user message for a monitoring trigger."""
+        """Build the user message for a monitoring trigger.
+
+        For FALLING_BEHIND and OVER_PROVISIONED, the prompt puts *job-level*
+        headroom first (aggregate TPS, required TPS, remaining tokens, time
+        left) and demotes per-chain TPS to an informational block. The
+        action framework explicitly blocks chain-level kill reasoning that
+        isn't grounded in either the job-level need or chain-sickness.
+        """
         tracker = trigger.job_tracker
         config = tracker.get("config", {})
         group_id = tracker.get("group_id") or trigger.job_id
@@ -1127,7 +1057,7 @@ class KoiAgent:
             f"  SLO: {tracker.get('slo_deadline_hours', '?')}h",
             f"  Total tokens: {tracker.get('total_tokens', 0):,}",
             f"",
-            f"Current state:",
+            f"Current state (this chain):",
             f"  Actual TPS: {actual_tps:.0f} (predicted {predicted_tps:.0f}, delta={delta_pct:+.1f}%)",
             f"  SLO headroom: {tracker.get('slo_headroom_pct', 0):.1f}%",
             f"  Elapsed: {tracker.get('elapsed_hours', 0):.2f}h",
@@ -1137,25 +1067,94 @@ class KoiAgent:
             f"  GPU mem BW: {tracker.get('gpu_mem_bw_util', 0):.0f}%",
         ]
 
-        # Per-replica TPS breakdown (so agent can identify sick/dead replicas)
+        # Job-level headroom block (the primary signal for health triggers).
+        #
+        # agg_tps  = sum(smoothed_tps) across live sibling chains
+        # req_tps  = tokens_remaining / time_left  (total_tokens on this tracker
+        #            is the whole-job total; Koi replicates it per chain)
+        is_health_trigger = trigger.trigger_type in (
+            MonitoringStatus.FALLING_BEHIND,
+            MonitoringStatus.OVER_PROVISIONED,
+        )
+        group_chains: dict = {}
+        chain_tps_list: list[float] = []
+        agg_tps = 0.0
         if self.monitor and tracker.get("group_id"):
             group_chains = self.monitor.get_group_chains(tracker["group_id"])
-            if len(group_chains) > 1:
-                sections.append(f"\nPer-replica TPS:")
-                for rid, t in group_chains.items():
-                    status_icon = (
-                        "💀"
-                        if t.status.value == "failed"
-                        else "⚠"
-                        if t.smoothed_tps < 100
-                        else "✓"
-                    )
-                    sections.append(
-                        f"  {status_icon} {rid}: TPS={t.smoothed_tps:.0f} ({t.status.value})"
-                    )
-                agg = sum(t.smoothed_tps for t in group_chains.values())
+
+        if is_health_trigger:
+            slo_hours = float(tracker.get("slo_deadline_hours") or 0) or 0.0
+            elapsed = float(tracker.get("elapsed_hours") or 0) or 0.0
+            time_left_hours = max(0.0, slo_hours - elapsed)
+            tokens_remaining = int(tracker.get("tokens_remaining") or 0)
+            if group_chains:
+                live_chains = {
+                    rid: t
+                    for rid, t in group_chains.items()
+                    if t.status.value not in ("failed", "completed")
+                }
+                chain_tps_list = [t.smoothed_tps for t in live_chains.values()]
+                agg_tps = sum(chain_tps_list)
+            else:
+                chain_tps_list = [actual_tps] if actual_tps else []
+                agg_tps = actual_tps or 0.0
+
+            if time_left_hours > 0 and tokens_remaining > 0:
+                req_tps_str = f"{tokens_remaining / (time_left_hours * 3600):,.0f}"
+                time_left_str = f"{time_left_hours:.2f}h"
+            elif tokens_remaining <= 0:
+                req_tps_str = "0 (no tokens remaining)"
+                time_left_str = f"{time_left_hours:.2f}h"
+            else:
+                req_tps_str = "unattainable (deadline exceeded)"
+                time_left_str = "0.00h (deadline exceeded)"
+
+            sections.append("")
+            sections.append("JOB-LEVEL HEADROOM (primary signal — reason from here):")
+            sections.append(f"  Aggregate TPS: {agg_tps:,.0f}")
+            sections.append(f"  Required TPS: {req_tps_str}")
+            sections.append(
+                f"  SLO headroom: {tracker.get('slo_headroom_pct', 0):.1f}%"
+            )
+            sections.append(f"  Tokens remaining: {tokens_remaining:,}")
+            sections.append(f"  Time left: {time_left_str}")
+
+        # Per-chain view — now *informational*, under the job-level block.
+        if group_chains and len(group_chains) >= 1:
+            tps_sorted = sorted(chain_tps_list) if chain_tps_list else []
+            n = len(tps_sorted)
+            if n == 0:
+                median_tps = 0.0
+                min_tps = 0.0
+                max_tps = 0.0
+            else:
+                median_tps = tps_sorted[n // 2]
+                min_tps = tps_sorted[0]
+                max_tps = tps_sorted[-1]
+
+            sections.append("")
+            sections.append(
+                "CHAINS (informational — do NOT pick an action from chain TPS alone):"
+            )
+            for rid, t in group_chains.items():
+                cfg = t.config
+                gpu = getattr(cfg, "gpu_type", "?")
+                tp = getattr(cfg, "tp", "?")
+                pp = getattr(cfg, "pp", "?")
+                status_icon = (
+                    "💀"
+                    if t.status.value == "failed"
+                    else "⚠"
+                    if t.smoothed_tps < 100 and t.status.value == "running"
+                    else "✓"
+                )
                 sections.append(
-                    f"  Aggregate: {agg:.0f} TPS ({len(group_chains)} replicas)"
+                    f"  {status_icon} {rid}  {gpu} tp={tp} pp={pp}  "
+                    f"TPS={t.smoothed_tps:.0f}  phase={t.status.value}"
+                )
+            if n > 0:
+                sections.append(
+                    f"  Median TPS: {median_tps:.0f}  |  Min: {min_tps:.0f}  |  Max: {max_tps:.0f}"
                 )
 
         if trigger.diagnosis_hint:
@@ -1168,20 +1167,68 @@ class KoiAgent:
         )
 
         if trigger.trigger_type == MonitoringStatus.FALLING_BEHIND:
-            sections.append("\nAction:")
+            sections.append("")
+            sections.append("ACTION FRAMEWORK — follow in this strict order:")
+            sections.append("")
             sections.append(
-                "1. Check per-replica TPS above. If any replica is producing <10% of the group average, it's degraded — kill it with kill_replica_tool(job_id, [replica_id]) to free resources."
+                "1) SCALE UP FIRST. The job is behind. The default action is to ADD "
+                "replicas via scale_chain_tool with a positive count. Pick a config "
+                "that's feasible for this model (verify VRAM fit via "
+                "get_gpu_physics_tool) and has available quota "
+                "(get_quota_status_tool). Prefer the GPU family already running "
+                "unless quota is exhausted."
             )
-            sections.append("2. Use get_job_metrics_tool to check live state.")
+            sections.append("")
             sections.append(
-                "3. If SLO is at risk after removing sick replicas, use scale_chain_tool to add replacements."
+                "2) ONLY kill a chain if it is GENUINELY SICK. A chain is sick if its "
+                "smoothed_tps is < 10% of its launch-time predicted_tps AND has "
+                "stayed there for 2+ consecutive polls. A single-poll low reading "
+                "is NOT sickness — L40S and A100 producing different TPS side-by-side "
+                "is normal, not sickness."
+            )
+            sections.append("")
+            sections.append(
+                "3) NEVER kill a chain whose TPS is >= the fleet median unless "
+                "rule (2) applies. Do not kill a healthy chain just because "
+                "another chain is faster, and do not kill a chain to 'free capacity "
+                "for a better config' — we do not have swap semantics today, so the "
+                "only safe path is scale_up first, let the new replicas prove "
+                "themselves on the next trigger, and the over-provisioned state will "
+                "retire the worst one then."
+            )
+            sections.append("")
+            sections.append(
+                "You are reasoning about the JOB, not about individual chains. "
+                "A 210 TPS L40S chain running alongside a 1140 TPS A100 chain is "
+                "working as designed."
             )
             sections.append(
                 "Do NOT use record_outcome_tool — this job is still RUNNING."
             )
         elif trigger.trigger_type == MonitoringStatus.OVER_PROVISIONED:
+            sections.append("")
+            sections.append("ACTION FRAMEWORK — follow in this strict order:")
+            sections.append("")
             sections.append(
-                "\nAction: Use scale_chain_tool with negative count to kill excess replicas."
+                "1) Pick the LEAST productive chain (lowest smoothed_tps among "
+                "running chains). Call kill_replica_tool with that single replica_id."
+            )
+            sections.append("")
+            sections.append(
+                "2) Kill AT MOST one chain per trigger. After the kill, aggregate "
+                "TPS must still be >= 110% of required TPS. If killing the least "
+                "productive chain would drop aggregate below that threshold, "
+                "do nothing and wait for the next trigger."
+            )
+            sections.append("")
+            sections.append(
+                "3) If all running chains are producing similar TPS, kill the one "
+                "with the highest $/TPS cost (consult get_resources_tool)."
+            )
+            sections.append("")
+            sections.append(
+                "4) Do NOT call scale_chain_tool with a positive count in an "
+                "OVER_PROVISIONED trigger — that fights the monitor."
             )
             sections.append(
                 "Do NOT use record_outcome_tool — this job is still RUNNING."

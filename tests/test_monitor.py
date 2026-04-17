@@ -226,6 +226,138 @@ class TestTriggerSuppression:
 
         assert not monitor._trigger_queue.empty()
 
+    @pytest.mark.asyncio
+    async def test_group_health_triggers_dedupe_within_cooldown(self):
+        """
+        Area 1: only ONE FALLING_BEHIND trigger should fire per group within
+        the 60s cooldown window, no matter how many chains report unhealthy.
+        """
+        monitor = MonitoringLoop(orca=MagicMock())
+        group_id = "group-x"
+        for rid in ("group-x-r0", "group-x-r1", "group-x-r2"):
+            monitor.register_job(
+                job_id=rid,
+                config=_make_config(),
+                slo_deadline_hours=8.0,
+                total_tokens=7_500_000,
+                predicted_tps=2590.0,
+                group_id=group_id,
+            )
+
+        await monitor._emit_trigger(
+            "group-x-r0", MonitoringStatus.FALLING_BEHIND, "Headroom=-50%"
+        )
+        await monitor._emit_trigger(
+            "group-x-r1", MonitoringStatus.FALLING_BEHIND, "Headroom=-50%"
+        )
+        await monitor._emit_trigger(
+            "group-x-r2", MonitoringStatus.FALLING_BEHIND, "Headroom=-50%"
+        )
+
+        drained: list[MonitoringTrigger] = []
+        while not monitor._trigger_queue.empty():
+            drained.append(monitor._trigger_queue.get_nowait())
+
+        assert len(drained) == 1
+        assert drained[0].trigger_type == MonitoringStatus.FALLING_BEHIND
+
+    @pytest.mark.asyncio
+    async def test_group_health_triggers_share_cooldown_across_status(self):
+        """
+        Area 1: cooldown key is group:health, not group:status — rapid alternations
+        between FALLING_BEHIND and OVER_PROVISIONED should all dedupe together.
+        """
+        monitor = MonitoringLoop(orca=MagicMock())
+        group_id = "group-y"
+        for rid in ("group-y-r0", "group-y-r1"):
+            monitor.register_job(
+                job_id=rid,
+                config=_make_config(),
+                slo_deadline_hours=8.0,
+                total_tokens=7_500_000,
+                predicted_tps=2590.0,
+                group_id=group_id,
+            )
+
+        await monitor._emit_trigger(
+            "group-y-r0", MonitoringStatus.FALLING_BEHIND, "Headroom=-50%"
+        )
+        # Within 60s: OVER_PROVISIONED should be suppressed too (health-family
+        # dedup means rapid flapping doesn't spam the agent).
+        await monitor._emit_trigger(
+            "group-y-r1", MonitoringStatus.OVER_PROVISIONED, "Headroom=95%"
+        )
+
+        drained: list[MonitoringTrigger] = []
+        while not monitor._trigger_queue.empty():
+            drained.append(monitor._trigger_queue.get_nowait())
+
+        assert len(drained) == 1
+        assert drained[0].trigger_type == MonitoringStatus.FALLING_BEHIND
+
+    @pytest.mark.asyncio
+    async def test_group_trigger_suppressed_while_sibling_action_in_flight(self):
+        """
+        Area 1: if a sibling chain in the same group is mid-action (anti-windup
+        freeze), no new health trigger should fire for the group.
+        """
+        import time as _time
+
+        monitor = MonitoringLoop(orca=MagicMock())
+        group_id = "group-z"
+        for rid in ("group-z-r0", "group-z-r1"):
+            monitor.register_job(
+                job_id=rid,
+                config=_make_config(),
+                slo_deadline_hours=8.0,
+                total_tokens=7_500_000,
+                predicted_tps=2590.0,
+                group_id=group_id,
+            )
+        # Freeze r0 (simulating scale_chain_tool / kill_replica_tool firing)
+        sibling = monitor.tracked_jobs["group-z-r0"]
+        sibling.action_in_progress = True
+        sibling.action_freeze_until = _time.time() + 120
+
+        # A trigger for r1 should be suppressed even though r1 itself isn't frozen.
+        await monitor._emit_trigger(
+            "group-z-r1", MonitoringStatus.FALLING_BEHIND, "Headroom=-20%"
+        )
+        assert monitor._trigger_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_per_chain_failed_trigger_not_deduped_by_group(self):
+        """
+        Area 1: group dedup only applies to health triggers. FAILED triggers
+        still fire per chain so the agent can react to a specific replica's
+        fate.
+        """
+        monitor = MonitoringLoop(orca=MagicMock())
+        group_id = "group-a"
+        for rid in ("group-a-r0", "group-a-r1"):
+            monitor.register_job(
+                job_id=rid,
+                config=_make_config(),
+                slo_deadline_hours=8.0,
+                total_tokens=7_500_000,
+                predicted_tps=2590.0,
+                group_id=group_id,
+            )
+
+        await monitor._emit_trigger(
+            "group-a-r0", MonitoringStatus.FAILED, "Orca reports dead"
+        )
+        await monitor._emit_trigger(
+            "group-a-r1", MonitoringStatus.FAILED, "Orca reports dead"
+        )
+
+        drained: list[MonitoringTrigger] = []
+        while not monitor._trigger_queue.empty():
+            drained.append(monitor._trigger_queue.get_nowait())
+
+        assert len(drained) == 2
+        assert all(t.trigger_type == MonitoringStatus.FAILED for t in drained)
+
 
 class TestGroupAggregation:
     def test_dead_replicas_excluded_from_aggregate(self):
