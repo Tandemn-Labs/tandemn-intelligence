@@ -11,6 +11,7 @@ Four tables:
 import json
 import math
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,8 +25,12 @@ class AgenticMemory:
         self.db_path = db_path
         if db_path != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._persistent_conn = sqlite3.connect(db_path)
+        # check_same_thread=False + Lock — required for FastAPI TestClient
+        # (handlers run on a worker thread) and any future background
+        # thread that writes outcomes. Matches RuntimeStateStore's pattern.
+        self._persistent_conn = sqlite3.connect(db_path, check_same_thread=False)
         self._persistent_conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
         if db_path != ":memory:":
             self._persistent_conn.execute("PRAGMA journal_mode=WAL")
         self._init_tables()
