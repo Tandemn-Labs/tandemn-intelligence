@@ -79,6 +79,9 @@ class MonitoringLoop:
         self._trigger_queue: asyncio.Queue = asyncio.Queue()
         self._tasks: List[asyncio.Task] = []
         self._running = False
+        # Fatal signal set by _on_task_done when a background loop dies
+        # unexpectedly. Read by /health in koi/server.py.
+        self._fatal: Optional[str] = None
         self._group_trigger_cooldown: Dict[
             str, float
         ] = {}  # "group_id:status" → last_emit_time
@@ -221,12 +224,43 @@ class MonitoringLoop:
     async def start(self):
         """Start all 3 loops as background tasks."""
         self._running = True
+        self._fatal = None
         self._trigger_queue = asyncio.Queue()
         self._tasks = [
             asyncio.create_task(self._telemetry_loop(), name="telemetry"),
             asyncio.create_task(self._trigger_dispatcher(), name="triggers"),
         ]
+        for task in self._tasks:
+            task.add_done_callback(self._on_task_done)
         logger.info("loops_started", telemetry_interval=self.telemetry_interval)
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        """Monitor a background task for unexpected termination.
+
+        Catches TWO failure modes operator would otherwise miss:
+          1. Task raised an exception.
+          2. Task returned cleanly while `_running` is still True — a silent
+             loop exit is just as fatal as a crash; /health must show 503.
+
+        Intentional cancellation during stop() is NOT fatal.
+        """
+        if not self._running:
+            return  # expected shutdown path
+        if task.cancelled():
+            return  # expected cancellation
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            self._fatal = f"{task.get_name()} raised: {exc!r}"
+        else:
+            self._fatal = f"{task.get_name()} exited unexpectedly (clean return)"
+        logger.error(
+            "monitor_task_died",
+            task=task.get_name(),
+            fatal=self._fatal,
+        )
 
     async def stop(self):
         """Cancel all loops."""

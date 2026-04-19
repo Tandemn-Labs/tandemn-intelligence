@@ -24,6 +24,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 import aiohttp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from koi.agent import KoiAgent
@@ -408,16 +409,30 @@ async def _run_with_inbox(
 
 @app.get("/health")
 async def health():
-    return {
+    monitor = app.state.monitor
+    runtime: Optional[RuntimeStateStore] = getattr(app.state, "runtime_state", None)
+
+    body = {
         "status": "ok",
         "version": "2.0",
         "perfdb_records": app.state.perfdb.record_count if app.state.perfdb else 0,
         "memory_decisions": app.state.memory.decision_count(),
         "memory_outcomes": app.state.memory.outcome_count(),
-        "tracked_jobs": len(app.state.monitor.tracked_jobs),
+        "tracked_jobs": len(monitor.tracked_jobs),
         "agent_model": app.state.agent.model,
         "orca_connected": app.state.orca is not None,
     }
+    if runtime is not None:
+        body["inbox_processed"] = runtime.inbox_count(status="processed")
+        body["inbox_processing"] = runtime.inbox_count(status="processing")
+        body["stale_inbox_claims"] = runtime.inbox_stale_count(older_than_secs=300)
+
+    fatal = getattr(monitor, "_fatal", None)
+    if fatal:
+        body["status"] = "fatal"
+        body["fatal"] = fatal
+        return JSONResponse(status_code=503, content=body)
+    return body
 
 
 @app.post("/decide")

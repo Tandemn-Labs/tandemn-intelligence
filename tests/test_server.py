@@ -71,6 +71,7 @@ async def client():
     monitor.tracked_jobs = {}
     monitor._pending_launches = {}
     monitor._pending_scale_decisions = {}
+    monitor._fatal = None
 
     def _track_pending_launch(job_id, launch_info):
         merged = dict(monitor._pending_launches.get(job_id, {}))
