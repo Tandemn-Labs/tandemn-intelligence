@@ -24,7 +24,9 @@ class ClaimResult(str, Enum):
 
     - CLAIMED: caller is now the owner; run the handler, then `mark_processed`.
     - ALREADY_PROCESSED: true duplicate; return 200 silently, skip side effects.
-    - IN_FLIGHT: a sibling request is processing; return 200, skip side effects.
+    - IN_FLIGHT: a sibling claim is still within the reclaim window; caller
+      should return 503 so the sender retries. If the prior claim crashed,
+      the claim ages out and a later retry reclaims it as RECLAIMED_STALE.
     - RECLAIMED_STALE: prior claim exceeded reclaim window (handler likely
       crashed); caller is now the owner, run the handler.
     """

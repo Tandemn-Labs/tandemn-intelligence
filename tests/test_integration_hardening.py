@@ -298,6 +298,50 @@ class TestHandlerReturnsErrorRetryLater:
         assert wired.koi_memory.outcome_count() == 1
         assert calls["n"] == 2
 
+    def test_retry_within_reclaim_window_stays_pending(self, wired, monkeypatch):
+        """Crashed handler + retry within 120s window must not purge the
+        outbox row. Koi returns 503 on IN_FLIGHT so the outbox keeps retrying
+        until the stale claim can be reclaimed."""
+
+        def always_raise(self, *args, **kwargs):
+            raise RuntimeError("synthetic fault")
+
+        monkeypatch.setattr(AgenticMemory, "record_outcome", always_raise)
+
+        wired.outbox.enqueue(
+            "/job/complete",
+            "job_complete",
+            {"job_id": "mo-abc", "status": "succeeded", "metrics": {}},
+            job_id="mo-abc",
+            dedup_key="job_complete:mo-abc",
+        )
+
+        # First drain: handler raises → 500 → row stays pending.
+        wired.publisher.drain_once()
+        assert wired.outbox.pending_count() == 1
+
+        # Force the outbox next_attempt_at to now, BUT leave the inbox
+        # claimed_at fresh (still within reclaim window). Second drain
+        # should see IN_FLIGHT → 503, not succeed.
+        with wired.outbox._lock:
+            wired.outbox._conn.execute(
+                "UPDATE outbox SET next_attempt_at = ? "
+                "WHERE event_id = 'job_complete:mo-abc'",
+                (time.time(),),
+            )
+            wired.outbox._conn.commit()
+
+        wired.publisher.drain_once()
+        assert wired.outbox.pending_count() == 1
+        assert wired.koi_memory.outcome_count() == 0
+        # The sender must see 503 — proves the exact retry-me signal, not
+        # just "some non-2xx happened."
+        row = wired.outbox._conn.execute(
+            "SELECT last_status_code FROM outbox WHERE event_id = ?",
+            ("job_complete:mo-abc",),
+        ).fetchone()
+        assert row["last_status_code"] == 503
+
 
 class TestKoiUnreachableBuffersAndRecovers:
     def test_connection_error_buffers_then_drains(self, wired, monkeypatch):

@@ -401,7 +401,14 @@ async def _run_with_inbox(
             event_type=event_type,
             job_id=job_id,
         )
-        return {"status": "in_flight", "event_id": event_id}
+        # 503 so Orca keeps retrying. If the prior claim crashed, it will
+        # age out past reclaim_after_secs and a later retry reclaims it as
+        # RECLAIMED_STALE. 200 here would purge the outbox row and lose
+        # the event.
+        return JSONResponse(
+            status_code=503,
+            content={"status": "in_flight", "event_id": event_id},
+        )
     if result == ClaimResult.RECLAIMED_STALE:
         logger.warning(
             "inbox_reclaimed_stale",

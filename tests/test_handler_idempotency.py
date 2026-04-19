@@ -178,3 +178,33 @@ class TestInboxPersistence:
                 },
             )
         assert app.state.runtime_state.inbox_count(status="processed") == 3
+
+
+class TestInFlightReturns503:
+    """A webhook that arrives while a prior claim is still within the
+    reclaim window must return 503 (retryable), not 200. Returning 200
+    would let Orca's outbox purge the event before the stale claim can
+    be reclaimed — the crash-retry-within-window hole."""
+
+    @pytest.mark.asyncio
+    async def test_in_flight_returns_503(self, client_with_tracker):
+        c, _ = client_with_tracker
+        # Force an event into 'processing' with a fresh claim.
+        app.state.runtime_state.claim_event(
+            event_id="job_complete:mo-abc",
+            event_type="job_complete",
+            job_id="mo-abc",
+            payload_hash="prior",
+        )
+        # Duplicate arrives within the reclaim window → IN_FLIGHT → 503.
+        r = await c.post(
+            "/job/complete",
+            json={
+                "event_id": "job_complete:mo-abc",
+                "job_id": "mo-abc",
+                "status": "succeeded",
+                "metrics": {},
+            },
+        )
+        assert r.status_code == 503
+        assert r.json()["status"] == "in_flight"
