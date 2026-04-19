@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 
 from koi.agent import KoiAgent
+from koi.contract import ReasonCode
 from koi.event_tap import emit_event
 from koi.logging_config import setup_logging, get_logger, bind_context, clear_context
 from koi.monitor import MonitoringLoop
@@ -57,6 +58,12 @@ KOI_PORT = int(os.environ.get("KOI_PORT", "8090"))
 class DecideRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Envelope (Optional during compat window — see koi/contract.py)
+    event_id: Optional[str] = None
+    event_type: Optional[str] = None
+    emitted_at: Optional[float] = None
+    correlation_id: Optional[str] = None
+
     job_request: Dict[str, Any]
     resource_map: Any  # Shape A, B, or C
 
@@ -64,9 +71,23 @@ class DecideRequest(BaseModel):
 class JobCompleteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Envelope (Optional during compat window)
+    event_id: Optional[str] = None
+    event_type: Optional[str] = None
+    emitted_at: Optional[float] = None
+    correlation_id: Optional[str] = None
+
     job_id: str
+    # Explicit entity IDs (new; job_id retained as legacy alias for group_id)
+    group_id: Optional[str] = None
+    decision_id: Optional[str] = None
+
     status: str
     metrics: Dict[str, Any] = {}
+
+    # Structured failure info (Optional; free-text status/metrics still primary)
+    reason_code: Optional[ReasonCode] = None
+    reason_detail: Optional[str] = None
 
 
 class _FixedTestAgent:
@@ -441,7 +462,17 @@ async def decide(req: DecideRequest):
 class JobStartedRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Envelope (Optional during compat window)
+    event_id: Optional[str] = None
+    event_type: Optional[str] = None
+    emitted_at: Optional[float] = None
+    correlation_id: Optional[str] = None
+
     job_id: str
+    # Explicit entity IDs (new; job_id retained as legacy alias for replica_id)
+    replica_id: Optional[str] = None
+    scale_request_id: Optional[str] = None
+
     decision_id: Optional[str] = None
     group_id: Optional[str] = None  # parent job ID for chunked replicas
     gpu_type: str
@@ -460,7 +491,16 @@ class JobStartedRequest(BaseModel):
 class JobLaunchingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Envelope (Optional during compat window)
+    event_id: Optional[str] = None
+    event_type: Optional[str] = None
+    emitted_at: Optional[float] = None
+    correlation_id: Optional[str] = None
+
     job_id: str
+    replica_id: Optional[str] = None
+    scale_request_id: Optional[str] = None
+
     decision_id: Optional[str] = None
     group_id: Optional[str] = None
     gpu_type: str = "unknown"
@@ -475,7 +515,16 @@ class JobLaunchingRequest(BaseModel):
 class JobLaunchHeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Envelope (Optional during compat window)
+    event_id: Optional[str] = None
+    event_type: Optional[str] = None
+    emitted_at: Optional[float] = None
+    correlation_id: Optional[str] = None
+
     job_id: str
+    replica_id: Optional[str] = None
+    scale_request_id: Optional[str] = None
+
     decision_id: Optional[str] = None
     group_id: Optional[str] = None
     gpu_type: str = "unknown"
@@ -830,7 +879,14 @@ async def job_complete(req: JobCompleteRequest):
 class ReplicaFailedRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Envelope (Optional during compat window)
+    event_id: Optional[str] = None
+    event_type: Optional[str] = None
+    emitted_at: Optional[float] = None
+    correlation_id: Optional[str] = None
+
     job_id: str  # replica chain ID
+    replica_id: Optional[str] = None  # alias for job_id; preferred going forward
     group_id: str  # parent job ID
     decision_id: Optional[str] = None
     instance_type: str = "unknown"
@@ -838,6 +894,10 @@ class ReplicaFailedRequest(BaseModel):
     market: str = "unknown"
     status: str = "failed"
     reason: str = ""
+
+    # Structured reason (preferred over free-text `reason` going forward)
+    reason_code: Optional[ReasonCode] = None
+    reason_detail: Optional[str] = None
 
 
 @app.post("/job/replica-failed")
@@ -940,7 +1000,14 @@ async def replica_failed(req: ReplicaFailedRequest):
 class ConfigAttemptRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Envelope (Optional during compat window)
+    event_id: Optional[str] = None
+    event_type: Optional[str] = None
+    emitted_at: Optional[float] = None
+    correlation_id: Optional[str] = None
+
     job_id: str
+    group_id: Optional[str] = None
     decision_id: Optional[str] = None
     instance_type: str
     gpu_type: str
@@ -1000,11 +1067,22 @@ async def config_attempted(req: ConfigAttemptRequest):
 class LaunchFailedRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Envelope (Optional during compat window)
+    event_id: Optional[str] = None
+    event_type: Optional[str] = None
+    emitted_at: Optional[float] = None
+    correlation_id: Optional[str] = None
+
     job_id: str
+    group_id: Optional[str] = None
     decision_id: Optional[str] = None
     configs_tried: List[Dict[str, Any]] = []
     failure_reasons: List[str] = []
     total_time_seconds: float = 0.0
+
+    # Structured reason (preferred over free-text failure_reasons going forward)
+    reason_code: Optional[ReasonCode] = None
+    reason_detail: Optional[str] = None
 
 
 @app.post("/job/launch-failed")
