@@ -440,23 +440,28 @@ class TestMonitoringLoopPersistence:
         )
         assert store.load_pending_launches()["replica-1"]["launch"]["market"] == "spot"
 
-        monitor.enqueue_pending_scale_decision(
-            "grp-1", {"decision_id": "dec-a", "remaining": 2}
+        monitor.register_pending_replica_decision(
+            replica_id="grp-1-v2-r0",
+            decision_id="dec-a",
+            scale_request_id="sr-1",
+            decision={"gpu_type": "L40S"},
         )
-        monitor.enqueue_pending_scale_decision(
-            "grp-1", {"decision_id": "dec-b", "remaining": 1}
+        monitor.register_pending_replica_decision(
+            replica_id="grp-1-v2-r1",
+            decision_id="dec-a",
+            scale_request_id="sr-1",
+            decision={"gpu_type": "L40S"},
         )
-        assert store.load_pending_scale_decisions()["grp-1"] == [
-            {"decision_id": "dec-a", "remaining": 2},
-            {"decision_id": "dec-b", "remaining": 1},
-        ]
+        loaded = store.load_pending_replica_decisions()
+        assert set(loaded.keys()) == {"grp-1-v2-r0", "grp-1-v2-r1"}
+        assert loaded["grp-1-v2-r0"]["decision_id"] == "dec-a"
 
-        first = monitor.consume_pending_scale_decision("grp-1")
+        first = monitor.consume_pending_replica_decision("grp-1-v2-r0")
         assert first["decision_id"] == "dec-a"
-        assert store.load_pending_scale_decisions()["grp-1"] == [
-            {"decision_id": "dec-a", "remaining": 1},
-            {"decision_id": "dec-b", "remaining": 1},
-        ]
+        # Sibling replica's mapping untouched by the consume.
+        loaded = store.load_pending_replica_decisions()
+        assert "grp-1-v2-r0" not in loaded
+        assert loaded["grp-1-v2-r1"]["decision_id"] == "dec-a"
 
         monitor.clear_pending_launch("replica-1")
         assert store.load_pending_launches() == {}
@@ -524,11 +529,10 @@ class TestMonitoringLoopPersistence:
                 "market": "spot",
             },
         )
-        store.replace_pending_scale_group(
-            "grp-restore",
-            [
-                {"decision_id": "dec-scale", "remaining": 2},
-            ],
+        store.upsert_pending_replica_decision(
+            replica_id="grp-restore-v2-r0",
+            decision_id="dec-scale",
+            decision={"gpu_type": "L40S", "tp": 4, "pp": 2},
         )
 
         restored = MonitoringLoop(
@@ -540,13 +544,13 @@ class TestMonitoringLoopPersistence:
         assert summary == {
             "tracked_jobs": 1,
             "pending_launches": 1,
-            "pending_scale_groups": 1,
+            "pending_replica_decisions": 1,
         }
         assert "job-restore" in restored.tracked_jobs
         assert restored.tracked_jobs["job-restore"].action_in_progress is False
         assert restored.tracked_jobs["job-restore"].action_freeze_until is None
         assert restored._pending_launches["replica-restore"]["market"] == "spot"
         assert (
-            restored._pending_scale_decisions["grp-restore"][0]["decision_id"]
+            restored._pending_replica_decisions["grp-restore-v2-r0"]["decision_id"]
             == "dec-scale"
         )

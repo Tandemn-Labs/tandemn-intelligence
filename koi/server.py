@@ -271,7 +271,7 @@ async def lifespan(app: FastAPI):
         ledger_reservations=restored_ledger,
         tracked_jobs=restored_monitor["tracked_jobs"],
         pending_launches=restored_monitor["pending_launches"],
-        pending_scale_groups=restored_monitor["pending_scale_groups"],
+        pending_replica_decisions=restored_monitor["pending_replica_decisions"],
     )
 
     if app.state.orca:
@@ -785,15 +785,17 @@ async def _job_started_impl(req: JobStartedRequest) -> Dict[str, Any]:
     if req.decision_id:
         app.state.ledger.release(req.decision_id)
 
-    # Link scale-up replicas to pending scale decisions queued per group.
-    pending_scale_decisions = getattr(monitor, "_pending_scale_decisions", None)
-    if req.group_id and isinstance(pending_scale_decisions, dict):
-        pending = monitor.consume_pending_scale_decision(req.group_id)
+    # Link scale-up replicas to the exact decision that produced them.
+    # scale_chain_tool registers (replica_id → decision) for every
+    # new_replica Orca returned; here we consume it by exact replica_id.
+    # No FIFO guesswork, so overlapping scale ops can't cross-attribute.
+    replica_id_key = req.replica_id or req.job_id
+    pending_replica_decisions = getattr(
+        monitor, "_pending_replica_decisions", None
+    )
+    if isinstance(pending_replica_decisions, dict):
+        pending = monitor.consume_pending_replica_decision(replica_id_key)
         if pending:
-            req.decision_id = pending["decision_id"]
-    elif isinstance(getattr(monitor, "_pending_scale_decision", None), dict):
-        pending = getattr(monitor, "_pending_scale_decision", None)
-        if pending and pending.get("group_id") == req.group_id:
             req.decision_id = pending["decision_id"]
 
     # Detect fallback: if Orca used a different config than Koi's primary decision,

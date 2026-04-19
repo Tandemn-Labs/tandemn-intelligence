@@ -89,9 +89,12 @@ class MonitoringLoop:
         self._pending_launches: Dict[
             str, dict
         ] = {}  # replica_id → launch info (pre-model_ready)
-        self._pending_scale_decisions: Dict[
-            str, List[dict]
-        ] = {}  # group_id -> FIFO queue
+        # Per-replica scale-up decision mapping (replaces the old
+        # group_id-keyed FIFO queue, which misattributed decisions under
+        # overlapping scale ops with out-of-order replica arrivals).
+        # Populated by scale_chain_tool with exactly the replica_ids Orca's
+        # /job/{id}/scale response reported; consumed by /job/started.
+        self._pending_replica_decisions: Dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Job registration
@@ -194,28 +197,42 @@ class MonitoringLoop:
                 self.runtime_state.delete_pending_launch(job_id)
         return len(removed_job_ids)
 
-    def enqueue_pending_scale_decision(self, group_id: str, decision: dict) -> None:
-        queue = self._pending_scale_decisions.setdefault(group_id, [])
-        queue.append(decision)
-        if self.runtime_state:
-            self.runtime_state.replace_pending_scale_group(group_id, queue)
+    def register_pending_replica_decision(
+        self,
+        replica_id: str,
+        decision_id: str,
+        scale_request_id: Optional[str] = None,
+        decision: Optional[dict] = None,
+    ) -> None:
+        """Remember the decision that produced this replica.
 
-    def consume_pending_scale_decision(self, group_id: str) -> Optional[dict]:
-        queue = self._pending_scale_decisions.get(group_id, [])
-        if not queue:
+        Called by scale_chain_tool for each replica_id returned by Orca's
+        scale response. When the replica later fires /job/started, the
+        handler does an exact-match lookup via consume_pending_replica_decision.
+        """
+        record = {
+            "decision_id": decision_id,
+            "scale_request_id": scale_request_id,
+            "decision": dict(decision or {}),
+            "registered_at": time.time(),
+        }
+        self._pending_replica_decisions[replica_id] = record
+        if self.runtime_state:
+            self.runtime_state.upsert_pending_replica_decision(
+                replica_id=replica_id,
+                decision_id=decision_id,
+                decision=record["decision"],
+                scale_request_id=scale_request_id,
+            )
+
+    def consume_pending_replica_decision(self, replica_id: str) -> Optional[dict]:
+        """Pop and return the pending decision for this exact replica_id."""
+        record = self._pending_replica_decisions.pop(replica_id, None)
+        if record is None:
             return None
-        decision = queue[0]
-        decision["remaining"] -= 1
-        if decision["remaining"] <= 0:
-            queue.pop(0)
-        if queue:
-            if self.runtime_state:
-                self.runtime_state.replace_pending_scale_group(group_id, queue)
-        else:
-            self._pending_scale_decisions.pop(group_id, None)
-            if self.runtime_state:
-                self.runtime_state.delete_pending_scale_group(group_id)
-        return decision
+        if self.runtime_state:
+            self.runtime_state.delete_pending_replica_decision(replica_id)
+        return record
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -278,7 +295,7 @@ class MonitoringLoop:
             return {
                 "tracked_jobs": 0,
                 "pending_launches": 0,
-                "pending_scale_groups": 0,
+                "pending_replica_decisions": 0,
             }
 
         restored_trackers: Dict[str, JobTracker] = {}
@@ -295,14 +312,14 @@ class MonitoringLoop:
             job_id: entry["launch"]
             for job_id, entry in self.runtime_state.load_pending_launches().items()
         }
-        self._pending_scale_decisions = (
-            self.runtime_state.load_pending_scale_decisions()
+        self._pending_replica_decisions = (
+            self.runtime_state.load_pending_replica_decisions()
         )
 
         summary = {
             "tracked_jobs": len(self.tracked_jobs),
             "pending_launches": len(self._pending_launches),
-            "pending_scale_groups": len(self._pending_scale_decisions),
+            "pending_replica_decisions": len(self._pending_replica_decisions),
         }
         if any(summary.values()):
             logger.info("monitor_restored", **summary)

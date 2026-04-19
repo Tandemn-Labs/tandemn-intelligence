@@ -206,6 +206,7 @@ class TestActionTools:
         monitor = SimpleNamespace(
             tracked_jobs={"parent-job-r0": tracker},
             _koi_initiated_kills=set(),
+            _pending_replica_decisions={},
         )
         tools = agent._build_tools(resource_map=resource_map, monitor=monitor)
         scale_tool = next(t for t in tools if t.name == "scale_chain_tool")
@@ -218,7 +219,8 @@ class TestActionTools:
         assert memory.decision_count() == 1
         assert tracker.action_in_progress is False
         assert tracker.action_freeze_until is None
-        assert not hasattr(monitor, "_pending_scale_decisions")
+        # Failed scale must not register phantom replica_id mappings.
+        assert monitor._pending_replica_decisions == {}
 
     @pytest.mark.asyncio
     async def test_scale_chain_defaults_on_demand_and_avoids_spot_without_quota(

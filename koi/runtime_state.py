@@ -70,12 +70,13 @@ class RuntimeStateStore:
                     updated_at   REAL NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS pending_scale_decisions (
-                    group_id      TEXT NOT NULL,
-                    queue_index   INTEGER NOT NULL,
-                    decision_json TEXT NOT NULL,
-                    updated_at    REAL NOT NULL,
-                    PRIMARY KEY (group_id, queue_index)
+                CREATE TABLE IF NOT EXISTS pending_replica_decisions (
+                    replica_id       TEXT PRIMARY KEY,
+                    decision_id      TEXT NOT NULL,
+                    scale_request_id TEXT,
+                    decision_json    TEXT NOT NULL,
+                    registered_at    REAL NOT NULL,
+                    updated_at       REAL NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS ledger_reservations (
@@ -192,50 +193,68 @@ class RuntimeStateStore:
         }
 
     # ------------------------------------------------------------------
-    # pending_scale_decisions
+    # pending_replica_decisions — per-replica mapping for scale-up correlation.
+    # Replaces the old group_id-keyed FIFO queue, which was vulnerable to
+    # mismatch under overlapping scale ops with out-of-order replica arrivals.
     # ------------------------------------------------------------------
 
-    def replace_pending_scale_group(self, group_id: str, decisions: List[Dict[str, Any]]) -> None:
+    def upsert_pending_replica_decision(
+        self,
+        replica_id: str,
+        decision_id: str,
+        decision: Dict[str, Any],
+        scale_request_id: Optional[str] = None,
+    ) -> None:
         now = time.time()
         with self._lock:
             self._conn.execute(
-                "DELETE FROM pending_scale_decisions WHERE group_id = ?",
-                (group_id,),
+                """
+                INSERT INTO pending_replica_decisions
+                    (replica_id, decision_id, scale_request_id, decision_json,
+                     registered_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(replica_id) DO UPDATE SET
+                    decision_id=excluded.decision_id,
+                    scale_request_id=excluded.scale_request_id,
+                    decision_json=excluded.decision_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    replica_id,
+                    decision_id,
+                    scale_request_id,
+                    json.dumps(decision),
+                    now,
+                    now,
+                ),
             )
-            if decisions:
-                self._conn.executemany(
-                    """
-                    INSERT INTO pending_scale_decisions (group_id, queue_index, decision_json, updated_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    [
-                        (group_id, idx, json.dumps(decision), now)
-                        for idx, decision in enumerate(decisions)
-                    ],
-                )
             self._conn.commit()
 
-    def delete_pending_scale_group(self, group_id: str) -> None:
+    def delete_pending_replica_decision(self, replica_id: str) -> None:
         with self._lock:
             self._conn.execute(
-                "DELETE FROM pending_scale_decisions WHERE group_id = ?",
-                (group_id,),
+                "DELETE FROM pending_replica_decisions WHERE replica_id = ?",
+                (replica_id,),
             )
             self._conn.commit()
 
-    def load_pending_scale_decisions(self) -> Dict[str, List[Dict[str, Any]]]:
+    def load_pending_replica_decisions(self) -> Dict[str, Dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT group_id, queue_index, decision_json
-                FROM pending_scale_decisions
-                ORDER BY group_id, queue_index
+                SELECT replica_id, decision_id, scale_request_id, decision_json, registered_at
+                FROM pending_replica_decisions
                 """
             ).fetchall()
-        result: Dict[str, List[Dict[str, Any]]] = {}
-        for row in rows:
-            result.setdefault(row["group_id"], []).append(json.loads(row["decision_json"]))
-        return result
+        return {
+            row["replica_id"]: {
+                "decision_id": row["decision_id"],
+                "scale_request_id": row["scale_request_id"],
+                "decision": json.loads(row["decision_json"]),
+                "registered_at": row["registered_at"],
+            }
+            for row in rows
+        }
 
     # ------------------------------------------------------------------
     # ledger_reservations

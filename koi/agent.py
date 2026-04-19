@@ -507,15 +507,25 @@ class KoiAgent:
                         market=market_str,
                     )
                     if monitor and count > 0:
-                        monitor.enqueue_pending_scale_decision(
-                            job_id,
-                            {
-                                "decision_id": scale_dec_id,
-                                "remaining": abs(count),
-                                "region": resolved_region,
-                                "gpu_type": gpu_type,
-                            },
-                        )
+                        # Orca returns exactly the new replica_ids it launched
+                        # (server.py:1533). Map each one to this decision so
+                        # /job/started can look up by exact replica_id instead
+                        # of relying on FIFO order (which breaks under
+                        # overlapping scale ops with out-of-order arrivals).
+                        new_replicas = scale_response.get("new_replicas", [])
+                        scale_request_id = scale_response.get("scale_request_id")
+                        for replica_id in new_replicas:
+                            monitor.register_pending_replica_decision(
+                                replica_id=replica_id,
+                                decision_id=scale_dec_id,
+                                scale_request_id=scale_request_id,
+                                decision={
+                                    "region": resolved_region,
+                                    "gpu_type": gpu_type,
+                                    "tp": tp,
+                                    "pp": pp,
+                                },
+                            )
                 # Anti-windup: freeze triggers for this job while scaling action takes effect
                 if monitor:
                     for tracker in monitor.tracked_jobs.values():

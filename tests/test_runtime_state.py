@@ -59,19 +59,53 @@ def test_store_round_trips_pending_launch():
     assert loaded["replica-1"]["launch"] == launch
 
 
-def test_store_replaces_pending_scale_group_in_order():
+def test_store_round_trips_pending_replica_decisions():
+    """Per-replica scale correlation: each replica_id maps to its own decision,
+    survives restart, and can be consumed exactly once."""
     store = RuntimeStateStore(":memory:")
-    initial = [
-        {"decision_id": "dec-a", "remaining": 1},
-        {"decision_id": "dec-b", "remaining": 2},
-    ]
-    replacement = [{"decision_id": "dec-c", "remaining": 3}]
+    store.upsert_pending_replica_decision(
+        replica_id="mo-abc-v2-r0",
+        decision_id="dec-a",
+        scale_request_id="sr-1",
+        decision={"gpu_type": "L40S", "tp": 4, "pp": 2},
+    )
+    store.upsert_pending_replica_decision(
+        replica_id="mo-abc-v2-r1",
+        decision_id="dec-a",
+        scale_request_id="sr-1",
+        decision={"gpu_type": "L40S", "tp": 4, "pp": 2},
+    )
+    store.upsert_pending_replica_decision(
+        replica_id="mo-xyz-v3-r0",
+        decision_id="dec-b",
+        scale_request_id="sr-2",
+        decision={"gpu_type": "L4", "tp": 8, "pp": 1},
+    )
 
-    store.replace_pending_scale_group("grp-1", initial)
-    assert store.load_pending_scale_decisions()["grp-1"] == initial
+    loaded = store.load_pending_replica_decisions()
+    assert set(loaded.keys()) == {"mo-abc-v2-r0", "mo-abc-v2-r1", "mo-xyz-v3-r0"}
+    assert loaded["mo-abc-v2-r0"]["decision_id"] == "dec-a"
+    assert loaded["mo-xyz-v3-r0"]["decision_id"] == "dec-b"
+    assert loaded["mo-abc-v2-r0"]["scale_request_id"] == "sr-1"
 
-    store.replace_pending_scale_group("grp-1", replacement)
-    assert store.load_pending_scale_decisions()["grp-1"] == replacement
+    store.delete_pending_replica_decision("mo-abc-v2-r0")
+    remaining = store.load_pending_replica_decisions()
+    assert "mo-abc-v2-r0" not in remaining
+    assert "mo-abc-v2-r1" in remaining  # sibling untouched
+
+
+def test_upsert_pending_replica_decision_is_idempotent():
+    store = RuntimeStateStore(":memory:")
+    store.upsert_pending_replica_decision(
+        replica_id="r1", decision_id="dec-a", decision={"v": 1}
+    )
+    store.upsert_pending_replica_decision(
+        replica_id="r1", decision_id="dec-b", decision={"v": 2}
+    )  # overwrite
+    loaded = store.load_pending_replica_decisions()
+    assert len(loaded) == 1
+    assert loaded["r1"]["decision_id"] == "dec-b"
+    assert loaded["r1"]["decision"] == {"v": 2}
 
 
 def test_store_round_trips_ledger_reservation():

@@ -68,7 +68,7 @@ async def client_with_tracker():
     tracker = _tracker("mo-abc", decision_id="d-1")
     monitor.tracked_jobs = {"mo-abc": tracker}
     monitor._pending_launches = {}
-    monitor._pending_scale_decisions = {}
+    monitor._pending_replica_decisions = {}
     monitor._koi_initiated_kills = set()
     monitor._trigger_queue = asyncio.Queue()
     monitor.persist_job = MagicMock()

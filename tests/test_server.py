@@ -70,7 +70,7 @@ async def client():
     monitor = MagicMock()
     monitor.tracked_jobs = {}
     monitor._pending_launches = {}
-    monitor._pending_scale_decisions = {}
+    monitor._pending_replica_decisions = {}
     monitor._fatal = None
 
     def _track_pending_launch(job_id, launch_info):
@@ -94,17 +94,17 @@ async def client():
             monitor._pending_launches.pop(job_id, None)
         return len(removed)
 
-    def _consume_pending_scale_decision(group_id):
-        queue = monitor._pending_scale_decisions.get(group_id, [])
-        if not queue:
-            return None
-        pending = queue[0]
-        pending["remaining"] -= 1
-        if pending["remaining"] <= 0:
-            queue.pop(0)
-        if not queue:
-            monitor._pending_scale_decisions.pop(group_id, None)
-        return pending
+    def _consume_pending_replica_decision(replica_id):
+        return monitor._pending_replica_decisions.pop(replica_id, None)
+
+    def _register_pending_replica_decision(
+        replica_id, decision_id, scale_request_id=None, decision=None
+    ):
+        monitor._pending_replica_decisions[replica_id] = {
+            "decision_id": decision_id,
+            "scale_request_id": scale_request_id,
+            "decision": dict(decision or {}),
+        }
 
     monitor.track_pending_launch = MagicMock(side_effect=_track_pending_launch)
     monitor.get_pending_launch = MagicMock(side_effect=_get_pending_launch)
@@ -112,8 +112,11 @@ async def client():
     monitor.clear_pending_launches_for_group = MagicMock(
         side_effect=_clear_pending_launches_for_group
     )
-    monitor.consume_pending_scale_decision = MagicMock(
-        side_effect=_consume_pending_scale_decision
+    monitor.consume_pending_replica_decision = MagicMock(
+        side_effect=_consume_pending_replica_decision
+    )
+    monitor.register_pending_replica_decision = MagicMock(
+        side_effect=_register_pending_replica_decision
     )
     monitor.persist_job = MagicMock()
     monitor.register_job = MagicMock()
@@ -1123,14 +1126,40 @@ class TestJobStarted:
         assert spot["availability_pct"] == pytest.approx(50.0)
 
     @pytest.mark.asyncio
-    async def test_started_consumes_pending_scale_decisions_by_group(self, client):
-        """New replicas should consume queued scale decisions for their group only."""
-        app.state.monitor._pending_scale_decisions = {
-            "parent-job": [{"decision_id": "dec-scale", "remaining": 2}],
-            "other-job": [{"decision_id": "dec-other", "remaining": 1}],
+    async def test_started_consumes_pending_replica_decision_by_replica_id(
+        self, client
+    ):
+        """/job/started looks up decisions by exact replica_id, not FIFO order.
+
+        Two scale ops overlap: decision A produced r-scale-0 and r-scale-1,
+        decision B produced r-other. Even if r-other arrives first (out of
+        launch order), each replica gets its correct decision_id.
+        """
+        app.state.monitor._pending_replica_decisions = {
+            "r-scale-0": {
+                "decision_id": "dec-scale",
+                "scale_request_id": "sr-1",
+                "decision": {"gpu_type": "L40S"},
+            },
+            "r-scale-1": {
+                "decision_id": "dec-scale",
+                "scale_request_id": "sr-1",
+                "decision": {"gpu_type": "L40S"},
+            },
+            "r-other": {
+                "decision_id": "dec-other",
+                "scale_request_id": "sr-2",
+                "decision": {"gpu_type": "L40S"},
+            },
         }
 
-        for replica_id in ("r-scale-0", "r-scale-1"):
+        # Out-of-order arrival: r-other, then r-scale-0, then r-scale-1.
+        expected = [
+            ("r-other", "dec-other"),
+            ("r-scale-0", "dec-scale"),
+            ("r-scale-1", "dec-scale"),
+        ]
+        for replica_id, expected_decision in expected:
             resp = await client.post(
                 "/job/started",
                 json={
@@ -1150,13 +1179,10 @@ class TestJobStarted:
                 },
             )
             assert resp.status_code == 200
-            assert resp.json()["decision_id"] == "dec-scale"
+            assert resp.json()["decision_id"] == expected_decision
 
-        assert "parent-job" not in app.state.monitor._pending_scale_decisions
-        assert (
-            app.state.monitor._pending_scale_decisions["other-job"][0]["decision_id"]
-            == "dec-other"
-        )
+        # All three pending decisions consumed exactly.
+        assert app.state.monitor._pending_replica_decisions == {}
 
 
 class TestStartupRestore:
@@ -1210,11 +1236,10 @@ class TestStartupRestore:
                 "launched_at": 123.4,
             },
         )
-        store.replace_pending_scale_group(
-            "grp-restored",
-            [
-                {"decision_id": "dec-scale", "remaining": 1},
-            ],
+        store.upsert_pending_replica_decision(
+            replica_id="grp-restored-v2-r0",
+            decision_id="dec-scale",
+            decision={"gpu_type": "L40S"},
         )
         store.upsert_ledger_reservation(
             "dec-ledger",
@@ -1247,9 +1272,9 @@ class TestStartupRestore:
                     == "spot"
                 )
                 assert (
-                    app.state.monitor._pending_scale_decisions["grp-restored"][0][
-                        "decision_id"
-                    ]
+                    app.state.monitor._pending_replica_decisions[
+                        "grp-restored-v2-r0"
+                    ]["decision_id"]
                     == "dec-scale"
                 )
                 assert app.state.ledger.pending_count == 1
@@ -1362,7 +1387,9 @@ class TestRestartPersistenceFlows:
                 assert restored.config.region == "us-west-2"
 
     @pytest.mark.asyncio
-    async def test_pending_scale_queue_survives_restart_and_is_consumed(self, tmp_path):
+    async def test_pending_replica_decision_survives_restart_and_is_consumed(
+        self, tmp_path
+    ):
         runtime_path = tmp_path / "runtime.sqlite"
         memory_path = tmp_path / "memory.sqlite"
         env = {
@@ -1373,15 +1400,14 @@ class TestRestartPersistenceFlows:
 
         with patch.dict(os.environ, env, clear=False):
             async with _lifespan_client():
-                app.state.monitor.enqueue_pending_scale_decision(
-                    "group-1",
-                    {
-                        "decision_id": "dec-scale",
-                        "remaining": 1,
-                    },
+                app.state.monitor.register_pending_replica_decision(
+                    replica_id="replica-r1",
+                    decision_id="dec-scale",
+                    scale_request_id="sr-1",
+                    decision={"gpu_type": "L40S"},
                 )
                 assert (
-                    app.state.monitor._pending_scale_decisions["group-1"][0][
+                    app.state.monitor._pending_replica_decisions["replica-r1"][
                         "decision_id"
                     ]
                     == "dec-scale"
@@ -1389,7 +1415,7 @@ class TestRestartPersistenceFlows:
 
             async with _lifespan_client() as c2:
                 assert (
-                    app.state.monitor._pending_scale_decisions["group-1"][0][
+                    app.state.monitor._pending_replica_decisions["replica-r1"][
                         "decision_id"
                     ]
                     == "dec-scale"
@@ -1414,10 +1440,13 @@ class TestRestartPersistenceFlows:
                 )
                 assert started_resp.status_code == 200
                 assert started_resp.json()["decision_id"] == "dec-scale"
-                assert "group-1" not in app.state.monitor._pending_scale_decisions
+                assert (
+                    "replica-r1"
+                    not in app.state.monitor._pending_replica_decisions
+                )
 
             async with _lifespan_client():
-                assert app.state.monitor._pending_scale_decisions == {}
+                assert app.state.monitor._pending_replica_decisions == {}
 
 
 class TestHappyPath:
