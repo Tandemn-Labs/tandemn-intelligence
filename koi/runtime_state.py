@@ -14,8 +14,25 @@ import json
 import sqlite3
 import threading
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+
+class ClaimResult(str, Enum):
+    """Outcome of `claim_event`.
+
+    - CLAIMED: caller is now the owner; run the handler, then `mark_processed`.
+    - ALREADY_PROCESSED: true duplicate; return 200 silently, skip side effects.
+    - IN_FLIGHT: a sibling request is processing; return 200, skip side effects.
+    - RECLAIMED_STALE: prior claim exceeded reclaim window (handler likely
+      crashed); caller is now the owner, run the handler.
+    """
+
+    CLAIMED = "claimed"
+    ALREADY_PROCESSED = "already_processed"
+    IN_FLIGHT = "in_flight"
+    RECLAIMED_STALE = "reclaimed_stale"
 
 
 class RuntimeStateStore:
@@ -67,6 +84,20 @@ class RuntimeStateStore:
                     expires_at       REAL,
                     updated_at       REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS inbox (
+                    event_id      TEXT PRIMARY KEY,
+                    event_type    TEXT NOT NULL,
+                    job_id        TEXT,
+                    status        TEXT NOT NULL,    -- 'processing' | 'processed'
+                    claimed_at    REAL NOT NULL,
+                    processed_at  REAL,
+                    attempts      INTEGER NOT NULL DEFAULT 1,
+                    last_error    TEXT,
+                    payload_hash  TEXT
+                );
+                CREATE INDEX IF NOT EXISTS ix_inbox_status
+                    ON inbox(status, claimed_at);
             """)
             self._conn.commit()
 
@@ -255,3 +286,128 @@ class RuntimeStateStore:
             }
             for row in rows
         }
+
+    # ------------------------------------------------------------------
+    # inbox (crash-safe event dedup)
+    # ------------------------------------------------------------------
+
+    def claim_event(
+        self,
+        event_id: str,
+        event_type: str,
+        job_id: Optional[str] = None,
+        payload_hash: Optional[str] = None,
+        reclaim_after_secs: float = 120.0,
+    ) -> ClaimResult:
+        """Atomically claim an event for processing.
+
+        Returns one of ClaimResult.{CLAIMED, ALREADY_PROCESSED, IN_FLIGHT,
+        RECLAIMED_STALE}. Caller should run the handler only on CLAIMED or
+        RECLAIMED_STALE, then call `mark_processed` on success or let the
+        row stay in 'processing' on failure (Orca will retry, and the claim
+        will age out past reclaim_after_secs so a future retry re-owns it).
+        """
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO inbox
+                    (event_id, event_type, job_id, status, claimed_at, attempts, payload_hash)
+                VALUES (?, ?, ?, 'processing', ?, 1, ?)
+                ON CONFLICT(event_id) DO NOTHING
+                """,
+                (event_id, event_type, job_id, now, payload_hash),
+            )
+            if cur.rowcount == 1:
+                self._conn.commit()
+                return ClaimResult.CLAIMED
+
+            row = self._conn.execute(
+                "SELECT status, claimed_at FROM inbox WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                # Race with DELETE or extremely narrow window — retry as fresh.
+                self._conn.commit()
+                return self.claim_event(
+                    event_id, event_type, job_id, payload_hash, reclaim_after_secs
+                )
+            if row["status"] == "processed":
+                self._conn.commit()
+                return ClaimResult.ALREADY_PROCESSED
+            # status == 'processing'
+            if (now - row["claimed_at"]) < reclaim_after_secs:
+                self._conn.commit()
+                return ClaimResult.IN_FLIGHT
+            # Stale claim — prior handler crashed. Reclaim.
+            self._conn.execute(
+                """
+                UPDATE inbox
+                SET claimed_at = ?, attempts = attempts + 1
+                WHERE event_id = ? AND status = 'processing'
+                """,
+                (now, event_id),
+            )
+            self._conn.commit()
+            return ClaimResult.RECLAIMED_STALE
+
+    def mark_processed(self, event_id: str) -> None:
+        """Mark an event as successfully handled."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE inbox SET status = 'processed', processed_at = ? "
+                "WHERE event_id = ?",
+                (time.time(), event_id),
+            )
+            self._conn.commit()
+
+    def mark_failed(self, event_id: str, error: str) -> None:
+        """Record a handler failure without marking the event processed.
+
+        Keeps status = 'processing' so Orca's retry can reclaim once the
+        stale window elapses.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE inbox SET last_error = ? WHERE event_id = ?",
+                (error[:2000], event_id),
+            )
+            self._conn.commit()
+
+    def inbox_count(self, status: Optional[str] = None) -> int:
+        with self._lock:
+            if status is None:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM inbox"
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM inbox WHERE status = ?",
+                    (status,),
+                ).fetchone()
+        return int(row["n"])
+
+    def inbox_stale_count(self, older_than_secs: float = 300.0) -> int:
+        """Rows still 'processing' whose claim is older than the threshold.
+
+        Non-zero means a handler crashed mid-flight (or is genuinely stuck).
+        """
+        cutoff = time.time() - older_than_secs
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM inbox "
+                "WHERE status = 'processing' AND claimed_at < ?",
+                (cutoff,),
+            ).fetchone()
+        return int(row["n"])
+
+    def prune_inbox(self, keep_secs: float = 14 * 86400.0) -> int:
+        """Delete processed events older than keep_secs. Returns rows removed."""
+        cutoff = time.time() - keep_secs
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM inbox WHERE status = 'processed' AND processed_at < ?",
+                (cutoff,),
+            )
+            self._conn.commit()
+        return cur.rowcount
