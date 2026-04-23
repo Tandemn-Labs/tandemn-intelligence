@@ -497,6 +497,7 @@ async def decide(req: DecideRequest):
             "objective",
             "preferred_gpu_types",
             "max_total_gpus",
+            "cost_roofline_usd",
             "region",
             "preferred_market",
             "quantization",
@@ -519,6 +520,9 @@ async def decide(req: DecideRequest):
             "preferred_gpu_types": d.get("preferred_gpu_types"),
             "max_total_gpus": int(d["max_total_gpus"])
             if d.get("max_total_gpus") is not None
+            else None,
+            "cost_roofline_usd": float(d["cost_roofline_usd"])
+            if d.get("cost_roofline_usd") is not None
             else None,
             "region": d.get("region"),
             "preferred_market": d.get("preferred_market"),

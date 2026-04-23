@@ -203,6 +203,57 @@ class TestDecide:
         assert pending[0]["region"] == "us-east-1"
 
     @pytest.mark.asyncio
+    async def test_decide_accepts_cost_roofline_field(self, client):
+        captured = {}
+
+        async def decide_capture(job_request, resource_map):
+            captured["cost_roofline_usd"] = job_request.cost_roofline_usd
+            return _mock_decision(job_id=job_request.job_id)
+
+        app.state.agent.decide = decide_capture
+
+        resp = await client.post(
+            "/decide",
+            json={
+                "job_request": {
+                    "model_name": "Qwen/Qwen2.5-72B-Instruct",
+                    "task_type": "batch",
+                    "avg_input_tokens": 953,
+                    "avg_output_tokens": 1024,
+                    "num_requests": 5000,
+                    "slo_deadline_hours": 8.0,
+                    "objective": "cheapest",
+                    "cost_roofline_usd": 120.0,
+                },
+                "resource_map": {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                        }
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 192,
+                            "used_vcpus": 0,
+                        }
+                    ],
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert captured["cost_roofline_usd"] == 120.0
+
+    @pytest.mark.asyncio
     async def test_decide_preserves_incoming_job_id(self, client):
         captured = {}
 
