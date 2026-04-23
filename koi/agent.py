@@ -891,8 +891,25 @@ class KoiAgent:
                     }
                 )
 
-        # Sort by total cost
-        rows.sort(key=lambda r: r["total_cost"])
+        # Annotate soft budget preference before ranking.
+        for row in rows:
+            roofline = req.cost_roofline_usd
+            if roofline is None:
+                row["under_cost_roofline"] = True
+                row["cost_overage_usd"] = 0.0
+            else:
+                row["under_cost_roofline"] = row["total_cost"] <= roofline
+                row["cost_overage_usd"] = round(max(0.0, row["total_cost"] - roofline), 2)
+
+        # Sort by policy: SLO is hard, cost roofline is a soft preference,
+        # total job cost breaks ties within each bucket.
+        rows.sort(
+            key=lambda r: (
+                not r["meets_slo"],
+                not r["under_cost_roofline"],
+                r["total_cost"],
+            )
+        )
 
         # Annotate with availability from Beta priors
         _avail_cache: Dict[str, Dict] = {}
