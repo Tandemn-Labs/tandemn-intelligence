@@ -88,6 +88,15 @@ class TestJobRequest:
         )
         assert jr.quantization == "fp8"
 
+    def test_cost_roofline_field(self):
+        jr = JobRequest(
+            model_name="test",
+            avg_input_tokens=100,
+            avg_output_tokens=50,
+            cost_roofline_usd=42.5,
+        )
+        assert jr.cost_roofline_usd == 42.5
+
 
 class TestGPUResource:
     def test_available_gpus(self):

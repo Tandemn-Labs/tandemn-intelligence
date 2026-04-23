@@ -93,6 +93,7 @@ class JobRequest(BaseModel):
     # Optional user constraints
     preferred_gpu_types: Optional[List[str]] = None
     max_total_gpus: Optional[int] = None
+    cost_roofline_usd: Optional[float] = None
     region: Optional[str] = None
     preferred_market: Optional[Literal["spot", "on_demand"]] = None
     quantization: Optional[str] = None  # "fp8", "int8", or None (fp16 default)

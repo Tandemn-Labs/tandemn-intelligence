@@ -33,3 +33,6 @@ build/
 .idea/
 .vscode/
 *.swp
+
+# Local planning notes
+docs/plans/
