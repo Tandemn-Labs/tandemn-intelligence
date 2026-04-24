@@ -632,7 +632,7 @@ class TestCostTableRanking:
         # Explicit ban on positive-count scale
         assert "Do NOT call scale_chain_tool with a positive count" in prompt
         assert "Projected total cost: $148.00" in prompt
-        assert "reduce cost while preserving SLO headroom" in prompt
+        assert "highest-ranked POLICY RANKING removal option" in prompt
 
     def test_trigger_prompt_ranks_cheaper_valid_scale_up_first(self, agent):
         group_id = "cost-job"
@@ -685,7 +685,7 @@ class TestCostTableRanking:
 
         assert "POLICY RANKING" in prompt
         assert "scale_up L40S TP=4 PP=1 count=1 [current_config]" in prompt
-        assert "scale_up A100-80GB TP=8 PP=1 count=1 [best_running]" in prompt
+        assert "scale_up A100-80GB TP=8 PP=1 count=1 [running:cost-job-r1]" in prompt
         assert prompt.index("scale_up L40S TP=4 PP=1 count=1") < prompt.index(
             "scale_up A100-80GB TP=8 PP=1 count=1"
         )

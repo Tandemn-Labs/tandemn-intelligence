@@ -21,6 +21,7 @@ from koi.runtime_policy import (
     RuntimeJobState,
     ScaleUpCandidate,
     RankedSuggestion,
+    filter_live_chains,
     rank_falling_behind_suggestions,
     rank_overprovisioned_suggestions,
 )
@@ -31,8 +32,10 @@ from koi.schemas import (
     JobRequest,
     MonitoringStatus,
     MonitoringTrigger,
+    Objective,
     PlacementConfig,
     ResourceMap,
+    TaskType,
 )
 from koi.tools.memory import AgenticMemory
 from koi.tools.orca_api import OrcaClient
@@ -671,7 +674,19 @@ class KoiAgent:
 
     async def handle_trigger(self, trigger: MonitoringTrigger) -> str:
         """Called by the monitor when a job needs attention."""
-        prompt = self._build_trigger_prompt(trigger)
+        precomputed: list[ScaleUpCandidate] = []
+        if trigger.trigger_type == MonitoringStatus.FALLING_BEHIND:
+            try:
+                precomputed = await self._build_redecide_candidates(trigger.job_tracker)
+            except Exception as e:
+                logger.warning(
+                    "redecide_candidates_failed",
+                    job_id=trigger.job_id,
+                    error=str(e),
+                )
+        prompt = self._build_trigger_prompt(
+            trigger, precomputed_candidates=precomputed
+        )
         tools = self._build_tools(monitor=self.monitor)
 
         logger.info(
@@ -795,13 +810,18 @@ class KoiAgent:
     # Pre-computed cost table
     # ------------------------------------------------------------------
 
-    def _build_cost_table(self, req: JobRequest, rm: ResourceMap) -> str:
+    def _build_cost_table(
+        self, req: JobRequest, rm: ResourceMap
+    ) -> tuple[str, list[dict]]:
         """Pre-compute total cost for known configs from memory + PerfDB.
-        Returns formatted text string sorted by total cost."""
+        Returns (formatted_text, rows) — both sorted by the same policy key."""
         total_tokens = req.total_tokens or 0
         if total_tokens == 0:
             self._last_cost_rows = []
-            return "COST TABLE: Cannot compute — total tokens unknown (num_requests not set)."
+            return (
+                "COST TABLE: Cannot compute — total tokens unknown (num_requests not set).",
+                [],
+            )
 
         lines = ["PRE-COMPUTED COST TABLE (sorted by total cost, cheapest first):"]
         lines.append(
@@ -965,9 +985,9 @@ class KoiAgent:
         if not rows:
             lines.append("  (no data — use tools to query PerfDB and physics)")
 
-        # Store structured rows for alternatives
+        # Store structured rows for alternatives (back-compat for /decide path)
         self._last_cost_rows = rows
-        return "\n".join(lines)
+        return "\n".join(lines), rows
 
     # ------------------------------------------------------------------
     # Prompt builders
@@ -987,7 +1007,7 @@ class KoiAgent:
         resources_text = get_resources(rm)
 
         # Pre-compute cost table from memory outcomes + PerfDB
-        cost_table = self._build_cost_table(req, rm)
+        cost_table, _ = self._build_cost_table(req, rm)
 
         sections = [
             f"PLACEMENT REQUEST:",
@@ -1033,7 +1053,11 @@ class KoiAgent:
         ]
         return "\n".join(s for s in sections if s is not None)
 
-    def _build_trigger_prompt(self, trigger: MonitoringTrigger) -> str:
+    def _build_trigger_prompt(
+        self,
+        trigger: MonitoringTrigger,
+        precomputed_candidates: Optional[list[ScaleUpCandidate]] = None,
+    ) -> str:
         """Build the user message for a monitoring trigger.
 
         For FALLING_BEHIND and OVER_PROVISIONED, the prompt puts *job-level*
@@ -1075,7 +1099,9 @@ class KoiAgent:
             f"  GPU mem BW: {tracker.get('gpu_mem_bw_util', 0):.0f}%",
         ]
 
-        ranked_suggestions = self._rank_runtime_policy_suggestions(trigger)
+        ranked_suggestions = self._rank_runtime_policy_suggestions(
+            trigger, precomputed_candidates=precomputed_candidates
+        )
 
         # Job-level headroom block (the primary signal for health triggers).
         #
@@ -1153,10 +1179,17 @@ class KoiAgent:
                     f"     post-action TPS={suggestion.projected_post_action_tps:.0f} | "
                     f"meets_slo={'yes' if suggestion.meets_slo else 'no'}"
                 )
-                if suggestion.projected_total_cost_usd is not None:
-                    sections.append(
-                        f"     projected total cost=${suggestion.projected_total_cost_usd:.2f}"
+                cost_bits = []
+                if suggestion.cost_per_mtoken_usd is not None:
+                    cost_bits.append(
+                        f"projected $/Mtok=${suggestion.cost_per_mtoken_usd:.2f}"
                     )
+                if suggestion.projected_total_cost_usd is not None:
+                    cost_bits.append(
+                        f"projected total cost=${suggestion.projected_total_cost_usd:.2f}"
+                    )
+                if cost_bits:
+                    sections.append("     " + " | ".join(cost_bits))
                 if suggestion.cost_overage_usd is not None:
                     sections.append(
                         f"     projected overage=${suggestion.cost_overage_usd:.2f}"
@@ -1355,8 +1388,88 @@ class KoiAgent:
 
         return "\n".join(sections)
 
+    async def _build_redecide_candidates(
+        self, tracker: dict
+    ) -> list[ScaleUpCandidate]:
+        """Re-run the decide-style cost table with a fresh ResourceMap.
+
+        Returns up to 6 viable scale-up candidates (meets_slo=True). Returns
+        an empty list if re-decide is not feasible (missing decision,
+        Orca unreachable, etc.) — callers fall back to their narrow set.
+        """
+        decision_id = tracker.get("decision_id")
+        if not decision_id or not self.memory or not self.orca:
+            return []
+        decision_meta = self.memory.get_decision(decision_id)
+        if not decision_meta or not decision_meta.get("model_name"):
+            return []
+        try:
+            raw = await self.orca.get_resources()
+            rm = parse_orca_resources(raw)
+            if self.ledger is not None:
+                rm = self.ledger.apply_to_resource_map(rm)
+        except Exception as e:
+            logger.warning(
+                "redecide_resource_fetch_failed",
+                job_id=tracker.get("job_id"),
+                error=str(e),
+            )
+            return []
+        market = decision_meta.get("market")
+        try:
+            req = JobRequest(
+                model_name=decision_meta["model_name"],
+                avg_input_tokens=int(decision_meta.get("avg_input_tokens") or 0),
+                avg_output_tokens=int(decision_meta.get("avg_output_tokens") or 0),
+                num_requests=decision_meta.get("num_requests"),
+                slo_deadline_hours=(
+                    float(decision_meta["slo_deadline_hours"])
+                    if decision_meta.get("slo_deadline_hours") is not None
+                    else None
+                ),
+                objective=Objective(decision_meta.get("objective", "cheapest")),
+                cost_roofline_usd=(
+                    float(decision_meta["cost_roofline_usd"])
+                    if decision_meta.get("cost_roofline_usd") is not None
+                    else None
+                ),
+                preferred_market=market if market in {"spot", "on_demand"} else None,
+                quantization=decision_meta.get("quantization"),
+            )
+        except Exception as e:
+            logger.warning(
+                "redecide_job_request_build_failed",
+                decision_id=decision_id,
+                error=str(e),
+            )
+            return []
+        _, cost_rows = self._build_cost_table(req, rm)
+        candidates: list[ScaleUpCandidate] = []
+        for row in cost_rows:
+            if not row.get("meets_slo"):
+                continue
+            tps = float(row.get("predicted_tps") or 0.0)
+            cost_hr = float(row.get("cost_per_hour") or 0.0)
+            if tps <= 0 or cost_hr <= 0:
+                continue
+            candidates.append(
+                ScaleUpCandidate(
+                    gpu_type=row["gpu_type"],
+                    tp=int(row["tp"]),
+                    pp=int(row["pp"]),
+                    predicted_tps=tps,
+                    cost_per_hour=cost_hr,
+                    source="redecide",
+                )
+            )
+            if len(candidates) >= 6:
+                break
+        return candidates
+
     def _rank_runtime_policy_suggestions(
-        self, trigger: MonitoringTrigger
+        self,
+        trigger: MonitoringTrigger,
+        precomputed_candidates: Optional[list[ScaleUpCandidate]] = None,
     ) -> list[RankedSuggestion]:
         tracker = trigger.job_tracker
         config = tracker.get("config", {})
@@ -1416,33 +1529,63 @@ class KoiAgent:
         )
 
         if trigger.trigger_type == MonitoringStatus.FALLING_BEHIND:
+            # Dedup priority for the [source] tag: current_config > redecide > running.
             candidates: dict[tuple[str, int, int], ScaleUpCandidate] = {}
 
+            # 1. current_config
             if predicted_tps > 0:
-                candidates[(str(config.get("gpu_type", "?")), int(config.get("tp", 1) or 1), int(config.get("pp", 1) or 1))] = ScaleUpCandidate(
-                    gpu_type=str(config.get("gpu_type", "?")),
-                    tp=int(config.get("tp", 1) or 1),
-                    pp=int(config.get("pp", 1) or 1),
+                key = (
+                    str(config.get("gpu_type", "?")),
+                    int(config.get("tp", 1) or 1),
+                    int(config.get("pp", 1) or 1),
+                )
+                candidates[key] = ScaleUpCandidate(
+                    gpu_type=key[0],
+                    tp=key[1],
+                    pp=key[2],
                     predicted_tps=predicted_tps,
                     cost_per_hour=predicted_cost_per_hour,
                     source="current_config",
                 )
 
-            if chain_states:
-                best_chain = max(chain_states, key=lambda chain: chain.smoothed_tps)
-                if best_chain.predicted_tps > 0:
-                    candidates[(best_chain.gpu_type, best_chain.tp, best_chain.pp)] = ScaleUpCandidate(
-                        gpu_type=best_chain.gpu_type,
-                        tp=best_chain.tp,
-                        pp=best_chain.pp,
-                        predicted_tps=best_chain.predicted_tps,
-                        cost_per_hour=best_chain.cost_per_hour,
-                        source="best_running",
+            # 2. precomputed (redecide) candidates from fresh cost table
+            for candidate in (precomputed_candidates or []):
+                key = (candidate.gpu_type, candidate.tp, candidate.pp)
+                if key not in candidates:
+                    candidates[key] = candidate
+
+            # 3. every live chain — observed TPS/cost beats prediction.
+            #    On collision with an existing candidate, overwrite numeric data
+            #    with observed values but keep the higher-priority source label.
+            for chain in filter_live_chains(chain_states):
+                observed_tps = (
+                    chain.smoothed_tps if chain.smoothed_tps > 0 else chain.predicted_tps
+                )
+                if observed_tps <= 0:
+                    continue
+                key = (chain.gpu_type, chain.tp, chain.pp)
+                if key in candidates:
+                    existing = candidates[key]
+                    candidates[key] = ScaleUpCandidate(
+                        gpu_type=existing.gpu_type,
+                        tp=existing.tp,
+                        pp=existing.pp,
+                        predicted_tps=observed_tps,
+                        cost_per_hour=chain.cost_per_hour,
+                        source=existing.source,
+                    )
+                else:
+                    candidates[key] = ScaleUpCandidate(
+                        gpu_type=chain.gpu_type,
+                        tp=chain.tp,
+                        pp=chain.pp,
+                        predicted_tps=observed_tps,
+                        cost_per_hour=chain.cost_per_hour,
+                        source=f"running:{chain.replica_id}",
                     )
 
-            return rank_falling_behind_suggestions(
-                job, chain_states, list(candidates.values())
-            )[:3]
+            capped = list(candidates.values())[:8]
+            return rank_falling_behind_suggestions(job, chain_states, capped)[:3]
 
         if trigger.trigger_type == MonitoringStatus.OVER_PROVISIONED:
             return rank_overprovisioned_suggestions(job, chain_states)[:3]
