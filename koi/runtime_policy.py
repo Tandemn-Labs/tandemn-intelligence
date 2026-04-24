@@ -52,6 +52,7 @@ class RankedSuggestion:
     replica_id: Optional[str]
     projected_post_action_tps: float
     projected_total_cost_usd: Optional[float]
+    cost_per_mtoken_usd: Optional[float]
     meets_slo: bool
     cost_overage_usd: Optional[float]
     priority_tps: float = 0.0
@@ -89,39 +90,21 @@ def _project_post_action_total_cost(
     return spent_so_far + (post_action_cost_per_hour * remaining_hours)
 
 
-def filter_dominated_actions(
-    candidates: list[RankedSuggestion],
-) -> list[RankedSuggestion]:
-    kept: list[RankedSuggestion] = []
-    for candidate in candidates:
-        dominated = False
-        for other in candidates:
-            if other is candidate:
-                continue
-            if other.meets_slo != candidate.meets_slo:
-                continue
-            same_or_better_tps = (
-                other.projected_post_action_tps >= candidate.projected_post_action_tps
-            )
-            same_or_lower_cost = (
-                other.projected_total_cost_usd is not None
-                and candidate.projected_total_cost_usd is not None
-                and other.projected_total_cost_usd <= candidate.projected_total_cost_usd
-            )
-            strictly_better = (
-                other.projected_post_action_tps > candidate.projected_post_action_tps
-                or (
-                    other.projected_total_cost_usd is not None
-                    and candidate.projected_total_cost_usd is not None
-                    and other.projected_total_cost_usd < candidate.projected_total_cost_usd
-                )
-            )
-            if same_or_better_tps and same_or_lower_cost and strictly_better:
-                dominated = True
-                break
-        if not dominated:
-            kept.append(candidate)
-    return kept
+def _project_cost_per_mtoken(
+    post_action_cost_per_hour: float,
+    post_action_tps: float,
+) -> Optional[float]:
+    """Cost in USD per million tokens at the post-action rate.
+
+    Independent of tokens_remaining and ignores sunk cost — the right
+    primitive for ranking "which option gives me the cheapest tokens
+    going forward".
+    """
+    if post_action_cost_per_hour <= 0:
+        return None
+    if post_action_tps <= 0:
+        return inf
+    return (post_action_cost_per_hour / post_action_tps) * (1_000_000.0 / 3600.0)
 
 
 def rank_falling_behind_suggestions(
@@ -136,13 +119,15 @@ def rank_falling_behind_suggestions(
 
     for candidate in candidates:
         post_action_tps = job.aggregate_tps + max(0.0, candidate.predicted_tps)
+        post_action_hourly = current_hourly_cost + max(0.0, candidate.cost_per_hour)
         projected_total_cost = _project_post_action_total_cost(
             current_hourly_cost,
-            current_hourly_cost + max(0.0, candidate.cost_per_hour),
+            post_action_hourly,
             job.elapsed_hours,
             job.tokens_remaining,
             post_action_tps,
         )
+        cost_per_mtoken = _project_cost_per_mtoken(post_action_hourly, post_action_tps)
         meets_slo = post_action_tps >= required_tps
         _, overage = evaluate_cost_roofline(projected_total_cost, job.cost_roofline_usd)
         suggestions.append(
@@ -158,6 +143,7 @@ def rank_falling_behind_suggestions(
                 replica_id=None,
                 projected_post_action_tps=post_action_tps,
                 projected_total_cost_usd=projected_total_cost,
+                cost_per_mtoken_usd=cost_per_mtoken,
                 meets_slo=meets_slo,
                 cost_overage_usd=overage,
                 priority_tps=candidate.predicted_tps,
@@ -167,8 +153,8 @@ def rank_falling_behind_suggestions(
     suggestions.sort(
         key=lambda suggestion: (
             not suggestion.meets_slo,
-            suggestion.projected_total_cost_usd
-            if suggestion.projected_total_cost_usd is not None
+            suggestion.cost_per_mtoken_usd
+            if suggestion.cost_per_mtoken_usd is not None
             else inf,
             suggestion.label,
         )
@@ -189,13 +175,15 @@ def rank_overprovisioned_suggestions(
 
     for chain in live_chains:
         post_action_tps = max(0.0, job.aggregate_tps - max(0.0, chain.smoothed_tps))
+        post_action_hourly = max(0.0, current_hourly_cost - max(0.0, chain.cost_per_hour))
         projected_total_cost = _project_post_action_total_cost(
             current_hourly_cost,
-            max(0.0, current_hourly_cost - max(0.0, chain.cost_per_hour)),
+            post_action_hourly,
             job.elapsed_hours,
             job.tokens_remaining,
             post_action_tps,
         )
+        cost_per_mtoken = _project_cost_per_mtoken(post_action_hourly, post_action_tps)
         meets_slo = post_action_tps >= safe_floor
         _, overage = evaluate_cost_roofline(projected_total_cost, job.cost_roofline_usd)
         suggestions.append(
@@ -209,6 +197,7 @@ def rank_overprovisioned_suggestions(
                 replica_id=chain.replica_id,
                 projected_post_action_tps=post_action_tps,
                 projected_total_cost_usd=projected_total_cost,
+                cost_per_mtoken_usd=cost_per_mtoken,
                 meets_slo=meets_slo,
                 cost_overage_usd=overage,
                 priority_tps=chain.smoothed_tps,
@@ -219,8 +208,8 @@ def rank_overprovisioned_suggestions(
     suggestions.sort(
         key=lambda suggestion: (
             suggestion.priority_tps,
-            suggestion.projected_total_cost_usd
-            if suggestion.projected_total_cost_usd is not None
+            suggestion.cost_per_mtoken_usd
+            if suggestion.cost_per_mtoken_usd is not None
             else inf,
             suggestion.replica_id or "",
         )

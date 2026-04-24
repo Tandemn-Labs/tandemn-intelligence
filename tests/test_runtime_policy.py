@@ -3,7 +3,6 @@ from koi.runtime_policy import (
     RuntimeJobState,
     ScaleUpCandidate,
     compute_required_tps,
-    filter_dominated_actions,
     rank_falling_behind_suggestions,
     rank_overprovisioned_suggestions,
 )
@@ -24,13 +23,14 @@ def test_evaluate_cost_roofline_returns_infinite_overage_for_infinite_cost():
     assert overage == float("inf")
 
 
-def test_filter_dominated_actions_drops_more_expensive_no_better_option():
+def test_rank_falling_behind_uses_cost_per_mtoken_for_ordering():
+    """Same post-action TPS, different $/hour → cheaper $/Mtok wins."""
     job = RuntimeJobState(
         trigger_type="falling_behind",
-        elapsed_hours=1.0,
+        elapsed_hours=0.5,
         time_left_hours=1.0,
         tokens_remaining=3_600_000,
-        aggregate_tps=500.0,
+        aggregate_tps=600.0,
         cost_roofline_usd=100.0,
     )
     chains = [
@@ -39,36 +39,36 @@ def test_filter_dominated_actions_drops_more_expensive_no_better_option():
             gpu_type="L40S",
             tp=4,
             pp=1,
-            smoothed_tps=500.0,
-            predicted_tps=500.0,
+            smoothed_tps=600.0,
+            predicted_tps=600.0,
             cost_per_hour=10.0,
             status="running",
         )
     ]
     candidates = [
         ScaleUpCandidate(
-            gpu_type="L40S",
-            tp=4,
-            pp=1,
-            predicted_tps=700.0,
-            cost_per_hour=10.0,
-            source="current_config",
-        ),
-        ScaleUpCandidate(
             gpu_type="A100-80GB",
             tp=8,
             pp=1,
-            predicted_tps=700.0,
+            predicted_tps=600.0,
             cost_per_hour=20.0,
-            source="best_running",
+            source="expensive",
+        ),
+        ScaleUpCandidate(
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            predicted_tps=600.0,
+            cost_per_hour=10.0,
+            source="cheap",
         ),
     ]
 
     ranked = rank_falling_behind_suggestions(job, chains, candidates)
-    filtered = filter_dominated_actions(ranked)
 
-    assert len(filtered) == 1
-    assert filtered[0].gpu_type == "L40S"
+    assert ranked[0].source == "cheap"
+    assert ranked[0].cost_per_mtoken_usd is not None
+    assert ranked[0].cost_per_mtoken_usd < ranked[1].cost_per_mtoken_usd
 
 
 def test_rank_falling_behind_prefers_cheapest_valid_scale_up():
