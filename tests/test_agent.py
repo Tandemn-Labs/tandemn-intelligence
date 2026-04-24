@@ -755,6 +755,148 @@ class TestCostTableRanking:
         )
 
 
+class TestRedecideCandidates:
+    @pytest.mark.asyncio
+    async def test_build_redecide_surfaces_fresh_configs(self, perfdb, memory):
+        """Re-decide pulls fresh ResourceMap from Orca and returns viable configs."""
+
+        async def fake_get_resources():
+            return {
+                "instances": [
+                    {
+                        "instance_type": "g6e.12xlarge",
+                        "gpu_type": "L40S",
+                        "gpus_per_instance": 4,
+                        "vcpus": 48,
+                        "quota_family": "G",
+                        "gpu_memory_gb": 48.0,
+                        "cost_per_instance_hour_usd": 10.49,
+                    },
+                ],
+                "quotas": [
+                    {
+                        "family": "G",
+                        "market": "on_demand",
+                        "region": "us-east-1",
+                        "baseline_vcpus": 10000,
+                        "used_vcpus": 0,
+                    }
+                ],
+                "vpc_id": "vpc-test",
+                "region": "us-east-1",
+            }
+
+        orca_stub = SimpleNamespace(get_resources=fake_get_resources)
+        agent = KoiAgent(perfdb=perfdb, memory=memory, orca=orca_stub, api_key="test-key")
+        dec_id = memory.record_decision(
+            job_id="job-re",
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=10.49,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            num_requests=5000,
+            market="on_demand",
+        )
+
+        candidates = await agent._build_redecide_candidates(
+            {"decision_id": dec_id, "job_id": "job-re"}
+        )
+
+        assert candidates, "expected at least one redecide candidate"
+        assert all(c.source == "redecide" for c in candidates)
+        assert any(c.gpu_type == "L40S" for c in candidates)
+
+    @pytest.mark.asyncio
+    async def test_build_redecide_returns_empty_when_orca_unreachable(
+        self, perfdb, memory
+    ):
+        """If Orca raises, we fall back silently — trigger path uses narrow set."""
+
+        async def raising_get_resources():
+            raise RuntimeError("orca is down")
+
+        orca_stub = SimpleNamespace(get_resources=raising_get_resources)
+        agent = KoiAgent(perfdb=perfdb, memory=memory, orca=orca_stub, api_key="test-key")
+        dec_id = memory.record_decision(
+            job_id="job-re",
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=10.49,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            num_requests=5000,
+        )
+
+        candidates = await agent._build_redecide_candidates(
+            {"decision_id": dec_id, "job_id": "job-re"}
+        )
+        assert candidates == []
+
+    @pytest.mark.asyncio
+    async def test_build_redecide_returns_empty_without_decision(
+        self, perfdb, memory
+    ):
+        """Missing decision_id or unknown decision → empty list, no crash."""
+        agent = KoiAgent(perfdb=perfdb, memory=memory, api_key="test-key")
+        assert await agent._build_redecide_candidates({}) == []
+        assert await agent._build_redecide_candidates(
+            {"decision_id": "dec-nonexistent"}
+        ) == []
+
+    def test_trigger_prompt_surfaces_redecide_candidates(self, agent):
+        """Precomputed [redecide] candidates appear in the POLICY RANKING block."""
+        from koi.runtime_policy import ScaleUpCandidate
+
+        precomputed = [
+            ScaleUpCandidate(
+                gpu_type="H100",
+                tp=2,
+                pp=1,
+                predicted_tps=2500.0,
+                cost_per_hour=15.0,
+                source="redecide",
+            )
+        ]
+        trigger = MonitoringTrigger(
+            trigger_type=MonitoringStatus.FALLING_BEHIND,
+            job_id="job-re",
+            job_tracker={
+                "config": {"gpu_type": "L40S", "tp": 4, "pp": 1, "dp": 1},
+                "slo_deadline_hours": 1.0,
+                "elapsed_hours": 0.5,
+                "tokens_remaining": 3_600_000,
+                "smoothed_tps": 600.0,
+                "predicted_tps": 1200.0,
+                "predicted_cost_per_hour": 10.0,
+                "slo_headroom_pct": -10.0,
+            },
+            diagnosis_hint="Headroom=-10%",
+        )
+        prompt = agent._build_trigger_prompt(
+            trigger, precomputed_candidates=precomputed
+        )
+
+        assert "[redecide]" in prompt
+        assert "scale_up H100 TP=2 PP=1 count=1 [redecide]" in prompt
+
+
 class TestParseDecision:
     def test_parse_decision_sets_cost_roofline_warning_fields(
         self, agent, resource_map
