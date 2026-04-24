@@ -1286,8 +1286,12 @@ class KoiAgent:
                 "working as designed."
             )
             sections.append(
-                "Prefer the highest-ranked POLICY RANKING option that restores SLO. "
-                "If you choose a lower-ranked option, explain why."
+                "For scale-up, ONLY call scale_chain_tool with a config from the "
+                "POLICY RANKING above. Do NOT use query_perfdb to discover alternative "
+                "configs — the POLICY RANKING already contains the cost-optimal options. "
+                "You may use get_gpu_physics_tool or get_quota_status_tool to VERIFY "
+                "a POLICY RANKING option, but your final scale_chain_tool call MUST "
+                "match one of the listed configs."
             )
             sections.append(
                 "Do NOT use record_outcome_tool — this job is still RUNNING."

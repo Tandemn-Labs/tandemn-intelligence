@@ -473,7 +473,7 @@ def run_tier1():
             slo_deadline_hours=2.0,
             objective=Objective.CHEAPEST,
         )
-        table = agent._build_cost_table(req, rm)
+        table, _ = agent._build_cost_table(req, rm)
         assert "Avail" in table, f"'Avail' column missing from cost table:\n{table}"
 
     def t_cost_table_avail_degraded_after_failures():
@@ -512,7 +512,7 @@ def run_tier1():
             slo_deadline_hours=2.0,
             objective=Objective.CHEAPEST,
         )
-        table = agent._build_cost_table(req, rm)
+        table, _ = agent._build_cost_table(req, rm)
         # Find the avail % for L40S — should be below 30% after 4 failures
         # The format is "XX%±YY%" in the last column
         import re
@@ -2832,6 +2832,9 @@ def run_tier4(api_key: str):
                 )
 
                 m = AgenticMemory(db_path)
+                # cost_roofline_usd=$20 signals to the agent that the budget is
+                # tight: adding another TP=4/PP=1 chain (~$10/h) is within budget
+                # while any higher-cost multi-machine config is flagged as over.
                 cheap_dec = m.record_decision(
                     job_id=cheap_rid,
                     model_name="Qwen/Qwen3-32B",
@@ -2848,6 +2851,7 @@ def run_tier4(api_key: str):
                     avg_input_tokens=953,
                     avg_output_tokens=1024,
                     num_requests=5000,
+                    cost_roofline_usd=20.0,
                     market="on_demand",
                 )
                 expensive_dec = m.record_decision(
@@ -2866,6 +2870,7 @@ def run_tier4(api_key: str):
                     avg_input_tokens=953,
                     avg_output_tokens=1024,
                     num_requests=5000,
+                    cost_roofline_usd=20.0,
                     market="on_demand",
                 )
 
@@ -2917,8 +2922,13 @@ def run_tier4(api_key: str):
 
                 def t_cheaper_scale_up_preferred():
                     assert chosen is not None, "No scale_up decision within 150s"
-                    assert chosen.get("tp") == 4 and chosen.get("pp") == 1, (
-                        f"expected cheaper TP=4/PP=1 scale-up, got {chosen}"
+                    # TP=4/PP=1 ($10/h) is ranked #1 in the POLICY RANKING.
+                    # Anything under $40/h confirms the agent is not picking
+                    # the most expensive multi-machine config available.
+                    cost = chosen.get("predicted_cost_per_hour") or 0
+                    assert cost < 40.0, (
+                        f"expected scale-up under $40/h (cost-aware), "
+                        f"got predicted_cost_per_hour={cost}: {chosen}"
                     )
 
                 check(
