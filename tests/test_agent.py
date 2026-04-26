@@ -345,6 +345,35 @@ class TestCostTableRanking:
         assert row["under_cost_roofline"] is False
         assert row["cost_overage_usd"] > 0
 
+    def test_build_cost_table_uses_none_without_cost_roofline(self, memory, resource_map):
+        class StubPerfDB:
+            def query(self, **kwargs):
+                return [
+                    {
+                        "gpu_type": "L40S",
+                        "tp": 4,
+                        "pp": 1,
+                        "dp": 1,
+                        "throughput_tps": 1200.0,
+                    }
+                ]
+
+        agent = KoiAgent(perfdb=StubPerfDB(), memory=memory, api_key="test-key")
+        req = JobRequest(
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            num_requests=5000,
+            slo_deadline_hours=8.0,
+            preferred_market="on_demand",
+        )
+
+        agent._build_cost_table(req, resource_map)
+
+        row = agent._last_cost_rows[0]
+        assert row["under_cost_roofline"] is None
+        assert row["cost_overage_usd"] is None
+
     def test_build_cost_table_sorts_slo_meeting_before_cheaper_slo_miss(
         self, memory, resource_map
     ):
@@ -434,7 +463,18 @@ class TestCostTableRanking:
 
     # ----- Area 2 tests: job-headroom-first trigger prompt ------------------
 
-    def _make_chain_tracker(self, job_id, group_id, gpu, tp, pp, tps, status):
+    def _make_chain_tracker(
+        self,
+        job_id,
+        group_id,
+        gpu,
+        tp,
+        pp,
+        tps,
+        status,
+        predicted_tps=None,
+        predicted_cost_per_hour=10.0,
+    ):
         """Build a live JobTracker for a mocked chain."""
         return JobTracker(
             job_id=job_id,
@@ -455,7 +495,8 @@ class TestCostTableRanking:
             ),
             slo_deadline_hours=1.0,
             total_tokens=12_000_000,
-            predicted_tps=tps,
+            predicted_tps=tps if predicted_tps is None else predicted_tps,
+            predicted_cost_per_hour=predicted_cost_per_hour,
             smoothed_tps=tps,
             status=status,
         )
@@ -591,7 +632,269 @@ class TestCostTableRanking:
         # Explicit ban on positive-count scale
         assert "Do NOT call scale_chain_tool with a positive count" in prompt
         assert "Projected total cost: $148.00" in prompt
-        assert "reduce cost while preserving SLO headroom" in prompt
+        assert "highest-ranked POLICY RANKING removal option" in prompt
+
+    def test_trigger_prompt_ranks_cheaper_valid_scale_up_first(self, agent):
+        group_id = "cost-job"
+        chains = {
+            "cost-job-r0": self._make_chain_tracker(
+                "cost-job-r0",
+                group_id,
+                "L40S",
+                4,
+                1,
+                600.0,
+                MonitoringStatus.ON_TRACK,
+                predicted_tps=1200.0,
+                predicted_cost_per_hour=10.0,
+            ),
+            "cost-job-r1": self._make_chain_tracker(
+                "cost-job-r1",
+                group_id,
+                "A100-80GB",
+                8,
+                1,
+                900.0,
+                MonitoringStatus.ON_TRACK,
+                predicted_tps=1200.0,
+                predicted_cost_per_hour=20.0,
+            ),
+        }
+        fake_monitor = SimpleNamespace(get_group_chains=lambda _gid: chains)
+        agent.monitor = fake_monitor
+        try:
+            trigger = MonitoringTrigger(
+                trigger_type=MonitoringStatus.FALLING_BEHIND,
+                job_id="cost-job-r0",
+                job_tracker={
+                    "group_id": group_id,
+                    "config": {"gpu_type": "L40S", "tp": 4, "pp": 1, "dp": 1},
+                    "slo_deadline_hours": 1.0,
+                    "elapsed_hours": 0.5,
+                    "tokens_remaining": 3_600_000,
+                    "smoothed_tps": 600.0,
+                    "predicted_tps": 1200.0,
+                    "predicted_cost_per_hour": 10.0,
+                    "slo_headroom_pct": -10.0,
+                },
+                diagnosis_hint="Headroom=-10%, TPS=1500",
+            )
+            prompt = agent._build_trigger_prompt(trigger)
+        finally:
+            agent.monitor = None
+
+        assert "POLICY RANKING" in prompt
+        assert "scale_up L40S TP=4 PP=1 count=1 [current_config]" in prompt
+        assert "scale_up A100-80GB TP=8 PP=1 count=1 [running:cost-job-r1]" in prompt
+        assert prompt.index("scale_up L40S TP=4 PP=1 count=1") < prompt.index(
+            "scale_up A100-80GB TP=8 PP=1 count=1"
+        )
+
+    def test_trigger_prompt_ranks_safe_lowest_tps_removal_first(self, agent):
+        group_id = "over-job"
+        chains = {
+            "over-job-r-fast": self._make_chain_tracker(
+                "over-job-r-fast",
+                group_id,
+                "A100-80GB",
+                8,
+                1,
+                1500.0,
+                MonitoringStatus.ON_TRACK,
+                predicted_cost_per_hour=20.0,
+            ),
+            "over-job-r-mid": self._make_chain_tracker(
+                "over-job-r-mid",
+                group_id,
+                "L40S",
+                4,
+                1,
+                900.0,
+                MonitoringStatus.ON_TRACK,
+                predicted_cost_per_hour=10.0,
+            ),
+            "over-job-r-slow": self._make_chain_tracker(
+                "over-job-r-slow",
+                group_id,
+                "L40S",
+                4,
+                1,
+                600.0,
+                MonitoringStatus.ON_TRACK,
+                predicted_cost_per_hour=10.0,
+            ),
+        }
+        fake_monitor = SimpleNamespace(get_group_chains=lambda _gid: chains)
+        agent.monitor = fake_monitor
+        try:
+            trigger = MonitoringTrigger(
+                trigger_type=MonitoringStatus.OVER_PROVISIONED,
+                job_id="over-job-r-fast",
+                job_tracker={
+                    "group_id": group_id,
+                    "config": {"gpu_type": "A100-80GB", "tp": 8, "pp": 1, "dp": 1},
+                    "slo_deadline_hours": 4.0,
+                    "elapsed_hours": 0.5,
+                    "tokens_remaining": 2_000_000,
+                    "smoothed_tps": 1500.0,
+                    "predicted_tps": 1500.0,
+                    "predicted_cost_per_hour": 20.0,
+                    "slo_headroom_pct": 95.0,
+                },
+                diagnosis_hint="Headroom=95%, can shed replicas",
+            )
+            prompt = agent._build_trigger_prompt(trigger)
+        finally:
+            agent.monitor = None
+
+        assert "POLICY RANKING" in prompt
+        assert "kill_replica over-job-r-slow" in prompt
+        assert "kill_replica over-job-r-mid" in prompt
+        assert prompt.index("kill_replica over-job-r-slow") < prompt.index(
+            "kill_replica over-job-r-mid"
+        )
+
+
+class TestRedecideCandidates:
+    @pytest.mark.asyncio
+    async def test_build_redecide_surfaces_fresh_configs(self, perfdb, memory):
+        """Re-decide pulls fresh ResourceMap from Orca and returns viable configs."""
+
+        async def fake_get_resources():
+            return {
+                "instances": [
+                    {
+                        "instance_type": "g6e.12xlarge",
+                        "gpu_type": "L40S",
+                        "gpus_per_instance": 4,
+                        "vcpus": 48,
+                        "quota_family": "G",
+                        "gpu_memory_gb": 48.0,
+                        "cost_per_instance_hour_usd": 10.49,
+                    },
+                ],
+                "quotas": [
+                    {
+                        "family": "G",
+                        "market": "on_demand",
+                        "region": "us-east-1",
+                        "baseline_vcpus": 10000,
+                        "used_vcpus": 0,
+                    }
+                ],
+                "vpc_id": "vpc-test",
+                "region": "us-east-1",
+            }
+
+        orca_stub = SimpleNamespace(get_resources=fake_get_resources)
+        agent = KoiAgent(perfdb=perfdb, memory=memory, orca=orca_stub, api_key="test-key")
+        dec_id = memory.record_decision(
+            job_id="job-re",
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=10.49,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            num_requests=5000,
+            market="on_demand",
+        )
+
+        candidates = await agent._build_redecide_candidates(
+            {"decision_id": dec_id, "job_id": "job-re"}
+        )
+
+        assert candidates, "expected at least one redecide candidate"
+        assert all(c.source == "redecide" for c in candidates)
+        assert any(c.gpu_type == "L40S" for c in candidates)
+
+    @pytest.mark.asyncio
+    async def test_build_redecide_returns_empty_when_orca_unreachable(
+        self, perfdb, memory
+    ):
+        """If Orca raises, we fall back silently — trigger path uses narrow set."""
+
+        async def raising_get_resources():
+            raise RuntimeError("orca is down")
+
+        orca_stub = SimpleNamespace(get_resources=raising_get_resources)
+        agent = KoiAgent(perfdb=perfdb, memory=memory, orca=orca_stub, api_key="test-key")
+        dec_id = memory.record_decision(
+            job_id="job-re",
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=10.49,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            num_requests=5000,
+        )
+
+        candidates = await agent._build_redecide_candidates(
+            {"decision_id": dec_id, "job_id": "job-re"}
+        )
+        assert candidates == []
+
+    @pytest.mark.asyncio
+    async def test_build_redecide_returns_empty_without_decision(
+        self, perfdb, memory
+    ):
+        """Missing decision_id or unknown decision → empty list, no crash."""
+        agent = KoiAgent(perfdb=perfdb, memory=memory, api_key="test-key")
+        assert await agent._build_redecide_candidates({}) == []
+        assert await agent._build_redecide_candidates(
+            {"decision_id": "dec-nonexistent"}
+        ) == []
+
+    def test_trigger_prompt_surfaces_redecide_candidates(self, agent):
+        """Precomputed [redecide] candidates appear in the POLICY RANKING block."""
+        from koi.runtime_policy import ScaleUpCandidate
+
+        precomputed = [
+            ScaleUpCandidate(
+                gpu_type="H100",
+                tp=2,
+                pp=1,
+                predicted_tps=2500.0,
+                cost_per_hour=15.0,
+                source="redecide",
+            )
+        ]
+        trigger = MonitoringTrigger(
+            trigger_type=MonitoringStatus.FALLING_BEHIND,
+            job_id="job-re",
+            job_tracker={
+                "config": {"gpu_type": "L40S", "tp": 4, "pp": 1, "dp": 1},
+                "slo_deadline_hours": 1.0,
+                "elapsed_hours": 0.5,
+                "tokens_remaining": 3_600_000,
+                "smoothed_tps": 600.0,
+                "predicted_tps": 1200.0,
+                "predicted_cost_per_hour": 10.0,
+                "slo_headroom_pct": -10.0,
+            },
+            diagnosis_hint="Headroom=-10%",
+        )
+        prompt = agent._build_trigger_prompt(
+            trigger, precomputed_candidates=precomputed
+        )
+
+        assert "[redecide]" in prompt
+        assert "scale_up H100 TP=2 PP=1 count=1 [redecide]" in prompt
 
 
 class TestParseDecision:

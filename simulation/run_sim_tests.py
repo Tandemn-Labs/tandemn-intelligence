@@ -473,7 +473,7 @@ def run_tier1():
             slo_deadline_hours=2.0,
             objective=Objective.CHEAPEST,
         )
-        table = agent._build_cost_table(req, rm)
+        table, _ = agent._build_cost_table(req, rm)
         assert "Avail" in table, f"'Avail' column missing from cost table:\n{table}"
 
     def t_cost_table_avail_degraded_after_failures():
@@ -512,7 +512,7 @@ def run_tier1():
             slo_deadline_hours=2.0,
             objective=Objective.CHEAPEST,
         )
-        table = agent._build_cost_table(req, rm)
+        table, _ = agent._build_cost_table(req, rm)
         # Find the avail % for L40S — should be below 30% after 4 failures
         # The format is "XX%±YY%" in the last column
         import re
@@ -2806,6 +2806,138 @@ def run_tier4(api_key: str):
     except RuntimeError as e:
         skip("agent scales up without killing fast replica", str(e))
         skip("fast chain survives the falling_behind trigger", str(e))
+
+    # ── T4.5: FALLING_BEHIND → cheaper valid scale-up preferred ────────────
+    section("T4.5  FALLING_BEHIND → cheaper valid scale-up preferred")
+
+    try:
+        fast_env = {"KOI_WARMUP_MINUTES": "0"}
+        with koi_server(
+            api_key=api_key, orca_url=ORCA_URL, extra_env=fast_env
+        ) as db_path:
+            with mock_orca_server(replicas=2, tps=1200):
+                from koi.tools.memory import AgenticMemory
+
+                group_id, running, _ = _get_sim_replicas()
+                if not running:
+                    skip("agent prefers cheaper valid scale-up", "no replicas")
+                    return
+
+                rids = sorted(running.keys())
+                cheap_rid, expensive_rid = rids[0], rids[1]
+                requests.post(
+                    f"{ORCA_URL}/sim/set-tps/{expensive_rid}",
+                    json={"tps": 1800},
+                    timeout=5,
+                )
+
+                m = AgenticMemory(db_path)
+                # cost_roofline_usd=$20 signals to the agent that the budget is
+                # tight: adding another TP=4/PP=1 chain (~$10/h) is within budget
+                # while any higher-cost multi-machine config is flagged as over.
+                cheap_dec = m.record_decision(
+                    job_id=cheap_rid,
+                    model_name="Qwen/Qwen3-32B",
+                    instance_type="g6e.12xlarge",
+                    gpu_type="L40S",
+                    tp=4,
+                    pp=1,
+                    dp=1,
+                    num_gpus=4,
+                    predicted_tps=1200.0,
+                    predicted_cost_per_hour=10.0,
+                    slo_deadline_hours=1.0,
+                    objective="cheapest",
+                    avg_input_tokens=953,
+                    avg_output_tokens=1024,
+                    num_requests=5000,
+                    cost_roofline_usd=20.0,
+                    market="on_demand",
+                )
+                expensive_dec = m.record_decision(
+                    job_id=expensive_rid,
+                    model_name="Qwen/Qwen3-32B",
+                    instance_type="g6e.48xlarge",
+                    gpu_type="L40S",
+                    tp=8,
+                    pp=1,
+                    dp=1,
+                    num_gpus=8,
+                    predicted_tps=1800.0,
+                    predicted_cost_per_hour=20.0,
+                    slo_deadline_hours=1.0,
+                    objective="cheapest",
+                    avg_input_tokens=953,
+                    avg_output_tokens=1024,
+                    num_requests=5000,
+                    cost_roofline_usd=20.0,
+                    market="on_demand",
+                )
+
+                post(
+                    f"{KOI_URL}/job/started",
+                    {
+                        "job_id": cheap_rid,
+                        "decision_id": cheap_dec,
+                        "group_id": group_id,
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.12xlarge",
+                        "tp": 4,
+                        "pp": 1,
+                        "dp": 1,
+                        "slo_deadline_hours": 1.0,
+                        "total_tokens": 14_400_000,
+                        "predicted_tps": 1200.0,
+                    },
+                )
+                post(
+                    f"{KOI_URL}/job/started",
+                    {
+                        "job_id": expensive_rid,
+                        "decision_id": expensive_dec,
+                        "group_id": group_id,
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.48xlarge",
+                        "tp": 8,
+                        "pp": 1,
+                        "dp": 1,
+                        "slo_deadline_hours": 1.0,
+                        "total_tokens": 14_400_000,
+                        "predicted_tps": 1800.0,
+                    },
+                )
+                time.sleep(8)
+
+                deadline = time.time() + 150
+                chosen = None
+                while time.time() < deadline:
+                    time.sleep(5)
+                    decs = AgenticMemory(db_path).query_decisions(limit=20)
+                    scale_decs = [d for d in decs if d.get("triggered_by") == "scale_up"]
+                    if scale_decs:
+                        chosen = scale_decs[0]
+                        break
+                    elapsed = int(time.time() - (deadline - 150))
+                    print(f"    waiting for cheaper scale_up preference... ({elapsed}s)")
+
+                def t_cheaper_scale_up_preferred():
+                    assert chosen is not None, "No scale_up decision within 150s"
+                    # TP=4/PP=1 ($10/h) is ranked #1 in the POLICY RANKING.
+                    # Anything under $40/h confirms the agent is not picking
+                    # the most expensive multi-machine config available.
+                    cost = chosen.get("predicted_cost_per_hour") or 0
+                    assert cost < 40.0, (
+                        f"expected scale-up under $40/h (cost-aware), "
+                        f"got predicted_cost_per_hour={cost}: {chosen}"
+                    )
+
+                check(
+                    "agent prefers cheaper valid scale-up",
+                    t_cheaper_scale_up_preferred,
+                )
+
+    except RuntimeError as e:
+        skip("agent prefers cheaper valid scale-up", str(e))
 
     # ── T4.4: OVER_PROVISIONED → kill at most one chain per trigger ─────────
     # Area 2's OVER_PROVISIONED framework says: kill AT MOST one chain per
