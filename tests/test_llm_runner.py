@@ -2,9 +2,15 @@
 from unittest.mock import patch
 
 import pytest
+from pydantic import BaseModel
 from pydantic_ai.models.test import TestModel
 
 from koi.llm.runner import KoiToolRunner
+
+
+class TypedChoice(BaseModel):
+    action_id: str
+    confidence: float
 
 
 @pytest.mark.asyncio
@@ -59,3 +65,34 @@ async def test_runner_returns_empty_string_when_no_output():
         )
     assert isinstance(tool_calls, int)
     assert isinstance(final_text, str)
+
+
+@pytest.mark.asyncio
+async def test_runner_typed_output_with_tools_counts_only_real_tools():
+    async def add_numbers(x: int, y: int) -> str:
+        """Add two integers and return the sum as a string."""
+        return str(x + y)
+
+    runner = KoiToolRunner(
+        model=TestModel(),
+        system_prompt="You are a bounded chooser.",
+        tools={"add_numbers": add_numbers},
+    )
+    with patch("koi.llm.runner.emit_event") as mock_emit:
+        tool_calls, output = await runner.run_typed(
+            "Choose an action after adding numbers",
+            label="harness",
+            job_id="job-typed",
+            max_iterations=5,
+            timeout=10.0,
+            output_type=TypedChoice,
+        )
+
+    assert tool_calls >= 1
+    assert isinstance(output, TypedChoice)
+    assert output.action_id == "a"
+    assert output.confidence == 0.0
+    assert mock_emit.call_count == tool_calls
+    assert all(
+        call.kwargs["tool"] == "add_numbers" for call in mock_emit.call_args_list
+    )
