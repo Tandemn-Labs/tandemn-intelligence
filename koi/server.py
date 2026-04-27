@@ -1217,8 +1217,21 @@ async def _replica_failed_impl(req: ReplicaFailedRequest) -> Dict[str, Any]:
         logger.info("replica_failed_dedup", job_id=req.job_id)
         return {"status": "already_failed", "job_id": req.job_id}
 
-    # Check if this was an intentional kill (from scale_chain_tool)
-    if req.job_id in monitor._koi_initiated_kills:
+    # Check if this was an intentional kill (from scale_chain_tool / Pscale).
+    # The marker can be consumed by either path that observes the kill first:
+    #   (a) this webhook (Orca → /job/replica-failed), or
+    #   (b) the monitor's own replica-liveness poll (`MonitoringLoop._poll_job`).
+    # If the monitor consumed the marker first, it set tracker.status to
+    # COMPLETED and added the replica to dead_replicas. We treat that case as
+    # an already-acknowledged intentional kill instead of falling through to
+    # the FAILED trigger path — otherwise Pscale's own kill would re-trigger
+    # a scale-up against itself ("self-fight").
+    intentional = (
+        req.job_id in monitor._koi_initiated_kills
+        or tracker.status == MonitoringStatus.COMPLETED
+        or req.job_id in tracker.dead_replicas
+    )
+    if intentional:
         monitor._koi_initiated_kills.discard(req.job_id)
         tracker.status = MonitoringStatus.COMPLETED
         tracker.smoothed_tps = 0

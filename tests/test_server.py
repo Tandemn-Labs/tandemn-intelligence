@@ -974,6 +974,61 @@ class TestReplicaFailed:
         )
 
     @pytest.mark.asyncio
+    async def test_intentional_kill_after_monitor_consumed_marker(self, client):
+        """Regression: the monitor poll can consume `_koi_initiated_kills` first
+        and mark the tracker COMPLETED. A subsequent /job/replica-failed for
+        the same replica must still be treated as an intentional kill, not
+        re-trigger a FAILED scale-up (the "self-fight" race)."""
+        import asyncio
+        from koi.schemas import JobTracker, MonitoringStatus
+
+        config = PlacementConfig(
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            num_gpus=4,
+            num_instances=1,
+            tp=4,
+            pp=1,
+            dp=1,
+            region="us-east-1",
+            engine_config=EngineConfig(
+                tensor_parallel_size=4, pipeline_parallel_size=1
+            ),
+            market="on_demand",
+        )
+        tracker = JobTracker(
+            job_id="r-killed",
+            config=config,
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
+            predicted_tps=1200.0,
+        )
+        # Monitor poll already saw r-killed dead and applied the koi-kill
+        # cleanup: status = COMPLETED, replica added to dead_replicas, marker
+        # discarded. /job/replica-failed must NOT re-emit a FAILED trigger.
+        tracker.status = MonitoringStatus.COMPLETED
+        tracker.dead_replicas.append("r-killed")
+        tracker.smoothed_tps = 0
+
+        app.state.monitor.tracked_jobs = {"r-killed": tracker}
+        app.state.monitor._koi_initiated_kills = set()
+        app.state.monitor._trigger_queue = asyncio.Queue()
+        app.state.monitor._pending_launches = {}
+
+        resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "r-killed",
+                "group_id": "parent-job",
+                "status": "failed",
+                "reason": "Orca observed replica killed",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "intentional_kill"
+        assert app.state.monitor._trigger_queue.qsize() == 0
+
+    @pytest.mark.asyncio
     async def test_p5c_harness_records_postmortem_and_cooloff(self, client, monkeypatch):
         """When the p5c flag is on, replica-failed should attach a postmortem
         and write an active cooloff for the failed scope."""
