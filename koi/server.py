@@ -1413,6 +1413,8 @@ async def _job_launch_failed_impl(req: LaunchFailedRequest) -> Dict[str, Any]:
     # Record each failed config in launch_attempts table
     tracker = monitor.tracked_jobs.get(req.job_id)
     decision_id = req.decision_id or (tracker.decision_id if tracker else None)
+    if decision_id and not req.decision_id:
+        req.decision_id = decision_id
 
     for i, config in enumerate(req.configs_tried):
         reason = req.failure_reasons[i] if i < len(req.failure_reasons) else "unknown"
@@ -1464,9 +1466,49 @@ async def _job_launch_failed_impl(req: LaunchFailedRequest) -> Dict[str, Any]:
     if tracker:
         monitor.unregister_job(req.job_id)
 
-    # Cold-start recovery: if every config tried hit a recoverable failure
-    # category (e.g. all OOMed), ask the agent to pick a different config
-    # and re-launch. Bounded by MAX_STARTUP_RETRIES.
+    response: Dict[str, Any] = {
+        "status": "recorded",
+        "job_id": req.job_id,
+        "attempts_recorded": len(req.configs_tried),
+    }
+
+    # Resolution between two launch-recovery paths:
+    #   - Harness P1 (KOI_HARNESS_PROMPTS=p1): typed bounded recovery menu.
+    #   - Legacy cold-start recovery (main): agent.recover_from_startup_failure.
+    # When the P1 harness flag is on, P1 owns the response. Otherwise the
+    # legacy cold-start path runs unchanged. Both code paths are preserved.
+    try:
+        from koi.harness.config import fail_open_enabled, prompt_enabled
+
+        use_p1_harness = prompt_enabled("p1")
+    except Exception:
+        use_p1_harness = False
+        fail_open_enabled = lambda: True  # type: ignore[assignment]
+
+    if use_p1_harness:
+        try:
+            from koi.harness.p1 import run_launch_recovery
+
+            recovery = await run_launch_recovery(
+                app.state.agent,
+                req,
+                memory,
+                ledger=app.state.ledger,
+            )
+            response["recovery"] = recovery
+        except Exception as e:
+            if not fail_open_enabled():
+                raise
+            logger.warning(
+                "p1_harness_failed_open",
+                job_id=req.job_id,
+                error=str(e),
+            )
+        return response
+
+    # Legacy cold-start recovery (main): if every config tried hit a
+    # recoverable failure category (e.g. all OOMed), ask the agent to pick a
+    # different config and re-launch. Bounded by MAX_STARTUP_RETRIES.
     categories = [_classify_failure(r) for r in req.failure_reasons]
     dominant = (
         max(set(categories), key=categories.count)
@@ -1510,11 +1552,7 @@ async def _job_launch_failed_impl(req: LaunchFailedRequest) -> Dict[str, Any]:
             "attempts_recorded": len(req.configs_tried),
         }
 
-    return {
-        "status": "recorded",
-        "job_id": req.job_id,
-        "attempts_recorded": len(req.configs_tried),
-    }
+    return response
 
 
 @app.get("/jobs")

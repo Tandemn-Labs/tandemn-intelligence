@@ -679,6 +679,93 @@ class TestLaunchFailed:
             "job-fail-group"
         )
 
+    @pytest.mark.asyncio
+    async def test_p1_harness_appends_recovery_when_enabled(self, client, monkeypatch):
+        import koi.harness.p1 as p1
+
+        dec_id = app.state.memory.record_decision(
+            job_id="job-p1-server",
+            model_name="Qwen/Qwen3-32B",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=10.49,
+            slo_deadline_hours=1.0,
+            objective="cheapest",
+            avg_input_tokens=1024,
+            avg_output_tokens=1024,
+            num_requests=1500,
+            market="spot",
+        )
+
+        async def fake_recovery(agent, req, memory, **kwargs):
+            assert req.decision_id == dec_id
+            return {"action": "abort", "reasoning": "test recovery"}
+
+        monkeypatch.setenv("KOI_HARNESS", "1")
+        monkeypatch.setenv("KOI_HARNESS_PROMPTS", "p1")
+        monkeypatch.setattr(p1, "run_launch_recovery", fake_recovery)
+
+        resp = await client.post(
+            "/job/launch-failed",
+            json={
+                "job_id": "job-p1-server",
+                "decision_id": dec_id,
+                "configs_tried": [
+                    {
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.12xlarge",
+                        "region": "us-east-1",
+                        "market": "spot",
+                    }
+                ],
+                "failure_reasons": ["InsufficientCapacity"],
+            },
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "recorded"
+        assert body["recovery"] == {"action": "abort", "reasoning": "test recovery"}
+
+    @pytest.mark.asyncio
+    async def test_p1_harness_fail_open_preserves_legacy_response(self, client, monkeypatch):
+        import koi.harness.p1 as p1
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("p1 exploded")
+
+        monkeypatch.setenv("KOI_HARNESS", "1")
+        monkeypatch.setenv("KOI_HARNESS_PROMPTS", "p1")
+        monkeypatch.setenv("KOI_HARNESS_FAIL_OPEN", "1")
+        monkeypatch.setattr(p1, "run_launch_recovery", boom)
+
+        resp = await client.post(
+            "/job/launch-failed",
+            json={
+                "job_id": "job-p1-open",
+                "configs_tried": [
+                    {
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.12xlarge",
+                        "region": "us-east-1",
+                        "market": "spot",
+                    }
+                ],
+                "failure_reasons": ["InsufficientCapacity"],
+            },
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "recorded"
+        assert body["attempts_recorded"] == 1
+        assert "recovery" not in body
+
 
 class TestReplicaFailed:
     @pytest.mark.asyncio
