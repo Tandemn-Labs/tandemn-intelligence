@@ -14,6 +14,12 @@ from koi.harness.schemas import (
     TransitionPacket,
     TransitionType,
 )
+from koi.harness.pscale_menu import (
+    ExclusionRecord,
+    MenuBuildResult,
+    MenuCandidate,
+    build_menu,
+)
 from koi.harness.validator import NoValidActionError, validate_choice
 from koi.logging_config import get_logger
 from koi.schemas import MonitoringStatus, MonitoringTrigger
@@ -284,16 +290,21 @@ async def build_pscale_packet(
     trigger: MonitoringTrigger,
     precomputed_candidates: Optional[list[Any]] = None,
 ) -> TransitionPacket:
-    suggestions = agent._rank_runtime_policy_suggestions(
+    """Phase 2.5: build menu through pscale_menu.build_menu, then materialize options."""
+
+    menu_result = await build_menu(
+        agent,
         trigger,
-        precomputed_candidates=precomputed_candidates,
-        limit=MAX_MENU_OPTIONS - 1,
+        max_options=MAX_MENU_OPTIONS - 1,
+        precomputed_redecide=precomputed_candidates,
     )
+
     options: list[ActionOption] = []
     detail_sections: dict[str, Any] = {}
 
-    for idx, suggestion in enumerate(suggestions[: MAX_MENU_OPTIONS - 1]):
+    for idx, suggestion in enumerate(menu_result.suggestions[: MAX_MENU_OPTIONS - 1]):
         action_id = _action_id(idx)
+        candidate = menu_result.candidates_by_action.get(suggestion.label)
         if suggestion.kind == "scale_up":
             action_type = "scale_up"
             executor_payload = {
@@ -319,25 +330,54 @@ async def build_pscale_packet(
             agent, trigger, suggestion, action_id, executor_payload
         )
         detail_sections.update(per_action_sections)
+
+        memory_success_section = per_action_sections.get(
+            f"memory_success:{action_id}", []
+        )
+        memory_failure_section = per_action_sections.get(
+            f"memory_failure:{action_id}", []
+        )
+        perfdb_exact_section = per_action_sections.get(
+            f"perfdb_exact:{action_id}", []
+        )
+
         evidence = {
             "source": suggestion.source,
             "gpu_type": suggestion.gpu_type,
             "memory_successes": (
-                len(per_action_sections[f"memory_success:{action_id}"])
-                if isinstance(per_action_sections[f"memory_success:{action_id}"], list)
+                len(memory_success_section)
+                if isinstance(memory_success_section, list)
                 else 0
             ),
             "memory_failures": (
-                len(per_action_sections[f"memory_failure:{action_id}"])
-                if isinstance(per_action_sections[f"memory_failure:{action_id}"], list)
+                len(memory_failure_section)
+                if isinstance(memory_failure_section, list)
                 else 0
             ),
             "perfdb_exact_rows": (
-                len(per_action_sections[f"perfdb_exact:{action_id}"])
-                if isinstance(per_action_sections[f"perfdb_exact:{action_id}"], list)
+                len(perfdb_exact_section)
+                if isinstance(perfdb_exact_section, list)
                 else 0
             ),
         }
+
+        risk: dict[str, Any] = {}
+        if candidate is not None:
+            evidence.update(
+                {
+                    "prediction_source": candidate.prediction_source,
+                    "prediction_confidence": candidate.prediction_confidence,
+                    "instance_type": candidate.instance_type,
+                    "market": candidate.market,
+                    "proxy_model": candidate.proxy_model,
+                    "proxy_distance": candidate.proxy_distance,
+                }
+            )
+            if candidate.feasibility:
+                risk["feasibility"] = candidate.feasibility
+            if candidate.physics:
+                risk["physics"] = candidate.physics
+
         options.append(
             ActionOption(
                 action_id=action_id,
@@ -359,7 +399,7 @@ async def build_pscale_packet(
                     "projected_total_cost_usd": suggestion.projected_total_cost_usd,
                     "cost_overage_usd": suggestion.cost_overage_usd,
                 },
-                risk={},
+                risk=risk,
                 executor_payload_ref=f"executor_payload:{action_id}",
                 detail_refs=_pscale_section_keys_for(action_id),
             )
@@ -377,7 +417,7 @@ async def build_pscale_packet(
             action_type="noop",
             summary="No action; wait for the next monitor tick.",
             rank=len(options) + 1,
-            valid=len(suggestions) == 0,
+            valid=len(menu_result.suggestions) == 0,
             risk={
                 "reason": "Use only when no listed scale action is safe or necessary."
             },
@@ -389,17 +429,34 @@ async def build_pscale_packet(
         )
     )
 
+    excluded_payload = [
+        {
+            "summary": rec.summary,
+            "source": rec.source,
+            "reason": rec.reason,
+        }
+        for rec in menu_result.excluded
+    ]
+
+    valid_options_count = sum(1 for option in options if option.valid)
+
+    runtime_context = _runtime_context(agent, trigger)
+    runtime_context["menu_degenerate"] = valid_options_count <= 1
+
     return TransitionPacket(
         packet_id=f"pscale-{trigger.job_id}",
         job_id=trigger.job_id,
         state=_state_for_trigger(trigger),
         transition_type=TransitionType.SCALE,
-        runtime_context=_runtime_context(agent, trigger),
+        runtime_context=runtime_context,
         failure_context={"diagnosis_hint": trigger.diagnosis_hint},
         evidence_summary={
-            "suggestion_count": len(suggestions),
-            "valid_action_count": len(options),
-            "source": "runtime_policy",
+            "suggestion_count": len(menu_result.suggestions),
+            "valid_action_count": valid_options_count,
+            "counts_by_source": dict(menu_result.counts_by_source),
+            "excluded_count": len(menu_result.excluded),
+            "excluded": excluded_payload,
+            "source": "pscale_menu",
         },
         action_options=options,
         detail_sections=detail_sections,
@@ -423,22 +480,74 @@ def render_pscale_prompt(packet: TransitionPacket) -> str:
         "",
         "RUNTIME CONTEXT:",
         json.dumps(packet.runtime_context, indent=2, sort_keys=True, default=str),
-        "",
-        "ACTION MENU:",
     ]
+
+    counts_by_source = packet.evidence_summary.get("counts_by_source") if packet.evidence_summary else None
+    if counts_by_source:
+        lines.extend(
+            [
+                "",
+                "EVIDENCE SUMMARY:",
+                json.dumps(
+                    {
+                        "valid_action_count": packet.evidence_summary.get(
+                            "valid_action_count"
+                        ),
+                        "counts_by_source": counts_by_source,
+                        "excluded_count": packet.evidence_summary.get(
+                            "excluded_count", 0
+                        ),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                ),
+            ]
+        )
+
+    lines.extend(["", "ACTION MENU:"])
     for option in packet.action_options:
-        lines.append(f"{option.rank}. action_id={option.action_id} type={option.action_type} valid={option.valid}")
+        source_tag = ""
+        if option.evidence and option.evidence.get("source"):
+            source_tag = f" source={option.evidence['source']}"
+        prediction_tag = ""
+        if option.evidence and option.evidence.get("prediction_source"):
+            prediction_tag = (
+                f" pred_source={option.evidence['prediction_source']}"
+                f" conf={option.evidence.get('prediction_confidence', '?')}"
+            )
+        lines.append(
+            f"{option.rank}. action_id={option.action_id} type={option.action_type}"
+            f" valid={option.valid}{source_tag}{prediction_tag}"
+        )
         lines.append(f"   {option.summary}")
         if option.performance:
-            lines.append(f"   performance={json.dumps(option.performance, sort_keys=True, default=str)}")
+            lines.append(
+                f"   performance={json.dumps(option.performance, sort_keys=True, default=str)}"
+            )
         if option.cost:
-            lines.append(f"   cost={json.dumps(option.cost, sort_keys=True, default=str)}")
+            lines.append(
+                f"   cost={json.dumps(option.cost, sort_keys=True, default=str)}"
+            )
         if option.risk:
-            lines.append(f"   risk={json.dumps(option.risk, sort_keys=True, default=str)}")
-    lines.extend([
-        "",
-        "Return your final answer as the typed ChosenAction schema.",
-    ])
+            lines.append(
+                f"   risk={json.dumps(option.risk, sort_keys=True, default=str)}"
+            )
+
+    excluded = packet.evidence_summary.get("excluded") if packet.evidence_summary else None
+    if excluded:
+        lines.extend(["", f"EXCLUDED CANDIDATES ({len(excluded)}):"])
+        for rec in excluded:
+            lines.append(
+                f"- {rec.get('summary')} reason={rec.get('reason')}"
+            )
+
+    lines.extend(
+        [
+            "",
+            "Return your final answer as the typed ChosenAction schema.",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -866,6 +975,45 @@ async def run_runtime_scale(
         trigger,
         precomputed_candidates=precomputed_candidates,
     )
+
+    valid_options = packet.valid_actions()
+    fast_path = len(valid_options) <= 1
+
+    if fast_path:
+        # Option A: skip the LLM call when the menu is trivial. Saves wall-clock
+        # in degenerate scenarios; we lose the LLM's rationale field but the
+        # menu was deterministic anyway, so there's nothing to weigh.
+        if not valid_options:
+            emit_event(
+                "harness.pscale.fast_path",
+                job_id=trigger.job_id,
+                reason="no_valid_options",
+            )
+            logger.info("pscale_fast_path", job_id=trigger.job_id, reason="no_valid_options")
+            return "[HARNESS FALLBACK] No valid runtime action available."
+        action_id = valid_options[0].action_id
+        emit_event(
+            "harness.pscale.fast_path",
+            job_id=trigger.job_id,
+            reason="single_valid_option",
+            action_id=action_id,
+        )
+        logger.info(
+            "pscale_fast_path",
+            job_id=trigger.job_id,
+            reason="single_valid_option",
+            action_id=action_id,
+        )
+        result = await _execute_validated_action(agent, packet, action_id)
+        emit_event(
+            "harness.pscale.executed",
+            job_id=trigger.job_id,
+            action_id=action_id,
+            fallback_used=True,
+            fast_path=True,
+        )
+        return result
+
     prompt = render_pscale_prompt(packet)
     reasoner = HarnessReasoner(
         model=agent._model,
@@ -907,5 +1055,6 @@ async def run_runtime_scale(
         job_id=trigger.job_id,
         action_id=action_id,
         fallback_used=fallback_used,
+        fast_path=False,
     )
     return result
