@@ -36,3 +36,7 @@ build/
 
 # Local planning notes
 docs/plans/
+
+# Claude/agent local state
+.claude/settings.local.json
+.claude/worktrees/
