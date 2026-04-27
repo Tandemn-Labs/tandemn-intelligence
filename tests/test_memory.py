@@ -1,5 +1,7 @@
 """Tests for koi/tools/memory.py"""
 
+import time
+
 import pytest
 from koi.tools.memory import AgenticMemory, query_memory, record_outcome_tool
 
@@ -122,6 +124,51 @@ class TestOutcomes:
         assert outcomes[0]["bottleneck"] == "memory_bound"
         assert "tp" in outcomes[0]["diff_from_parent"]
 
+
+class TestCooloffs:
+    def test_record_and_query_active_cooloff(self, memory):
+        now = time.time()
+        cooloff_id = memory.record_cooloff(
+            key="L40S|g6e.12xlarge|us-east-1|spot",
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            region="us-east-1",
+            market="spot",
+            tp=4,
+            pp=1,
+            dp=1,
+            reason="fresh spot preemption",
+            diagnosis_code="spot_preemption",
+            avoid_until=now + 600,
+            hard_until=now + 120,
+            source_event_id="evt-1",
+        )
+
+        rows = memory.get_active_cooloffs(
+            gpu_type="L40S",
+            region="us-east-1",
+            market="spot",
+            now=now,
+        )
+
+        assert cooloff_id.startswith("cof-")
+        assert len(rows) == 1
+        assert rows[0]["key"] == "L40S|g6e.12xlarge|us-east-1|spot"
+        assert rows[0]["diagnosis_code"] == "spot_preemption"
+
+    def test_expired_cooloff_is_filtered(self, memory):
+        now = time.time()
+        memory.record_cooloff(
+            key="L40S|g6e.12xlarge|us-east-1|spot",
+            gpu_type="L40S",
+            reason="expired",
+            avoid_until=now - 1,
+        )
+
+        assert memory.get_active_cooloffs(now=now) == []
+
+
+class TestQueryMemoryNarrative:
     def test_query_memory_shows_diagnosis(self, memory):
         dec_id = memory.record_decision(
             job_id="job-fail2", model_name="Qwen-72B",

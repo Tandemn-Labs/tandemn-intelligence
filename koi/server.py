@@ -1250,16 +1250,75 @@ async def _replica_failed_impl(req: ReplicaFailedRequest) -> Dict[str, Any]:
     market = req.market if req.market != "unknown" else tracker.config.market
     if market == "unknown" and failure_category == "spot_preemption":
         market = "spot"
+    postmortem = None
+    try:
+        from koi.harness.config import fail_open_enabled, prompt_enabled
+
+        use_p5c_harness = prompt_enabled("p5c")
+    except Exception:
+        use_p5c_harness = False
+        fail_open_enabled = lambda: True  # type: ignore[assignment]
+
+    if use_p5c_harness:
+        try:
+            from koi.harness.p5c import run_chain_postmortem
+
+            postmortem = await run_chain_postmortem(
+                agent=app.state.agent,
+                req=req,
+                tracker=tracker,
+                memory=app.state.memory,
+                failure_category=failure_category,
+                region=region,
+                market=market,
+                actual_tps_before_death=actual_tps_before_death,
+            )
+        except Exception as e:
+            if not fail_open_enabled():
+                raise
+            logger.warning(
+                "p5c_harness_failed_open",
+                job_id=req.job_id,
+                error=str(e),
+            )
+
     # Record failure outcome in memory for learning (with actual TPS if available)
     memory: AgenticMemory = app.state.memory
     if tracker.decision_id:
+        diagnosis_text = req.reason[:200]
+        bottleneck = None
+        postmortem_json = None
+        if postmortem is not None:
+            diagnosis_text = (
+                f"{postmortem.diagnosis_code}: {postmortem.rationale}"
+            )[:500]
+            bottleneck = postmortem.bottleneck
+            postmortem_json = json.dumps(postmortem.model_dump(), sort_keys=True)
         memory.record_outcome(
             decision_id=tracker.decision_id,
             job_id=req.group_id,
             status="replica_failed",
             actual_tps=actual_tps_before_death if actual_tps_before_death > 0 else None,
             failure_category=failure_category,
-            diagnosis=req.reason[:200],
+            diagnosis=diagnosis_text,
+            bottleneck=bottleneck,
+            diff_from_parent=postmortem_json,
+        )
+    if postmortem is not None and postmortem.avoid_until and postmortem.cooloff_key:
+        memory.record_cooloff(
+            key=postmortem.cooloff_key,
+            gpu_type=tracker.config.gpu_type,
+            instance_type=tracker.config.instance_type,
+            region=region,
+            market=market,
+            tp=tracker.config.tp,
+            pp=tracker.config.pp,
+            dp=tracker.config.dp,
+            reason=postmortem.rationale or postmortem.diagnosis_code,
+            diagnosis_code=postmortem.diagnosis_code,
+            avoid_until=postmortem.avoid_until,
+            hard_until=postmortem.hard_until,
+            source_event_id=req.event_id or req.correlation_id or req.job_id,
         )
     # Update availability prior (failure observation)
     if region != "unknown" and market != "unknown":
@@ -1297,7 +1356,10 @@ async def _replica_failed_impl(req: ReplicaFailedRequest) -> Dict[str, Any]:
         group_id=req.group_id,
         reason=req.reason[:100],
     )
-    return {"status": "trigger_emitted", "job_id": req.job_id}
+    response = {"status": "trigger_emitted", "job_id": req.job_id}
+    if postmortem is not None:
+        response["postmortem"] = postmortem.model_dump(mode="json")
+    return response
 
 
 class ConfigAttemptRequest(BaseModel):

@@ -973,6 +973,186 @@ class TestReplicaFailed:
             outcomes[0]["diagnosis"] == "Clean exit with pending chunks (likely killed)"
         )
 
+    @pytest.mark.asyncio
+    async def test_p5c_harness_records_postmortem_and_cooloff(self, client, monkeypatch):
+        """When the p5c flag is on, replica-failed should attach a postmortem
+        and write an active cooloff for the failed scope."""
+        import asyncio
+        from koi.harness import p5c as p5c_module
+        from koi.harness.p5c import P5cDiagnosis
+        from koi.schemas import JobTracker, MonitoringStatus
+
+        config = PlacementConfig(
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            num_gpus=4,
+            num_instances=1,
+            tp=4,
+            pp=1,
+            dp=1,
+            region="us-east-1",
+            engine_config=EngineConfig(
+                tensor_parallel_size=4, pipeline_parallel_size=1
+            ),
+            market="spot",
+        )
+        tracker = JobTracker(
+            job_id="r0",
+            config=config,
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
+            predicted_tps=1200.0,
+        )
+        tracker.smoothed_tps = 1180.0
+
+        dec_id = app.state.memory.record_decision(
+            job_id="parent-job",
+            model_name="Qwen/Qwen3-32B",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=6.85,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            market="spot",
+        )
+        tracker.decision_id = dec_id
+
+        app.state.monitor.tracked_jobs = {"r0": tracker}
+        app.state.monitor._koi_initiated_kills = set()
+        app.state.monitor._trigger_queue = asyncio.Queue()
+        app.state.monitor._pending_launches = {}
+
+        import time as _time
+
+        now = _time.time()
+
+        async def _stub_postmortem(**kwargs):
+            return P5cDiagnosis(
+                diagnosis_code="spot_preemption",
+                bottleneck="market_capacity",
+                next_fix="retry_same_topology_on_demand",
+                failure_scope="L40S|g6e.12xlarge|us-east-1|spot",
+                event_at=now,
+                avoid_until=now + 30 * 60,
+                hard_until=now + 10 * 60,
+                cooloff_key="L40S|g6e.12xlarge|us-east-1|spot",
+                cooloff_minutes=30,
+                rationale="seeded postmortem",
+            )
+
+        monkeypatch.setattr(p5c_module, "run_chain_postmortem", _stub_postmortem)
+        monkeypatch.setenv("KOI_HARNESS", "1")
+        monkeypatch.setenv("KOI_HARNESS_PROMPTS", "p5c")
+
+        resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "r0",
+                "group_id": "parent-job",
+                "status": "failed",
+                "reason": "SpotInstanceInterruption",
+                "market": "spot",
+                "region": "us-east-1",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "trigger_emitted"
+        assert body["postmortem"]["diagnosis_code"] == "spot_preemption"
+        assert body["postmortem"]["cooloff_minutes"] == 30
+        assert tracker.status == MonitoringStatus.FAILED
+
+        outcomes = app.state.memory.query_outcomes(status="replica_failed")
+        assert outcomes
+        assert outcomes[0]["bottleneck"] == "market_capacity"
+        assert outcomes[0]["diff_from_parent"] is not None
+        assert "spot_preemption" in outcomes[0]["diagnosis"]
+
+        cooloffs = app.state.memory.get_active_cooloffs(
+            gpu_type="L40S", region="us-east-1", market="spot"
+        )
+        assert len(cooloffs) == 1
+        assert cooloffs[0]["diagnosis_code"] == "spot_preemption"
+
+    @pytest.mark.asyncio
+    async def test_p5c_harness_fail_open_preserves_legacy_behavior(self, client, monkeypatch):
+        """Harness exception should not break legacy replica-failed handling."""
+        import asyncio
+        from koi.harness import p5c as p5c_module
+        from koi.schemas import JobTracker
+
+        config = PlacementConfig(
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            num_gpus=4,
+            num_instances=1,
+            tp=4,
+            pp=1,
+            dp=1,
+            region="us-east-1",
+            engine_config=EngineConfig(
+                tensor_parallel_size=4, pipeline_parallel_size=1
+            ),
+        )
+        tracker = JobTracker(
+            job_id="r0",
+            config=config,
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
+            predicted_tps=1200.0,
+        )
+        tracker.smoothed_tps = 1100.0
+        dec_id = app.state.memory.record_decision(
+            job_id="parent-job",
+            model_name="Qwen/Qwen3-32B",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=6.85,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+        )
+        tracker.decision_id = dec_id
+        app.state.monitor.tracked_jobs = {"r0": tracker}
+        app.state.monitor._koi_initiated_kills = set()
+        app.state.monitor._trigger_queue = asyncio.Queue()
+        app.state.monitor._pending_launches = {}
+
+        async def _boom(**kwargs):
+            raise RuntimeError("p5c exploded")
+
+        monkeypatch.setattr(p5c_module, "run_chain_postmortem", _boom)
+        monkeypatch.setenv("KOI_HARNESS", "1")
+        monkeypatch.setenv("KOI_HARNESS_PROMPTS", "p5c")
+        monkeypatch.setenv("KOI_HARNESS_FAIL_OPEN", "1")
+
+        resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "r0",
+                "group_id": "parent-job",
+                "status": "failed",
+                "reason": "Heartbeat timeout (45s)",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "trigger_emitted"
+        assert "postmortem" not in body
+
 
 class TestClassifyFailure:
     def test_spot_preemption(self):

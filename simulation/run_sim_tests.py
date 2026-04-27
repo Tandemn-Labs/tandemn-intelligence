@@ -2313,6 +2313,151 @@ def run_tier2():
         ]:
             skip(name, str(e))
 
+    # ── T2.12: P5c chain post-mortem (deterministic, no LLM) ──────────────
+    section("T2.12  /job/replica-failed P5c writes structured diagnosis + cooloff")
+
+    try:
+        p5c_env = {
+            "KOI_HARNESS": "1",
+            "KOI_HARNESS_PROMPTS": "p5c",
+            "KOI_HARNESS_FAIL_OPEN": "0",
+            "KOI_TEST_FAKE_DECIDE": "1",
+            "KOI_TEST_GPU_TYPE": "L40S",
+            "KOI_TEST_REQUIRED_GPUS": "4",
+            "KOI_WARMUP_MINUTES": "0",
+        }
+        with koi_server(api_key="dummy", extra_env=p5c_env) as db_path:
+            from koi.tools.memory import AgenticMemory
+
+            decide_payload = {
+                "job_request": {
+                    "model_name": "Qwen/Qwen3-32B",
+                    "task_type": "batch",
+                    "avg_input_tokens": 953,
+                    "avg_output_tokens": 1024,
+                    "num_requests": 5000,
+                    "slo_deadline_hours": 8.0,
+                    "objective": "cheapest",
+                    "preferred_market": "spot",
+                },
+                "resource_map": {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                            "region": "us-east-1",
+                            "interconnect": "PCIe",
+                        },
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "spot",
+                            "baseline_vcpus": 96,
+                            "used_vcpus": 0,
+                        },
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 96,
+                            "used_vcpus": 0,
+                        },
+                    ],
+                },
+            }
+            decide_resp = requests.post(
+                f"{KOI_URL}/decide", json=decide_payload, timeout=30
+            )
+            decide_resp.raise_for_status()
+            decide_body = decide_resp.json()
+            decision_id = decide_body["_decision_id"]
+            replica_id = "p5c-r0"
+
+            post(
+                f"{KOI_URL}/job/started",
+                {
+                    "job_id": replica_id,
+                    "decision_id": decision_id,
+                    "group_id": "p5c-group",
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "region": "us-east-1",
+                    "market": "spot",
+                    "tp": 4,
+                    "pp": 1,
+                    "dp": 1,
+                    "slo_deadline_hours": 8.0,
+                    "total_tokens": 6_000_000,
+                    "predicted_tps": 1200.0,
+                },
+            )
+
+            spot_response = post(
+                f"{KOI_URL}/job/replica-failed",
+                {
+                    "job_id": replica_id,
+                    "group_id": "p5c-group",
+                    "status": "failed",
+                    "reason": "SpotInstanceInterruption",
+                    "region": "us-east-1",
+                    "market": "spot",
+                },
+            )
+
+            def t_p5c_response_includes_postmortem():
+                assert spot_response.get("status") == "trigger_emitted", spot_response
+                pm = spot_response.get("postmortem")
+                assert pm is not None, spot_response
+                assert pm.get("diagnosis_code") == "spot_preemption", pm
+                assert pm.get("bottleneck") == "market_capacity", pm
+                assert pm.get("next_fix") == "retry_same_topology_on_demand", pm
+                assert pm.get("cooloff_minutes") == 30, pm
+
+            def t_p5c_outcome_has_structured_diagnosis():
+                m = AgenticMemory(db_path)
+                outcomes = m.query_outcomes(status="replica_failed", limit=5)
+                assert outcomes, "expected replica_failed outcome"
+                latest = outcomes[0]
+                assert latest["bottleneck"] == "market_capacity", latest
+                assert "spot_preemption" in (latest.get("diagnosis") or ""), latest
+                assert latest.get("diff_from_parent"), latest
+
+            def t_p5c_records_active_cooloff():
+                m = AgenticMemory(db_path)
+                cooloffs = m.get_active_cooloffs(
+                    gpu_type="L40S", region="us-east-1", market="spot"
+                )
+                assert cooloffs, "expected an active cooloff for failed scope"
+                assert cooloffs[0]["diagnosis_code"] == "spot_preemption", cooloffs[0]
+
+            check(
+                "P5c attaches structured postmortem to replica-failed response",
+                t_p5c_response_includes_postmortem,
+            )
+            check(
+                "P5c records bottleneck + structured diagnosis in outcome",
+                t_p5c_outcome_has_structured_diagnosis,
+            )
+            check(
+                "P5c persists active cooloff for the failed scope",
+                t_p5c_records_active_cooloff,
+            )
+
+    except RuntimeError as e:
+        for name in [
+            "P5c attaches structured postmortem to replica-failed response",
+            "P5c records bottleneck + structured diagnosis in outcome",
+            "P5c persists active cooloff for the failed scope",
+        ]:
+            skip(name, str(e))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TIER 3 — Full agent loop (requires KOI_API_KEY or ANTHROPIC_API_KEY)
@@ -2570,6 +2715,115 @@ def run_tier3(api_key: str):
             "P1 LLM returns recovery field with parent decision",
             "P1 LLM picks a known recovery action",
             "P1 LLM retry recovery records a child decision in memory",
+        ]:
+            skip(name, str(e))
+
+    # ── T3.4: P5c chain post-mortem LLM scenario ──────────────────────────
+    section("T3.4  P5c LLM diagnosis after replica spot preemption")
+
+    try:
+        p5c_llm_env = {
+            "KOI_HARNESS": "1",
+            "KOI_HARNESS_PROMPTS": "p5c",
+            "KOI_HARNESS_FAIL_OPEN": "0",
+            "KOI_WARMUP_MINUTES": "0",
+        }
+        with koi_server(api_key=api_key, extra_env=p5c_llm_env) as db_path:
+            from koi.tools.memory import AgenticMemory
+
+            seed_memory = AgenticMemory(db_path)
+            parent_decision_id = seed_memory.record_decision(
+                job_id="p5c-llm-group",
+                model_name="Qwen/Qwen3-32B",
+                instance_type="g6e.12xlarge",
+                gpu_type="L40S",
+                tp=4,
+                pp=1,
+                dp=1,
+                num_gpus=4,
+                predicted_tps=1200.0,
+                predicted_cost_per_hour=10.49,
+                slo_deadline_hours=8.0,
+                objective="cheapest",
+                avg_input_tokens=953,
+                avg_output_tokens=1024,
+                num_requests=5000,
+                market="spot",
+            )
+
+            replica_id = "p5c-llm-r0"
+            post(
+                f"{KOI_URL}/job/started",
+                {
+                    "job_id": replica_id,
+                    "decision_id": parent_decision_id,
+                    "group_id": "p5c-llm-group",
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "region": "us-east-1",
+                    "market": "spot",
+                    "tp": 4,
+                    "pp": 1,
+                    "dp": 1,
+                    "slo_deadline_hours": 8.0,
+                    "total_tokens": 6_000_000,
+                    "predicted_tps": 1200.0,
+                },
+            )
+
+            response = requests.post(
+                f"{KOI_URL}/job/replica-failed",
+                json={
+                    "job_id": replica_id,
+                    "group_id": "p5c-llm-group",
+                    "status": "failed",
+                    "reason": "SpotInstanceInterruption",
+                    "region": "us-east-1",
+                    "market": "spot",
+                },
+                timeout=180,
+            ).json()
+
+            def t_p5c_llm_postmortem_present():
+                assert response.get("status") == "trigger_emitted", response
+                pm = response.get("postmortem")
+                assert pm is not None, response
+                assert pm.get("diagnosis_code"), pm
+                assert pm.get("failure_scope"), pm
+
+            def t_p5c_llm_outcome_persisted():
+                m = AgenticMemory(db_path)
+                outcomes = m.query_outcomes(status="replica_failed", limit=5)
+                assert outcomes, "expected replica_failed outcome"
+                latest = outcomes[0]
+                assert latest.get("bottleneck"), latest
+                assert latest.get("diff_from_parent"), latest
+
+            def t_p5c_llm_cooloff_recorded_for_spot_scope():
+                m = AgenticMemory(db_path)
+                cooloffs = m.get_active_cooloffs(
+                    gpu_type="L40S", region="us-east-1", market="spot"
+                )
+                assert cooloffs, "expected an active cooloff after spot preemption"
+
+            check(
+                "P5c LLM returns postmortem field with diagnosis_code",
+                t_p5c_llm_postmortem_present,
+            )
+            check(
+                "P5c LLM persists outcome with bottleneck and structured diagnosis",
+                t_p5c_llm_outcome_persisted,
+            )
+            check(
+                "P5c LLM persists active cooloff for spot scope",
+                t_p5c_llm_cooloff_recorded_for_spot_scope,
+            )
+
+    except RuntimeError as e:
+        for name in [
+            "P5c LLM returns postmortem field with diagnosis_code",
+            "P5c LLM persists outcome with bottleneck and structured diagnosis",
+            "P5c LLM persists active cooloff for spot scope",
         ]:
             skip(name, str(e))
 
@@ -3300,6 +3554,12 @@ if __name__ == "__main__":
             "agent calls get_failure_summary_tool on FAILED trigger",
             "scale_up decision recorded in memory",
             "agent uses market=on_demand after 2 spot preemptions",
+            "P1 LLM returns recovery field with parent decision",
+            "P1 LLM picks a known recovery action",
+            "P1 LLM retry recovery records a child decision in memory",
+            "P5c LLM returns postmortem field with diagnosis_code",
+            "P5c LLM persists outcome with bottleneck and structured diagnosis",
+            "P5c LLM persists active cooloff for spot scope",
             "agent scaled down on OVER_PROVISIONED trigger",
             "no self-fight: killed replicas did NOT trigger scale_up",
             "agent scales up on FALLING_BEHIND trigger",

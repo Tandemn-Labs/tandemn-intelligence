@@ -6,12 +6,14 @@ Four tables:
   outcomes             — what actually happened (ground truth)
   launch_attempts      — per-attempt launch success/failure tracking
   availability_priors  — Beta(α,β) conjugate priors for GPU availability
+  cooloffs             — short-horizon avoid signals for fresh failures
 """
 
 import json
 import math
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -119,11 +121,31 @@ class AgenticMemory:
                 last_decay       TEXT DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS cooloffs (
+                cooloff_id       TEXT PRIMARY KEY,
+                key              TEXT NOT NULL,
+                gpu_type         TEXT NOT NULL,
+                instance_type    TEXT,
+                region           TEXT,
+                market           TEXT,
+                tp               INTEGER,
+                pp               INTEGER,
+                dp               INTEGER,
+                reason           TEXT,
+                diagnosis_code   TEXT,
+                avoid_until      REAL NOT NULL,
+                hard_until       REAL,
+                source_event_id  TEXT,
+                created_at       REAL NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_decisions_model ON decisions(model_name);
             CREATE INDEX IF NOT EXISTS idx_outcomes_job ON outcomes(job_id);
             CREATE INDEX IF NOT EXISTS idx_outcomes_status ON outcomes(status);
             CREATE INDEX IF NOT EXISTS idx_launch_instance ON launch_attempts(instance_type, region);
             CREATE INDEX IF NOT EXISTS idx_avail_gpu ON availability_priors(gpu_type);
+            CREATE INDEX IF NOT EXISTS idx_cooloffs_key ON cooloffs(key);
+            CREATE INDEX IF NOT EXISTS idx_cooloffs_active ON cooloffs(avoid_until);
         """)
         conn.commit()
 
@@ -365,6 +387,60 @@ class AgenticMemory:
         conn.commit()
         return attempt_id
 
+    def record_cooloff(
+        self,
+        *,
+        key: str,
+        gpu_type: str,
+        avoid_until: float,
+        reason: str,
+        instance_type: Optional[str] = None,
+        region: Optional[str] = None,
+        market: Optional[str] = None,
+        tp: Optional[int] = None,
+        pp: Optional[int] = None,
+        dp: Optional[int] = None,
+        hard_until: Optional[float] = None,
+        diagnosis_code: Optional[str] = None,
+        source_event_id: Optional[str] = None,
+    ) -> str:
+        """Persist a short-horizon avoid signal for future menu ranking."""
+        cooloff_id = f"cof-{uuid.uuid4().hex[:8]}"
+        # Use time.time() (POSIX/UTC) so reads/writes share a consistent clock.
+        # datetime.utcnow().timestamp() interprets the naive UTC datetime as
+        # *local* time on the timestamp() call, which can offset the value by
+        # the local UTC offset.
+        now = time.time()
+        conn = self._conn()
+        conn.execute(
+            """
+            INSERT INTO cooloffs (
+                cooloff_id, key, gpu_type, instance_type, region, market,
+                tp, pp, dp, reason, diagnosis_code, avoid_until, hard_until,
+                source_event_id, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                cooloff_id,
+                key,
+                gpu_type,
+                instance_type,
+                region,
+                market,
+                tp,
+                pp,
+                dp,
+                reason,
+                diagnosis_code,
+                avoid_until,
+                hard_until,
+                source_event_id,
+                now,
+            ),
+        )
+        conn.commit()
+        return cooloff_id
+
     # ------------------------------------------------------------------
     # Read operations
     # ------------------------------------------------------------------
@@ -471,6 +547,33 @@ class AgenticMemory:
         query += " ORDER BY o.timestamp DESC LIMIT ?"
         params.append(limit)
 
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_active_cooloffs(
+        self,
+        *,
+        gpu_type: Optional[str] = None,
+        region: Optional[str] = None,
+        market: Optional[str] = None,
+        now: Optional[float] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        current = time.time() if now is None else now
+        conn = self._conn()
+        query = "SELECT * FROM cooloffs WHERE avoid_until > ?"
+        params: list = [current]
+        if gpu_type:
+            query += " AND gpu_type = ?"
+            params.append(gpu_type)
+        if region:
+            query += " AND region = ?"
+            params.append(region)
+        if market:
+            query += " AND market = ?"
+            params.append(market)
+        query += " ORDER BY avoid_until DESC LIMIT ?"
+        params.append(limit)
         rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
