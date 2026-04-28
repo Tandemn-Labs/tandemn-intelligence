@@ -2942,6 +2942,200 @@ def run_tier3(api_key: str):
         ]:
             skip(name, str(e))
 
+    # ── T3.5: P0 LLM avoids recently failed launch scope ──────────────────
+    section("T3.5  P0 LLM avoids recently failed launch scope")
+
+    try:
+        p0_env = {
+            "KOI_HARNESS": "1",
+            "KOI_HARNESS_PROMPTS": "p0",
+            "KOI_HARNESS_FAIL_OPEN": "0",
+            "KOI_WARMUP_MINUTES": "0",
+        }
+        with koi_server(api_key=api_key, extra_env=p0_env) as db_path:
+            from koi.tools.memory import AgenticMemory
+
+            seed_memory = AgenticMemory(db_path)
+            model_name = "harness-recent-failure-test/Qwen-32B"
+
+            # Seed a verified L40S outcome so the cost table includes it.
+            l40s_dec = seed_memory.record_decision(
+                job_id="seed-l40s-job",
+                model_name=model_name,
+                instance_type="g6e.12xlarge",
+                gpu_type="L40S",
+                tp=4,
+                pp=1,
+                dp=1,
+                num_gpus=4,
+                predicted_tps=1200.0,
+                predicted_cost_per_hour=10.49,
+                predicted_total_cost=12.40,
+                slo_deadline_hours=2.0,
+                objective="cheapest",
+                avg_input_tokens=512,
+                avg_output_tokens=512,
+                num_requests=5000,
+                market="spot",
+            )
+            seed_memory.record_outcome(
+                decision_id=l40s_dec,
+                job_id="seed-l40s-job",
+                status="succeeded",
+                actual_tps=1200.0,
+                actual_cost_per_hour=10.49,
+                actual_total_cost=12.40,
+                actual_runtime_hours=1.18,
+                slo_met=True,
+            )
+
+            # Seed a verified A100-80GB outcome so the cost table also has a
+            # safer alternative the agent can pick.
+            a100_dec = seed_memory.record_decision(
+                job_id="seed-a100-job",
+                model_name=model_name,
+                instance_type="p4de.24xlarge",
+                gpu_type="A100-80GB",
+                tp=8,
+                pp=1,
+                dp=1,
+                num_gpus=8,
+                predicted_tps=2400.0,
+                predicted_cost_per_hour=40.96,
+                predicted_total_cost=24.16,
+                slo_deadline_hours=2.0,
+                objective="cheapest",
+                avg_input_tokens=512,
+                avg_output_tokens=512,
+                num_requests=5000,
+                market="spot",
+            )
+            seed_memory.record_outcome(
+                decision_id=a100_dec,
+                job_id="seed-a100-job",
+                status="succeeded",
+                actual_tps=2400.0,
+                actual_cost_per_hour=40.96,
+                actual_total_cost=24.16,
+                actual_runtime_hours=0.59,
+                slo_met=True,
+            )
+
+            # Mark the L40S spot scope as recently failed. The harness should
+            # downrank the cheaper option below the safer A100 option.
+            now = time.time()
+            seed_memory.record_cooloff(
+                key="L40S|g6e.12xlarge|us-east-1|spot",
+                gpu_type="L40S",
+                instance_type="g6e.12xlarge",
+                region="us-east-1",
+                market="spot",
+                tp=4,
+                pp=1,
+                dp=1,
+                reason="fresh spot preemption",
+                diagnosis_code="spot_preemption",
+                avoid_until=now + 30 * 60,
+                source_event_id="sim-t35",
+            )
+
+            decide_payload = {
+                "job_request": {
+                    "model_name": model_name,
+                    "task_type": "batch",
+                    "avg_input_tokens": 512,
+                    "avg_output_tokens": 512,
+                    "num_requests": 5000,
+                    "slo_deadline_hours": 2.0,
+                    "objective": "cheapest",
+                    "preferred_market": "spot",
+                },
+                "resource_map": {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                            "region": "us-east-1",
+                            "interconnect": "PCIe",
+                        },
+                        {
+                            "instance_type": "p4de.24xlarge",
+                            "gpu_type": "A100-80GB",
+                            "gpus_per_instance": 8,
+                            "vcpus": 96,
+                            "quota_family": "P",
+                            "gpu_memory_gb": 80.0,
+                            "cost_per_instance_hour_usd": 40.96,
+                            "region": "us-east-1",
+                            "interconnect": "NVLink",
+                        },
+                    ],
+                    "quotas": [
+                        {"family": "G", "region": "us-east-1", "market": "spot", "baseline_vcpus": 384, "used_vcpus": 0},
+                        {"family": "G", "region": "us-east-1", "market": "on_demand", "baseline_vcpus": 384, "used_vcpus": 0},
+                        {"family": "P", "region": "us-east-1", "market": "spot", "baseline_vcpus": 384, "used_vcpus": 0},
+                        {"family": "P", "region": "us-east-1", "market": "on_demand", "baseline_vcpus": 384, "used_vcpus": 0},
+                    ],
+                },
+            }
+            decide_resp = requests.post(
+                f"{KOI_URL}/decide",
+                json=decide_payload,
+                timeout=180,
+            )
+            decide_resp.raise_for_status()
+            decide_body = decide_resp.json()
+            config = decide_body.get("config", {}) or {}
+
+            failed_scope = ("L40S", "g6e.12xlarge", "us-east-1", "spot")
+            chosen_scope = (
+                config.get("gpu_type"),
+                config.get("instance_type"),
+                config.get("region"),
+                (config.get("market") or decide_body.get("planned_market") or "").lower(),
+            )
+
+            def t_p0_llm_avoids_failed_scope():
+                assert decide_body.get("config"), decide_body
+                assert chosen_scope != failed_scope, (
+                    f"Agent picked the recently failed scope. "
+                    f"chosen={chosen_scope} failed={failed_scope} "
+                    f"reasoning={decide_body.get('reasoning')}"
+                )
+
+            def t_p0_llm_picked_alternative_path():
+                gpu = config.get("gpu_type")
+                market = (config.get("market") or decide_body.get("planned_market") or "").lower()
+                # Either pick a different GPU family entirely OR move L40S
+                # off the failed market/region. Anything else means the agent
+                # is ignoring the recent-failure evidence.
+                acceptable = gpu == "A100-80GB" or (gpu == "L40S" and market != "spot")
+                assert acceptable, (
+                    f"Agent did not avoid failed L40S spot scope: gpu={gpu} market={market} "
+                    f"config={config}"
+                )
+
+            check(
+                "P0 LLM does not pick recently failed launch scope",
+                t_p0_llm_avoids_failed_scope,
+            )
+            check(
+                "P0 LLM picks an alternative GPU or market vs failed scope",
+                t_p0_llm_picked_alternative_path,
+            )
+
+    except RuntimeError as e:
+        for name in [
+            "P0 LLM does not pick recently failed launch scope",
+            "P0 LLM picks an alternative GPU or market vs failed scope",
+        ]:
+            skip(name, str(e))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TIER 4 — Scenario tests (OVER_PROVISIONED + FALLING_BEHIND, requires KOI_API_KEY or ANTHROPIC_API_KEY)
@@ -3675,6 +3869,8 @@ if __name__ == "__main__":
             "P5c LLM returns postmortem field with diagnosis_code",
             "P5c LLM persists outcome with bottleneck and structured diagnosis",
             "P5c LLM persists active cooloff for spot scope",
+            "P0 LLM does not pick recently failed launch scope",
+            "P0 LLM picks an alternative GPU or market vs failed scope",
             "agent scaled down on OVER_PROVISIONED trigger",
             "no self-fight: killed replicas did NOT trigger scale_up",
             "agent scales up on FALLING_BEHIND trigger",

@@ -218,6 +218,13 @@ def build_p0_packet(agent: Any, req: JobRequest, rm: ResourceMap) -> TransitionP
         rm,
         default_market=req.preferred_market or "on_demand",
     )
+    # Mirror the recent-failure ranking into the agent's cached cost rows so
+    # the deterministic fallback decision and alternatives helper see the
+    # same safer-first ordering.
+    try:
+        agent._last_cost_rows = rows
+    except Exception:
+        pass
     options: list[ActionOption] = []
     detail_sections: dict[str, Any] = {}
 
