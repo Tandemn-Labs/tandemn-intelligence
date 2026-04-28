@@ -401,11 +401,74 @@ def _detail_sections_for(
 # ---------------------------------------------------------------------------
 
 
+# Diagnosis-aligned ranking table.
+#
+# Keys are the diagnosis codes P5c emits today (koi/harness/p5c.py).
+# Values are tuples ordered "best to worst" recovery action source for that
+# diagnosis. Anything not in this table receives no diagnosis bias and falls
+# back to the standard meets_slo -> recent_failure -> cost ladder.
+#
+# We hand-rolled this rather than building a generic scorer because:
+#   - the recovery prompt benefits from being read by humans (SRE / CEO),
+#   - the v0 set of diagnosis codes is small,
+#   - bias is easy to override in code review.
 _DIAGNOSIS_PREFERS = {
+    # Spot reclaim by the cloud. The cluster, GPU choice, and topology were
+    # fine. What changed is the market.
+    #   1. replace_market       — same GPU + same topology, switch spot ->
+    #                              on_demand. Matches P5c next_fix
+    #                              "retry_same_topology_on_demand". Cheapest,
+    #                              least-risky fix.
+    #   2. migrate_gpu_family   — fall back to a different GPU family if the
+    #                              same family on on_demand is unavailable
+    #                              or quota-tight.
+    #   3. replace_alt_topology — last-resort same-GPU shape change; usually
+    #                              suboptimal because the previous topology
+    #                              was already working.
+    #   4. replace_same         — exactly the scope that just got reclaimed;
+    #                              should only win if every other option is
+    #                              infeasible.
     "spot_preemption": ("replace_market", "migrate_gpu_family", "replace_alt_topology", "replace_same"),
+
+    # Orca reported no capacity for the failed scope. Same recovery shape as
+    # spot preemption: market/region/instance is what changed, not the
+    # workload. Treated identically because P4 doesn't yet distinguish
+    # "market gone" from "spot reclaim" beyond the diagnosis code.
     "no_capacity": ("replace_market", "migrate_gpu_family", "replace_alt_topology", "replace_same"),
+
+    # Cloud-side quota is the bottleneck, not transient capacity. Quotas are
+    # family-scoped, so switching markets within the same family rarely helps.
+    #   1. migrate_gpu_family   — go to a different family with remaining
+    #                              quota.
+    #   2. replace_market       — included as a fallback when quota is split
+    #                              by market.
+    #   3. replace_alt_topology — same family, smaller footprint; sometimes
+    #                              fits under remaining quota.
+    #   4. replace_same         — quota is still pinned; this will almost
+    #                              certainly fail again.
     "quota_exhausted": ("migrate_gpu_family", "replace_market", "replace_alt_topology", "replace_same"),
+
+    # The replica exceeded GPU memory. The fix is structural, not market-side.
+    #   1. migrate_gpu_family   — go to higher VRAM (e.g. L40S 48GB ->
+    #                              A100 80GB). Mirrors P5c's next_fix
+    #                              "increase_vram_or_reduce_memory_pressure".
+    #   2. replace_alt_topology — keep the family, shard differently to
+    #                              reduce per-shard memory pressure.
+    #   3. replace_market       — switching markets won't fix OOM; kept only
+    #                              as a low-priority tie-breaker.
+    #   4. replace_same         — repeat the exact OOMing config. Worst
+    #                              option; kept only as the final tie-break.
     "oom": ("migrate_gpu_family", "replace_alt_topology", "replace_market", "replace_same"),
+
+    # Replica simply stopped reporting. Cause is unknown; the previous config
+    # was working until it died, so a like-for-like replacement is the most
+    # likely correct move.
+    #   1. replace_same         — re-launch the same config; previous one was
+    #                              healthy until the heartbeat dropped.
+    #   2. replace_market       — try the same topology in another market.
+    #   3. replace_alt_topology — change shape if same shape keeps dying.
+    #   4. migrate_gpu_family   — last resort; no evidence the GPU family is
+    #                              wrong yet.
     "heartbeat_timeout": ("replace_same", "replace_market", "replace_alt_topology", "migrate_gpu_family"),
 }
 
