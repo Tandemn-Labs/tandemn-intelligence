@@ -15,6 +15,7 @@ from koi.event_tap import emit_event
 from koi.harness.decision_utils import (
     alternative_payloads,
     placement_config_from_payload,
+    reconstruct_job_request,
     source_to_prediction_source,
 )
 from koi.harness.failures import (
@@ -62,31 +63,6 @@ _KNOWN_SECTIONS = (
     "executor_payload",
     "row",
 )
-
-
-def _reconstruct_job_request(
-    *,
-    decision: dict[str, Any],
-    job_id: str,
-    force_on_demand: bool,
-) -> JobRequest:
-    market = decision.get("market")
-    if force_on_demand:
-        market = "on_demand"
-    if market not in {"spot", "on_demand"}:
-        market = None
-    return JobRequest(
-        job_id=job_id,
-        model_name=str(decision.get("model_name") or "unknown"),
-        avg_input_tokens=max(1, int(decision.get("avg_input_tokens") or 1)),
-        avg_output_tokens=max(1, int(decision.get("avg_output_tokens") or 1)),
-        num_requests=decision.get("num_requests"),
-        slo_deadline_hours=decision.get("slo_deadline_hours") or None,
-        objective=decision.get("objective") or "cheapest",
-        cost_roofline_usd=decision.get("cost_roofline_usd"),
-        preferred_market=market,
-        quantization=decision.get("quantization"),
-    )
 
 
 def _source_for_row(row: dict[str, Any], failed: list[dict[str, Any]]) -> str:
@@ -303,7 +279,7 @@ async def build_p1_packet(
     reconstructed: Optional[JobRequest] = None
 
     if decision is not None:
-        reconstructed = _reconstruct_job_request(
+        reconstructed = reconstruct_job_request(
             decision=decision,
             job_id=getattr(req, "job_id", decision.get("job_id", "unknown")),
             force_on_demand=force_on_demand,

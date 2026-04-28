@@ -1372,6 +1372,39 @@ async def _replica_failed_impl(req: ReplicaFailedRequest) -> Dict[str, Any]:
     response = {"status": "trigger_emitted", "job_id": req.job_id}
     if postmortem is not None:
         response["postmortem"] = postmortem.model_dump(mode="json")
+
+    try:
+        from koi.harness.config import fail_open_enabled, prompt_enabled
+
+        use_p4_harness = prompt_enabled("p4")
+    except Exception:
+        use_p4_harness = False
+        fail_open_enabled = lambda: True  # type: ignore[assignment]
+
+    if use_p4_harness:
+        try:
+            from koi.harness.p4 import run_replica_recovery
+
+            recovery = await run_replica_recovery(
+                agent=app.state.agent,
+                req=req,
+                tracker=tracker,
+                memory=app.state.memory,
+                diagnosis=postmortem,
+                region=region,
+                market=market,
+                ledger=app.state.ledger,
+            )
+            response["recovery"] = recovery
+        except Exception as e:
+            if not fail_open_enabled():
+                raise
+            logger.warning(
+                "p4_harness_failed_open",
+                job_id=req.job_id,
+                error=str(e),
+            )
+
     return response
 
 

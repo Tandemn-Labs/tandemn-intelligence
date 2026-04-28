@@ -1328,6 +1328,177 @@ class TestReplicaFailed:
         assert cooloffs[0]["diagnosis_code"] == "spot_preemption"
 
     @pytest.mark.asyncio
+    async def test_p4_recovery_appends_plan_when_p4_flag_enabled(self, client, monkeypatch):
+        """When p4 flag is on, the response should include a recovery plan
+        produced by run_replica_recovery."""
+        import asyncio
+        from koi.harness import p4 as p4_module
+        from koi.schemas import JobTracker, MonitoringStatus
+
+        config = PlacementConfig(
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            num_gpus=4,
+            num_instances=1,
+            tp=4,
+            pp=1,
+            dp=1,
+            region="us-east-1",
+            engine_config=EngineConfig(
+                tensor_parallel_size=4, pipeline_parallel_size=1
+            ),
+            market="spot",
+        )
+        tracker = JobTracker(
+            job_id="r0",
+            config=config,
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
+            predicted_tps=1200.0,
+        )
+        tracker.smoothed_tps = 1180.0
+
+        dec_id = app.state.memory.record_decision(
+            job_id="parent-job-p4",
+            model_name="Qwen/Qwen3-32B",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=10.49,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=512,
+            avg_output_tokens=512,
+            num_requests=5000,
+            market="spot",
+        )
+        tracker.decision_id = dec_id
+
+        app.state.monitor.tracked_jobs = {"r0": tracker}
+        app.state.monitor._koi_initiated_kills = set()
+        app.state.monitor._trigger_queue = asyncio.Queue()
+        app.state.monitor._pending_launches = {}
+
+        async def _stub_recovery(**kwargs):
+            assert kwargs["region"] == "us-east-1"
+            assert kwargs["market"] == "spot"
+            return {
+                "action": "replace_market",
+                "decision_id": "dec-recovery-1",
+                "parent_decision_id": dec_id,
+                "config": {
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "tp": 4,
+                    "pp": 1,
+                    "dp": 1,
+                    "market": "on_demand",
+                    "region": "us-east-1",
+                },
+                "reasoning": "p4 stub plan",
+                "confidence": 0.7,
+                "retry_budget_remaining": 2,
+            }
+
+        monkeypatch.setattr(p4_module, "run_replica_recovery", _stub_recovery)
+        monkeypatch.setenv("KOI_HARNESS", "1")
+        monkeypatch.setenv("KOI_HARNESS_PROMPTS", "p4")
+
+        resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "r0",
+                "group_id": "parent-job-p4",
+                "status": "failed",
+                "reason": "SpotInstanceInterruption",
+                "region": "us-east-1",
+                "market": "spot",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "trigger_emitted"
+        assert body["recovery"]["action"] == "replace_market"
+        assert body["recovery"]["parent_decision_id"] == dec_id
+        assert tracker.status == MonitoringStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_p4_recovery_fail_open_preserves_legacy_behavior(self, client, monkeypatch):
+        """A P4 reasoner crash with fail-open must not break the webhook contract."""
+        import asyncio
+        from koi.harness import p4 as p4_module
+        from koi.schemas import JobTracker
+
+        config = PlacementConfig(
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            num_gpus=4,
+            num_instances=1,
+            tp=4,
+            pp=1,
+            dp=1,
+            region="us-east-1",
+            engine_config=EngineConfig(
+                tensor_parallel_size=4, pipeline_parallel_size=1
+            ),
+        )
+        tracker = JobTracker(
+            job_id="r0",
+            config=config,
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
+            predicted_tps=1200.0,
+        )
+        tracker.smoothed_tps = 1100.0
+        dec_id = app.state.memory.record_decision(
+            job_id="parent-job-p4",
+            model_name="Qwen/Qwen3-32B",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=10.49,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=512,
+            avg_output_tokens=512,
+        )
+        tracker.decision_id = dec_id
+        app.state.monitor.tracked_jobs = {"r0": tracker}
+        app.state.monitor._koi_initiated_kills = set()
+        app.state.monitor._trigger_queue = asyncio.Queue()
+        app.state.monitor._pending_launches = {}
+
+        async def _boom(**kwargs):
+            raise RuntimeError("p4 exploded")
+
+        monkeypatch.setattr(p4_module, "run_replica_recovery", _boom)
+        monkeypatch.setenv("KOI_HARNESS", "1")
+        monkeypatch.setenv("KOI_HARNESS_PROMPTS", "p4")
+        monkeypatch.setenv("KOI_HARNESS_FAIL_OPEN", "1")
+
+        resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "r0",
+                "group_id": "parent-job-p4",
+                "status": "failed",
+                "reason": "Heartbeat timeout (45s)",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "trigger_emitted"
+        assert "recovery" not in body
+
+    @pytest.mark.asyncio
     async def test_p5c_harness_fail_open_preserves_legacy_behavior(self, client, monkeypatch):
         """Harness exception should not break legacy replica-failed handling."""
         import asyncio

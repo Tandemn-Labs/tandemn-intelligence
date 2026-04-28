@@ -2573,6 +2573,148 @@ def run_tier2():
         ]:
             skip(name, str(e))
 
+    # ── T2.14: Phase 5 P4 replica recovery (deterministic, no LLM) ─────────
+    section("T2.14  /job/replica-failed P4 recovery returns plan + child decision")
+
+    try:
+        p4_env = {
+            "KOI_HARNESS": "1",
+            "KOI_HARNESS_PROMPTS": "p5c,p4",
+            "KOI_HARNESS_FAIL_OPEN": "0",
+            "KOI_TEST_FAKE_DECIDE": "1",
+            "KOI_TEST_GPU_TYPE": "L40S",
+            "KOI_TEST_REQUIRED_GPUS": "4",
+            "KOI_WARMUP_MINUTES": "0",
+        }
+        with koi_server(api_key="dummy", extra_env=p4_env) as db_path:
+            from koi.tools.memory import AgenticMemory
+
+            decide_payload = {
+                "job_request": {
+                    "model_name": "Qwen/Qwen3-32B",
+                    "task_type": "batch",
+                    "avg_input_tokens": 953,
+                    "avg_output_tokens": 1024,
+                    "num_requests": 5000,
+                    "slo_deadline_hours": 8.0,
+                    "objective": "cheapest",
+                    "preferred_market": "spot",
+                },
+                "resource_map": {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                            "region": "us-east-1",
+                            "interconnect": "PCIe",
+                        },
+                        {
+                            "instance_type": "p4de.24xlarge",
+                            "gpu_type": "A100-80GB",
+                            "gpus_per_instance": 8,
+                            "vcpus": 96,
+                            "quota_family": "P",
+                            "gpu_memory_gb": 80.0,
+                            "cost_per_instance_hour_usd": 40.96,
+                            "region": "us-east-1",
+                            "interconnect": "NVLink",
+                        },
+                    ],
+                    "quotas": [
+                        {"family": "G", "region": "us-east-1", "market": "spot", "baseline_vcpus": 96, "used_vcpus": 0},
+                        {"family": "G", "region": "us-east-1", "market": "on_demand", "baseline_vcpus": 96, "used_vcpus": 0},
+                        {"family": "P", "region": "us-east-1", "market": "on_demand", "baseline_vcpus": 96, "used_vcpus": 0},
+                    ],
+                },
+            }
+            decide_resp = requests.post(
+                f"{KOI_URL}/decide", json=decide_payload, timeout=30
+            )
+            decide_resp.raise_for_status()
+            decide_body = decide_resp.json()
+            parent_decision_id = decide_body["_decision_id"]
+            replica_id = "p4-r0"
+
+            post(
+                f"{KOI_URL}/job/started",
+                {
+                    "job_id": replica_id,
+                    "decision_id": parent_decision_id,
+                    "group_id": "p4-group",
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "region": "us-east-1",
+                    "market": "spot",
+                    "tp": 4,
+                    "pp": 1,
+                    "dp": 1,
+                    "slo_deadline_hours": 8.0,
+                    "total_tokens": 6_000_000,
+                    "predicted_tps": 1200.0,
+                },
+            )
+
+            response = post(
+                f"{KOI_URL}/job/replica-failed",
+                {
+                    "job_id": replica_id,
+                    "group_id": "p4-group",
+                    "status": "failed",
+                    "reason": "SpotInstanceInterruption",
+                    "region": "us-east-1",
+                    "market": "spot",
+                },
+            )
+
+            def t_p4_response_includes_recovery_plan():
+                assert response.get("status") == "trigger_emitted", response
+                assert response.get("postmortem"), response
+                recovery = response.get("recovery")
+                assert recovery is not None, response
+                assert recovery.get("parent_decision_id") == parent_decision_id, recovery
+                assert recovery.get("action") in {
+                    "replace_market",
+                    "migrate_gpu_family",
+                    "replace_alt_topology",
+                    "hold",
+                    "abort",
+                }, recovery
+
+            def t_p4_records_recovery_child_decision_when_replaced():
+                recovery = response.get("recovery") or {}
+                if recovery.get("action") in {"hold", "abort"}:
+                    return
+                child_id = recovery.get("decision_id")
+                assert child_id and child_id != parent_decision_id, recovery
+                m = AgenticMemory(db_path)
+                child = m.get_decision(child_id)
+                assert child is not None, child_id
+                assert child.get("triggered_by") == "replica_recovery", child
+                assert child.get("parent_decision_id") == parent_decision_id, child
+                # Spot preemption should force on_demand recovery.
+                assert child.get("market") == "on_demand", child
+
+            check(
+                "P4 attaches structured recovery plan to replica-failed response",
+                t_p4_response_includes_recovery_plan,
+            )
+            check(
+                "P4 records replica_recovery child decision tied to parent",
+                t_p4_records_recovery_child_decision_when_replaced,
+            )
+
+    except RuntimeError as e:
+        for name in [
+            "P4 attaches structured recovery plan to replica-failed response",
+            "P4 records replica_recovery child decision tied to parent",
+        ]:
+            skip(name, str(e))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TIER 3 — Full agent loop (requires KOI_API_KEY or ANTHROPIC_API_KEY)
@@ -3133,6 +3275,442 @@ def run_tier3(api_key: str):
         for name in [
             "P0 LLM does not pick recently failed launch scope",
             "P0 LLM picks an alternative GPU or market vs failed scope",
+        ]:
+            skip(name, str(e))
+
+    # ── T3.6: P4 replica recovery LLM scenario ────────────────────────────
+    section("T3.6  P4 replica recovery LLM picks diagnosis-aligned action")
+
+    try:
+        p4_llm_env = {
+            "KOI_HARNESS": "1",
+            "KOI_HARNESS_PROMPTS": "p5c,p4",
+            "KOI_HARNESS_FAIL_OPEN": "0",
+            "KOI_WARMUP_MINUTES": "0",
+        }
+        with koi_server(api_key=api_key, extra_env=p4_llm_env) as db_path:
+            from koi.tools.memory import AgenticMemory
+
+            seed_memory = AgenticMemory(db_path)
+            model_name = "p4-llm-recovery-test/Qwen-32B"
+
+            # Seed verified outcomes for both options so the cost table has
+            # both candidates for the recovery menu.
+            l40s_dec = seed_memory.record_decision(
+                job_id="seed-l40s-job",
+                model_name=model_name,
+                instance_type="g6e.12xlarge",
+                gpu_type="L40S",
+                tp=4,
+                pp=1,
+                dp=1,
+                num_gpus=4,
+                predicted_tps=1200.0,
+                predicted_cost_per_hour=10.49,
+                predicted_total_cost=12.40,
+                slo_deadline_hours=2.0,
+                objective="cheapest",
+                avg_input_tokens=512,
+                avg_output_tokens=512,
+                num_requests=5000,
+                market="spot",
+            )
+            seed_memory.record_outcome(
+                decision_id=l40s_dec,
+                job_id="seed-l40s-job",
+                status="succeeded",
+                actual_tps=1200.0,
+                actual_cost_per_hour=10.49,
+                actual_total_cost=12.40,
+                actual_runtime_hours=1.18,
+                slo_met=True,
+            )
+            a100_dec = seed_memory.record_decision(
+                job_id="seed-a100-job",
+                model_name=model_name,
+                instance_type="p4de.24xlarge",
+                gpu_type="A100-80GB",
+                tp=8,
+                pp=1,
+                dp=1,
+                num_gpus=8,
+                predicted_tps=2400.0,
+                predicted_cost_per_hour=40.96,
+                predicted_total_cost=24.16,
+                slo_deadline_hours=2.0,
+                objective="cheapest",
+                avg_input_tokens=512,
+                avg_output_tokens=512,
+                num_requests=5000,
+                market="on_demand",
+            )
+            seed_memory.record_outcome(
+                decision_id=a100_dec,
+                job_id="seed-a100-job",
+                status="succeeded",
+                actual_tps=2400.0,
+                actual_cost_per_hour=40.96,
+                actual_total_cost=24.16,
+                actual_runtime_hours=0.59,
+                slo_met=True,
+            )
+
+            decide_payload = {
+                "job_request": {
+                    "model_name": model_name,
+                    "task_type": "batch",
+                    "avg_input_tokens": 512,
+                    "avg_output_tokens": 512,
+                    "num_requests": 5000,
+                    "slo_deadline_hours": 2.0,
+                    "objective": "cheapest",
+                    "preferred_market": "spot",
+                },
+                "resource_map": {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                            "region": "us-east-1",
+                            "interconnect": "PCIe",
+                        },
+                        {
+                            "instance_type": "p4de.24xlarge",
+                            "gpu_type": "A100-80GB",
+                            "gpus_per_instance": 8,
+                            "vcpus": 96,
+                            "quota_family": "P",
+                            "gpu_memory_gb": 80.0,
+                            "cost_per_instance_hour_usd": 40.96,
+                            "region": "us-east-1",
+                            "interconnect": "NVLink",
+                        },
+                    ],
+                    "quotas": [
+                        {"family": "G", "region": "us-east-1", "market": "spot", "baseline_vcpus": 96, "used_vcpus": 0},
+                        {"family": "G", "region": "us-east-1", "market": "on_demand", "baseline_vcpus": 96, "used_vcpus": 0},
+                        {"family": "P", "region": "us-east-1", "market": "on_demand", "baseline_vcpus": 96, "used_vcpus": 0},
+                    ],
+                },
+            }
+            decide_resp = requests.post(
+                f"{KOI_URL}/decide", json=decide_payload, timeout=180
+            )
+            decide_resp.raise_for_status()
+            parent_decision_id = decide_resp.json()["_decision_id"]
+            replica_id = "p4-llm-r0"
+
+            post(
+                f"{KOI_URL}/job/started",
+                {
+                    "job_id": replica_id,
+                    "decision_id": parent_decision_id,
+                    "group_id": "p4-llm-group",
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "region": "us-east-1",
+                    "market": "spot",
+                    "tp": 4,
+                    "pp": 1,
+                    "dp": 1,
+                    "slo_deadline_hours": 2.0,
+                    "total_tokens": 6_000_000,
+                    "predicted_tps": 1200.0,
+                },
+            )
+
+            response = requests.post(
+                f"{KOI_URL}/job/replica-failed",
+                json={
+                    "job_id": replica_id,
+                    "group_id": "p4-llm-group",
+                    "status": "failed",
+                    "reason": "SpotInstanceInterruption",
+                    "region": "us-east-1",
+                    "market": "spot",
+                },
+                timeout=240,
+            ).json()
+
+            def t_p4_llm_response_has_recovery_plan():
+                assert response.get("status") == "trigger_emitted", response
+                recovery = response.get("recovery")
+                assert recovery is not None, response
+                assert recovery.get("parent_decision_id") == parent_decision_id, recovery
+                assert recovery.get("action") in {
+                    "replace_market",
+                    "migrate_gpu_family",
+                    "replace_alt_topology",
+                    "hold",
+                    "abort",
+                }, recovery
+
+            def t_p4_llm_avoids_recently_failed_scope():
+                recovery = response.get("recovery") or {}
+                if recovery.get("action") in {"hold", "abort"}:
+                    return
+                cfg = recovery.get("config") or {}
+                failed_scope = ("L40S", "g6e.12xlarge", "us-east-1", "spot")
+                chosen_scope = (
+                    cfg.get("gpu_type"),
+                    cfg.get("instance_type"),
+                    cfg.get("region"),
+                    (cfg.get("market") or "").lower(),
+                )
+                assert chosen_scope != failed_scope, recovery
+                # Spot preemption diagnosis must result in either a different
+                # GPU family OR a different market. Same-GPU replacement on
+                # the failed market would mean ignoring the diagnosis.
+                gpu = cfg.get("gpu_type")
+                market = (cfg.get("market") or "").lower()
+                acceptable = gpu != "L40S" or market != "spot"
+                assert acceptable, (
+                    f"LLM picked same-GPU spot replacement after spot_preemption: {cfg}"
+                )
+
+            def t_p4_llm_records_child_decision_when_replaced():
+                recovery = response.get("recovery") or {}
+                if recovery.get("action") in {"hold", "abort"}:
+                    return
+                child_id = recovery.get("decision_id")
+                assert child_id and child_id != parent_decision_id, recovery
+                m = AgenticMemory(db_path)
+                child = m.get_decision(child_id)
+                assert child is not None, child_id
+                assert child.get("triggered_by") == "replica_recovery", child
+                assert child.get("parent_decision_id") == parent_decision_id, child
+
+            check(
+                "P4 LLM returns recovery plan tied to parent decision",
+                t_p4_llm_response_has_recovery_plan,
+            )
+            check(
+                "P4 LLM avoids the recently failed L40S spot scope",
+                t_p4_llm_avoids_recently_failed_scope,
+            )
+            check(
+                "P4 LLM records replica_recovery child decision when replacing",
+                t_p4_llm_records_child_decision_when_replaced,
+            )
+
+    except RuntimeError as e:
+        for name in [
+            "P4 LLM returns recovery plan tied to parent decision",
+            "P4 LLM avoids the recently failed L40S spot scope",
+            "P4 LLM records replica_recovery child decision when replacing",
+        ]:
+            skip(name, str(e))
+
+    # ── T3.7: P4 LLM honors diagnosis next_fix ranking ───────────────────
+    # Same setup as T3.6 but with a stricter post-condition: when the
+    # diagnosis explicitly prefers `replace_market` (spot -> on_demand),
+    # the LLM should NOT pick a same-GPU spot retry, AND the chosen action
+    # type should be a diagnosis-aligned source (replace_market or
+    # migrate_gpu_family or replace_alt_topology). This exercises the
+    # LLM reading the P4 prompt's diagnosis context, not just rank order.
+    section("T3.7  P4 LLM honors diagnosis-aligned next_fix")
+
+    try:
+        p4_llm_env = {
+            "KOI_HARNESS": "1",
+            "KOI_HARNESS_PROMPTS": "p5c,p4",
+            "KOI_HARNESS_FAIL_OPEN": "0",
+            "KOI_WARMUP_MINUTES": "0",
+        }
+        with koi_server(api_key=api_key, extra_env=p4_llm_env) as db_path:
+            from koi.tools.memory import AgenticMemory
+
+            seed_memory = AgenticMemory(db_path)
+            model_name = "p4-llm-diagnosis-test/Qwen-32B"
+
+            l40s_dec = seed_memory.record_decision(
+                job_id="seed-l40s-diag",
+                model_name=model_name,
+                instance_type="g6e.12xlarge",
+                gpu_type="L40S",
+                tp=4,
+                pp=1,
+                dp=1,
+                num_gpus=4,
+                predicted_tps=1200.0,
+                predicted_cost_per_hour=10.49,
+                predicted_total_cost=12.40,
+                slo_deadline_hours=2.0,
+                objective="cheapest",
+                avg_input_tokens=512,
+                avg_output_tokens=512,
+                num_requests=5000,
+                market="spot",
+            )
+            seed_memory.record_outcome(
+                decision_id=l40s_dec,
+                job_id="seed-l40s-diag",
+                status="succeeded",
+                actual_tps=1200.0,
+                actual_cost_per_hour=10.49,
+                actual_total_cost=12.40,
+                actual_runtime_hours=1.18,
+                slo_met=True,
+            )
+            a100_dec = seed_memory.record_decision(
+                job_id="seed-a100-diag",
+                model_name=model_name,
+                instance_type="p4de.24xlarge",
+                gpu_type="A100-80GB",
+                tp=8,
+                pp=1,
+                dp=1,
+                num_gpus=8,
+                predicted_tps=2400.0,
+                predicted_cost_per_hour=40.96,
+                predicted_total_cost=24.16,
+                slo_deadline_hours=2.0,
+                objective="cheapest",
+                avg_input_tokens=512,
+                avg_output_tokens=512,
+                num_requests=5000,
+                market="on_demand",
+            )
+            seed_memory.record_outcome(
+                decision_id=a100_dec,
+                job_id="seed-a100-diag",
+                status="succeeded",
+                actual_tps=2400.0,
+                actual_cost_per_hour=40.96,
+                actual_total_cost=24.16,
+                actual_runtime_hours=0.59,
+                slo_met=True,
+            )
+
+            decide_payload = {
+                "job_request": {
+                    "model_name": model_name,
+                    "task_type": "batch",
+                    "avg_input_tokens": 512,
+                    "avg_output_tokens": 512,
+                    "num_requests": 5000,
+                    "slo_deadline_hours": 2.0,
+                    "objective": "cheapest",
+                    "preferred_market": "spot",
+                },
+                "resource_map": {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                            "region": "us-east-1",
+                            "interconnect": "PCIe",
+                        },
+                        {
+                            "instance_type": "p4de.24xlarge",
+                            "gpu_type": "A100-80GB",
+                            "gpus_per_instance": 8,
+                            "vcpus": 96,
+                            "quota_family": "P",
+                            "gpu_memory_gb": 80.0,
+                            "cost_per_instance_hour_usd": 40.96,
+                            "region": "us-east-1",
+                            "interconnect": "NVLink",
+                        },
+                    ],
+                    "quotas": [
+                        {"family": "G", "region": "us-east-1", "market": "spot", "baseline_vcpus": 96, "used_vcpus": 0},
+                        {"family": "G", "region": "us-east-1", "market": "on_demand", "baseline_vcpus": 96, "used_vcpus": 0},
+                        {"family": "P", "region": "us-east-1", "market": "on_demand", "baseline_vcpus": 96, "used_vcpus": 0},
+                    ],
+                },
+            }
+            decide_resp = requests.post(
+                f"{KOI_URL}/decide", json=decide_payload, timeout=180
+            )
+            decide_resp.raise_for_status()
+            parent_decision_id = decide_resp.json()["_decision_id"]
+            replica_id = "p4-diag-r0"
+
+            post(
+                f"{KOI_URL}/job/started",
+                {
+                    "job_id": replica_id,
+                    "decision_id": parent_decision_id,
+                    "group_id": "p4-diag-group",
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "region": "us-east-1",
+                    "market": "spot",
+                    "tp": 4,
+                    "pp": 1,
+                    "dp": 1,
+                    "slo_deadline_hours": 2.0,
+                    "total_tokens": 6_000_000,
+                    "predicted_tps": 1200.0,
+                },
+            )
+
+            response = requests.post(
+                f"{KOI_URL}/job/replica-failed",
+                json={
+                    "job_id": replica_id,
+                    "group_id": "p4-diag-group",
+                    "status": "failed",
+                    "reason": "SpotInstanceInterruption",
+                    "region": "us-east-1",
+                    "market": "spot",
+                },
+                timeout=240,
+            ).json()
+
+            def t_p4_llm_diagnosis_in_response_payload():
+                pm = response.get("postmortem") or {}
+                assert pm.get("diagnosis_code") == "spot_preemption", pm
+                assert pm.get("next_fix") == "retry_same_topology_on_demand", pm
+                recovery = response.get("recovery") or {}
+                assert recovery.get("diagnosis_code") == "spot_preemption", recovery
+
+            def t_p4_llm_chosen_action_is_diagnosis_aligned():
+                recovery = response.get("recovery") or {}
+                action = recovery.get("action")
+                # Either pick a diagnosis-preferred source or hold/abort.
+                aligned = {
+                    "replace_market",
+                    "migrate_gpu_family",
+                    "replace_alt_topology",
+                    "hold",
+                    "abort",
+                }
+                assert action in aligned, recovery
+                # If we replaced, the chosen GPU+market combination must NOT
+                # be the failed scope L40S spot.
+                if action in {"replace_market", "migrate_gpu_family", "replace_alt_topology"}:
+                    cfg = recovery.get("config") or {}
+                    same_gpu_same_market = (
+                        cfg.get("gpu_type") == "L40S"
+                        and (cfg.get("market") or "").lower() == "spot"
+                    )
+                    assert not same_gpu_same_market, recovery
+
+            check(
+                "P4 LLM response carries the spot_preemption diagnosis + next_fix",
+                t_p4_llm_diagnosis_in_response_payload,
+            )
+            check(
+                "P4 LLM chosen action is diagnosis-aligned (not same-GPU spot retry)",
+                t_p4_llm_chosen_action_is_diagnosis_aligned,
+            )
+
+    except RuntimeError as e:
+        for name in [
+            "P4 LLM response carries the spot_preemption diagnosis + next_fix",
+            "P4 LLM chosen action is diagnosis-aligned (not same-GPU spot retry)",
         ]:
             skip(name, str(e))
 
@@ -3871,6 +4449,11 @@ if __name__ == "__main__":
             "P5c LLM persists active cooloff for spot scope",
             "P0 LLM does not pick recently failed launch scope",
             "P0 LLM picks an alternative GPU or market vs failed scope",
+            "P4 LLM returns recovery plan tied to parent decision",
+            "P4 LLM avoids the recently failed L40S spot scope",
+            "P4 LLM records replica_recovery child decision when replacing",
+            "P4 LLM response carries the spot_preemption diagnosis + next_fix",
+            "P4 LLM chosen action is diagnosis-aligned (not same-GPU spot retry)",
             "agent scaled down on OVER_PROVISIONED trigger",
             "no self-fight: killed replicas did NOT trigger scale_up",
             "agent scales up on FALLING_BEHIND trigger",
