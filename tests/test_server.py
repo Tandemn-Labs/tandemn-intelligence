@@ -71,6 +71,9 @@ async def client():
     app.state.agent.model = "claude-sonnet-4-6"
     app.state.agent.decide = AsyncMock(return_value=_mock_decision())
     app.state.agent.handle_trigger = AsyncMock(return_value="ok")
+    # Cold-start failure recovery — default to a no-op response. Tests that
+    # exercise the recovery path override this with their own AsyncMock.
+    app.state.agent.recover_from_startup_failure = AsyncMock(return_value="ok")
     monitor = MagicMock()
     monitor.tracked_jobs = {}
     monitor._pending_launches = {}
@@ -570,7 +573,10 @@ class TestLaunchFailed:
                         "market": "on_demand",
                     },
                 ],
-                "failure_reasons": ["InsufficientCapacity", "QuotaExceeded"],
+                # Use unrecoverable categories so this test exercises the
+                # legacy "recorded" path, not the new agent-driven retry.
+                # Recovery is covered separately in TestLaunchFailedRecovery.
+                "failure_reasons": ["QuotaExceeded", "QuotaExceeded"],
                 "total_time_seconds": 240.0,
             },
         )
@@ -1872,3 +1878,470 @@ class TestListJobs:
         assert job["projected_remaining_cost_usd"] is None
         assert job["projected_total_cost_usd"] is None
         assert job["cost_overage_usd"] is None
+
+# ===========================================================================
+# Cold-start failure recovery
+# ===========================================================================
+#
+# When a replica dies during vLLM startup (CUDA OOM, missing model arch,
+# weight-load failure), Orca fires /job/replica-failed BEFORE the replica
+# ever transitioned via /job/started — so it's in monitor._pending_launches,
+# not monitor.tracked_jobs. Pre-recovery, _replica_failed_impl returned
+# {"status": "unknown"} for these and Koi silently dropped the event.
+# These tests exercise the new path that detects pending-launch deaths,
+# records the attempt, and asks the agent to pick a different config.
+
+
+class TestReplicaFailedStartupRecovery:
+    """`/job/replica-failed` for a replica still in _pending_launches."""
+
+    @pytest.mark.asyncio
+    async def test_pending_launch_oom_triggers_agent_recovery(self, client):
+        """OOM during cold-start with budget remaining → agent.recover called,
+        scale_chain_tool path drives a new launch, status=retrying."""
+        from koi.server import app as _app
+
+        # Pre-register a pending launch that's about to die
+        _app.state.monitor.track_pending_launch(
+            "mo-test-aaaa-r0",
+            {
+                "decision_id": "dec-aaaa1234",
+                "group_id": "mo-test-aaaa",
+                "instance_type": "g6.xlarge",
+                "gpu_type": "L4",
+                "region": "us-east-1",
+                "market": "on_demand",
+            },
+        )
+        # Agent will be called — make it return a non-NO_VIABLE answer
+        _app.state.agent.recover_from_startup_failure = AsyncMock(
+            return_value="Called scale_chain_tool with L40S TP=1 PP=1 count=1"
+        )
+
+        resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "mo-test-aaaa-r0",
+                "group_id": "mo-test-aaaa",
+                "decision_id": "dec-aaaa1234",
+                "instance_type": "g6.xlarge",
+                "region": "us-east-1",
+                "market": "on_demand",
+                "status": "failed",
+                "reason": "vLLM exited with code 1 during startup — CUDA out of memory",
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "retrying"
+        assert body["parent_job_id"] == "mo-test-aaaa"
+        # Agent was actually invoked with the right context
+        _app.state.agent.recover_from_startup_failure.assert_called_once()
+        kwargs = _app.state.agent.recover_from_startup_failure.call_args.kwargs
+        assert kwargs["parent_job_id"] == "mo-test-aaaa"
+        assert kwargs["failure_category"] == "oom"
+
+    @pytest.mark.asyncio
+    async def test_pending_launch_unknown_category_records_no_recovery(self, client):
+        """Non-recoverable failure (unknown reason) → recorded but no retry."""
+        from koi.server import app as _app
+
+        _app.state.monitor.track_pending_launch(
+            "mo-test-bbbb-r0",
+            {
+                "decision_id": "dec-bbbb1234",
+                "group_id": "mo-test-bbbb",
+                "instance_type": "g6e.xlarge",
+                "gpu_type": "L40S",
+                "region": "us-east-1",
+                "market": "on_demand",
+            },
+        )
+        _app.state.agent.recover_from_startup_failure = AsyncMock()
+
+        resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "mo-test-bbbb-r0",
+                "group_id": "mo-test-bbbb",
+                "decision_id": "dec-bbbb1234",
+                "instance_type": "g6e.xlarge",
+                "region": "us-east-1",
+                "market": "on_demand",
+                "status": "failed",
+                "reason": "weights file corrupted",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "recorded_no_recovery"
+        assert body["failure_category"] == "unknown"
+        _app.state.agent.recover_from_startup_failure.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pending_launch_oom_after_budget_exhausted(self, client):
+        """If MAX_STARTUP_RETRIES launch attempts already recorded for this
+        parent group, return status=exhausted instead of calling the agent."""
+        from koi.server import app as _app
+        from koi.server import MAX_STARTUP_RETRIES
+
+        # Pre-seed launch_attempts so count_launch_attempts hits the cap
+        memory: AgenticMemory = _app.state.memory
+        for i in range(MAX_STARTUP_RETRIES):
+            memory.record_launch_attempt(
+                decision_id="dec-cccc1234",
+                job_id=f"mo-test-cccc-r{i}",
+                instance_type="g6.xlarge",
+                gpu_type="L4",
+                region="us-east-1",
+                market="on_demand",
+                count=1,
+                launched=False,
+                failure_reason="CUDA out of memory",
+                failure_category="oom",
+            )
+
+        _app.state.monitor.track_pending_launch(
+            "mo-test-cccc-r9",
+            {
+                "decision_id": "dec-cccc1234",
+                "group_id": "mo-test-cccc",
+                "instance_type": "g6.xlarge",
+                "gpu_type": "L4",
+                "region": "us-east-1",
+                "market": "on_demand",
+            },
+        )
+        _app.state.agent.recover_from_startup_failure = AsyncMock()
+
+        resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "mo-test-cccc-r9",
+                "group_id": "mo-test-cccc",
+                "decision_id": "dec-cccc1234",
+                "instance_type": "g6.xlarge",
+                "region": "us-east-1",
+                "market": "on_demand",
+                "status": "failed",
+                "reason": "vLLM exited with code 1 — CUDA out of memory",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "exhausted"
+        # Agent must NOT be called when budget is exhausted
+        _app.state.agent.recover_from_startup_failure.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pending_launch_oom_agent_returns_no_alternative(self, client):
+        """Agent says NO_VIABLE_ALTERNATIVE → status=no_alternative, no retry."""
+        from koi.server import app as _app
+
+        _app.state.monitor.track_pending_launch(
+            "mo-test-dddd-r0",
+            {
+                "decision_id": "dec-dddd1234",
+                "group_id": "mo-test-dddd",
+                "instance_type": "g6e.xlarge",
+                "gpu_type": "L40S",
+                "region": "us-east-1",
+                "market": "on_demand",
+            },
+        )
+        _app.state.agent.recover_from_startup_failure = AsyncMock(
+            return_value="NO_VIABLE_ALTERNATIVE — every config in the menu would also OOM"
+        )
+
+        resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "mo-test-dddd-r0",
+                "group_id": "mo-test-dddd",
+                "decision_id": "dec-dddd1234",
+                "instance_type": "g6e.xlarge",
+                "region": "us-east-1",
+                "market": "on_demand",
+                "status": "failed",
+                "reason": "CUDA out of memory",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "no_alternative"
+
+    @pytest.mark.asyncio
+    async def test_no_pending_no_tracked_still_unknown(self, client):
+        """Nothing tracked, nothing pending → unchanged legacy behavior."""
+        from koi.server import app as _app
+
+        _app.state.agent.recover_from_startup_failure = AsyncMock()
+        resp = await client.post(
+            "/job/replica-failed",
+            json={
+                "job_id": "mo-ghost-9999-r0",
+                "group_id": "mo-ghost-9999",
+                "instance_type": "unknown",
+                "region": "unknown",
+                "market": "unknown",
+                "status": "failed",
+                "reason": "out of memory",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "unknown"
+        _app.state.agent.recover_from_startup_failure.assert_not_called()
+
+
+class TestLaunchFailedRecovery:
+    """`/job/launch-failed` (all replicas in a group died during launch)."""
+
+    @pytest.mark.asyncio
+    async def test_all_oom_triggers_agent_retry(self, client):
+        """Every config tried hit OOM → agent is called for re-decision."""
+        from koi.server import app as _app
+
+        _app.state.agent.recover_from_startup_failure = AsyncMock(
+            return_value="Called scale_chain_tool with L40S TP=1 count=1"
+        )
+
+        resp = await client.post(
+            "/job/launch-failed",
+            json={
+                "job_id": "mo-test-eeee",
+                "decision_id": "dec-eeee1234",
+                "configs_tried": [
+                    {
+                        "instance_type": "g6.xlarge",
+                        "gpu_type": "L4",
+                        "region": "us-east-1",
+                        "market": "on_demand",
+                    },
+                    {
+                        "instance_type": "g6.xlarge",
+                        "gpu_type": "L4",
+                        "region": "us-west-2",
+                        "market": "on_demand",
+                    },
+                ],
+                "failure_reasons": [
+                    "CUDA out of memory during sampler warmup",
+                    "torch.cuda.OutOfMemoryError",
+                ],
+                "total_time_seconds": 600,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "retrying"
+        _app.state.agent.recover_from_startup_failure.assert_called_once()
+        kwargs = _app.state.agent.recover_from_startup_failure.call_args.kwargs
+        assert kwargs["failure_category"] == "oom"
+
+    @pytest.mark.asyncio
+    async def test_unknown_failures_just_recorded(self, client):
+        """Mixed/unknown failure categories → fall back to existing record-only behavior."""
+        from koi.server import app as _app
+
+        _app.state.agent.recover_from_startup_failure = AsyncMock()
+
+        resp = await client.post(
+            "/job/launch-failed",
+            json={
+                "job_id": "mo-test-ffff",
+                "decision_id": "dec-ffff1234",
+                "configs_tried": [
+                    {
+                        "instance_type": "p4d.24xlarge",
+                        "gpu_type": "A100",
+                        "region": "us-east-1",
+                        "market": "on_demand",
+                    }
+                ],
+                "failure_reasons": ["something nondescript happened"],
+                "total_time_seconds": 120,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "recorded"
+        _app.state.agent.recover_from_startup_failure.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_oom_but_budget_exhausted(self, client):
+        """All-OOM failure but we've already retried MAX_STARTUP_RETRIES times → exhausted."""
+        from koi.server import app as _app
+        from koi.server import MAX_STARTUP_RETRIES
+
+        memory: AgenticMemory = _app.state.memory
+        for i in range(MAX_STARTUP_RETRIES):
+            memory.record_launch_attempt(
+                decision_id="dec-gggg1234",
+                job_id=f"mo-test-gggg-r{i}",
+                instance_type="g6.xlarge",
+                gpu_type="L4",
+                region="us-east-1",
+                market="on_demand",
+                count=1,
+                launched=False,
+                failure_reason="CUDA out of memory",
+                failure_category="oom",
+            )
+
+        _app.state.agent.recover_from_startup_failure = AsyncMock()
+
+        resp = await client.post(
+            "/job/launch-failed",
+            json={
+                "job_id": "mo-test-gggg",
+                "decision_id": "dec-gggg1234",
+                "configs_tried": [
+                    {
+                        "instance_type": "g6.xlarge",
+                        "gpu_type": "L4",
+                        "region": "us-east-1",
+                        "market": "on_demand",
+                    }
+                ],
+                "failure_reasons": ["CUDA out of memory"],
+                "total_time_seconds": 300,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "exhausted"
+        _app.state.agent.recover_from_startup_failure.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_agent_returns_no_alternative(self, client):
+        from koi.server import app as _app
+
+        _app.state.agent.recover_from_startup_failure = AsyncMock(
+            return_value="NO_VIABLE_ALTERNATIVE"
+        )
+        resp = await client.post(
+            "/job/launch-failed",
+            json={
+                "job_id": "mo-test-hhhh",
+                "decision_id": "dec-hhhh1234",
+                "configs_tried": [
+                    {
+                        "instance_type": "g6.xlarge",
+                        "gpu_type": "L4",
+                        "region": "us-east-1",
+                        "market": "on_demand",
+                    }
+                ],
+                "failure_reasons": ["CUDA out of memory"],
+                "total_time_seconds": 300,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "no_alternative"
+
+
+class TestMemoryQueriesForRecovery:
+    """The new memory helpers used by the recovery path."""
+
+    def test_count_launch_attempts_matches_parent_and_replicas(self):
+        memory = AgenticMemory(db_path=":memory:")
+        # Parent-level row + two replica rows
+        memory.record_launch_attempt(
+            decision_id="dec-x",
+            job_id="parent-1",
+            instance_type="g6.xlarge",
+            gpu_type="L4",
+            region="us-east-1",
+            market="on_demand",
+            count=1,
+            launched=False,
+            failure_reason="oom",
+            failure_category="oom",
+        )
+        memory.record_launch_attempt(
+            decision_id="dec-x",
+            job_id="parent-1-r0",
+            instance_type="g6.xlarge",
+            gpu_type="L4",
+            region="us-east-1",
+            market="on_demand",
+            count=1,
+            launched=False,
+            failure_reason="oom",
+            failure_category="oom",
+        )
+        memory.record_launch_attempt(
+            decision_id="dec-x",
+            job_id="parent-1-r1",
+            instance_type="g6.xlarge",
+            gpu_type="L4",
+            region="us-east-1",
+            market="on_demand",
+            count=1,
+            launched=True,
+            failure_category=None,
+        )
+        # Different parent (must not bleed across)
+        memory.record_launch_attempt(
+            decision_id="dec-y",
+            job_id="parent-2-r0",
+            instance_type="g6.xlarge",
+            gpu_type="L4",
+            region="us-east-1",
+            market="on_demand",
+            count=1,
+            launched=False,
+            failure_reason="oom",
+            failure_category="oom",
+        )
+
+        # 2 failed under parent-1 (parent-level + r0); r1 succeeded
+        assert memory.count_launch_attempts("parent-1") == 2
+        assert memory.count_launch_attempts("parent-1", only_failed=False) == 3
+        # parent-2 has 1 failure
+        assert memory.count_launch_attempts("parent-2") == 1
+
+    def test_get_failed_configs_groups_distinct_tuples(self):
+        memory = AgenticMemory(db_path=":memory:")
+        memory.record_launch_attempt(
+            decision_id="dec-a",
+            job_id="parent-X-r0",
+            instance_type="g6.xlarge",
+            gpu_type="L4",
+            region="us-east-1",
+            market="on_demand",
+            count=1,
+            launched=False,
+            failure_reason="oom",
+            failure_category="oom",
+        )
+        memory.record_launch_attempt(
+            decision_id="dec-a",
+            job_id="parent-X-r1",
+            instance_type="g6.xlarge",
+            gpu_type="L4",
+            region="us-east-1",
+            market="on_demand",
+            count=1,
+            launched=False,
+            failure_reason="oom",
+            failure_category="oom",
+        )
+        memory.record_launch_attempt(
+            decision_id="dec-a",
+            job_id="parent-X-r2",
+            instance_type="g6e.xlarge",
+            gpu_type="L40S",
+            region="us-east-1",
+            market="on_demand",
+            count=1,
+            launched=False,
+            failure_reason="oom",
+            failure_category="oom",
+        )
+        rows = memory.get_failed_configs("parent-X")
+        # Two distinct (instance_type, gpu_type, region, market, category) tuples
+        assert len(rows) == 2
+        types = {r["instance_type"] for r in rows}
+        assert types == {"g6.xlarge", "g6e.xlarge"}
+        # Aggregated count for the L4 row should be 2
+        l4_row = next(r for r in rows if r["instance_type"] == "g6.xlarge")
+        assert l4_row["attempts"] == 2
