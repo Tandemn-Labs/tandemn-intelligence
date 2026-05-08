@@ -36,11 +36,25 @@ Here are some states/prompts that need to be made -
 - PRecovery (if chain died - try to recover it);
 - P5c (if chain died / finished - summary of it);
 - P5j (if whole job died / failed to launch with all alternatives - summary of it)
-- Deterministic Admission Gate and a queue based architecture - we  only allow certain jobs to come in, if quota/cost-ceiling are reasonable.
-- Single-Per-Job Repair Budget - Everytime a certain action (PScale/PRecovery) is called, we deduct one point from the per-job repair budget.
+- Single-Per-Job Repair Budget - **Every PRecovery or Pscale invocation that picks a real repair action deducts one point from the per-job repair budget**. `noop` does NOT deduct — if the agent decides "do nothing this tick," no repair happened so nothing is charged. P0 is exempt entirely. Budget is checked before the prompt; if exhausted, the prompt is skipped and the job routes to P5j → `TERMINAL_FAILED`.
 - Recent Failure Awareness - The recommendations provided to the LLM, in the packet, will also have when did this sort of a deployment last fail (cold-delay sort of a thing)
 
 Every time the system has to explain a failure, the agent generates a structured Theory grounded in Orca's raw failure code, the failed job's physics features, and recent memory. Theories are persisted next to decisions and outcomes so the system can learn over time which (theory → action → outcome) triples actually work. This is the foundation for a future causal graph.
+
+### Two-Stage LLM Contract
+
+Every decision phase (P0, PRecovery, Pscale, P5c, P5j) uses a strict **two-stage LLM contract**. The two stages never share a call.
+
+- **Stage 1 — Exploration.** The agent reads the packet, calls read tools, requests counterfactuals, and reasons freeform. No structured-output enforcement. The output of stage 1 is a message history, not a config. Implemented as `pydantic-ai` `Agent.iter()` with tools enabled and no `output_type`.
+- **Stage 2 — Commit.** A separate LLM call with **zero tools**, the stage 1 message history as context, and `strict: true` JSON-schema enforcement. This call's only job is to emit the final `ChosenAction` (theory + plan + 3 alternatives). Implemented as `pydantic-ai` `NativeOutput(ChosenAction)` against the provider's native `response_format: json_schema` API.
+
+Mixing tool use and strict structured output in one call is unreliable on most providers and confuses weak local models — the model gets stuck choosing between calling read tools and emitting the output-tool. Splitting the two removes the ambiguity. Stage 1 is "think and explore." Stage 2 is "commit, no second-guessing, no tools."
+
+For v0 (MVP), stage-2 schema validation failure is **fatal**: the program halts. No retries, no deterministic fallback. Production hardening (retry policy, graceful degradation) is deferred.
+
+### What is `action_id`?
+
+`action_id` is **a label the LLM mints for each config it emits** in Stage 2, so that detail sections, tools, and downstream records can correlate evidence with the specific emitted config. It is not a key into a deterministic action catalog — there is no catalog. The LLM picks any short identifier (e.g. `"primary"`, `"alt-a100-spot"`, `"alt-l40s-onprem"`) and the harness uses it purely as a join key. Suggestions in the packet may also carry their own `action_id`s for the same correlation purpose, but the LLM is never required to reuse a suggestion's `action_id` — it generates fresh ones for each emitted config.
 
 ---
 
@@ -65,7 +79,7 @@ The LLM should not have to discover basic facts every time. The packet should al
 The LLM can still ask for more detail, but the default path should require zero external info-seeking.
 
 ### Bound Execution, Not Thought
-The LLM may reason freely, inspect detail sections, compare options, and disagree with the provided options. It may not invent raw cluster mutations. Final execution happens only through a validated `action_id` that maps to a deterministic executor payload.
+The LLM may reason freely, inspect detail sections, compare options, and disagree with the provided options. It should at the end of the day generate the cluster specifications (TP/PP etc.) instead of selecting from options. The final results can be validated deterministically though.
 
 ### Production Path Only
 This architecture targets the live path:
@@ -95,13 +109,9 @@ This is the business-level FSM for v0. Do not expand it unless a condition is tr
 
 ```mermaid
 flowchart TD
-    %% ───── Admission ─────
+    %% ───── Entry ─────
     START([/decide]) --> REQ[REQUESTED]
-    REQ --> G_ADMIT{admit?<br/>quota + cost ceiling}
-    G_ADMIT -->|fail| WAIT[ADMIT_WAITING<br/>ttl=1800s]
-    WAIT -->|retry tick| G_ADMIT
-    WAIT -->|ttl expired| ABORTED((TERMINAL_ABORTED))
-    G_ADMIT -->|pass| P0[[P0: initial placement]]
+    REQ --> P0[[P0: initial placement]]
     P0 --> LAUNCHING[LAUNCHING]
     %% ───── Launch ─────
     LAUNCHING -->|heartbeat| LAUNCHING
@@ -128,7 +138,7 @@ flowchart TD
     CDIED -->|memory branch| P5c[[P5c: chain post-mortem<br/>memory write<br/>chain prior]]
     CDIED -->|decision branch| G_REPAIR
     %% ───── Single repair guard + unified recovery loop ─────
-    LFAIL --> G_REPAIR{repair budget?<br/>≤30 chain attempts}
+    LFAIL --> G_REPAIR{repair budget?<br/>≤30 PRecovery+Pscale invocations}
     G_REPAIR -->|ok| PRECOVERY[[PRecovery<br/>triggers: launch_failed, chain_died<br/>emits n=3 alternatives]]
     G_REPAIR -->|exhausted| P5j
     PRECOVERY -->|retry / switch / replace / migrate| LAUNCHING
@@ -152,7 +162,7 @@ flowchart TD
     classDef evidence fill:#fff,stroke:#777,stroke-dasharray:5 5;
     class LaunchTheory,RuntimeTheory evidence;
     classDef terminal fill:#fee,stroke:#900,stroke-width:2px;
-    class ABORTED,COMPLETED,FAILED terminal;
+    class COMPLETED,FAILED terminal;
     classDef fork fill:#fff,stroke:#999,stroke-dasharray:2 2;
     class CDIED fork;
 ```
@@ -185,7 +195,6 @@ There are two kinds of states
 | State | Meaning |
 | --- | --- |
 | `REQUESTED` | `/decide` accepted and parsed. | (P0)
-| `ADMIT_WAITING` | quota/cost not met yet, in queue | (not an LLM State)
 | `LAUNCHING` | Launch requested, heartbeat/start/failure pending. | (not an LLM State)
 | `LAUNCH_FAILED` | Launch path failed before serving (if all alternatives fail to launch / install failed / OOM) | (PRecovery)
 | `WARMING` | Job or replica started, metrics not stable yet. | (not an LLM State)
@@ -247,7 +256,6 @@ ClusterStates according to me are -
 
 class ClusterState(str, Enum):
     REQUESTED          = "requested"          # /decide accepted
-    ADMIT_WAITING      = "admit_waiting"      # quota/cost not met yet, in queue
     LAUNCHING          = "launching"          # Orca submit in flight
     WARMING            = "warming"            # model_ready signal, metrics not stable
     HEALTHY            = "healthy"            # SLO headroom OK
@@ -272,9 +280,9 @@ What kicks each DecisionPhase
 
 | DecisionPhase | Trigger                                | Agent reads                                 | Agent emits          | Persists                                           |
 |---------------|----------------------------------------|---------------------------------------------|----------------------|----------------------------------------------------|
-| P0            | REQUESTED after admission              | job_context, memory, perfdb, physics        | (no theory)          | decision row                                       |
+| P0            | REQUESTED                              | job_context, memory, perfdb, physics        | (no theory)          | decision row                                       |
 | PRecovery     | LAUNCH_FAILED or /job/replica-failed   | failure_context + (P5c diagnosis  )         | action + theory if no diagnosis exists yet | decision row + budget−1      |
-| Pscale        | DEGRADED or OVERPROV                   | telemetry, physics, perfdb, memory          | RuntimeTheory               | decision row + theory_blob + budget−1 if scale-up  |
+| Pscale        | DEGRADED or OVERPROV                   | telemetry, physics, perfdb, memory          | RuntimeTheory               | decision row + theory_blob + budget−1 (skip on `noop`) |
 | P5c           | /job/replica-failed                    | Orca reason_code + chain physics + memory   | P5c diagnosis (theory shape) | outcome row + cooloff signal + theory_blob |
 | P5j           | terminal failure / budget exhausted    | all decision/theory rows + final outcome    | job-level theory     | outcome row + theory_blob                          |
 | P2            | /job/complete success                  | observed metrics + decision history         | (none; optional short reflection) | chain_summary row                     |
@@ -304,15 +312,22 @@ Every LLM decision follows the same outer pipeline:
 
 Here is one example - 
 Trigger: DEGRADED detected for job=J1
-  -> StateReducer:    cluster=DEGRADED phase=PSCALE
-  -> PacketBuilder:   build_runtime_context(J1) + recent_failure_signals
-  -> LLMReasoner #1:  reasons over packet, takes in Telemetry etc -> emits RuntimeTheory  
-  -> SuggestionBuilder: 5 candidates, ranking will be done based on Physics / certainity
-  -> PromptTemplate:  pscale.j2 (state=DEGRADED, theory=RuntimeTheory(...), failed_suggestions=...)
-  -> LLMReasoner #2:  emits ChosenAction(plan=..., alternatives=[...], rationale=...)
-  -> Guardrail:       ConfigValidator OK, ActionGate OK
-  -> Executor:        Orca scale-up submit
-  -> Recorder:        decisions row + RuntimeTheory/runtimetheory blob + budget −1
+  -> StateReducer:       cluster=DEGRADED phase=PSCALE
+  -> PacketBuilder:      build_runtime_context(J1) + recent_failure_signals
+  -> SuggestionBuilder:  candidates ranked by physics / certainty (advisory)
+  -> PromptTemplate:     pscale.j2 (state=DEGRADED, packet=..., suggestions=...)
+  -> LLM Stage 1:        Agent.iter() with read tools enabled, no output_type.
+                         Reads packet, calls read tools, reasons freeform.
+                         Produces message_history.
+  -> LLM Stage 2:        Separate call. Zero tools. NativeOutput(ChosenAction)
+                         with response_format=json_schema strict=true.
+                         Takes Stage 1 message_history as context.
+                         Emits ChosenAction(theory=RuntimeTheory(...),
+                                            alternatives=[3]).
+                         On schema validation failure: HALT (MVP).
+  -> Feasibility check:  on every emitted config (VRAM / TP / PP / market / cooloff)
+  -> Executor:           Orca scale-up submit
+  -> Recorder:           decisions row + theory_blob + budget −1
 
 | Stage | Responsibility |
 | --- | --- |
@@ -327,7 +342,8 @@ Trigger: DEGRADED detected for job=J1
                     can learn which beliefs predict which fixes. |
 | `SuggestionBuilder` | Pre-filter infeasible options and show some suggestions to the Agent. This is a Guardrail even before it goes to the LLM.|
 | `PromptTemplate` | Render a small state-specific prompt from the packet. "Objective is to handle failure -> here are resources..... and some recommended options. Please generate the final configuration"|
-| `LLMReasoner` | Let the model inspect packet details and do the final action / generate a launch config (structured generation)|
+| `LLM Stage 1` | Exploration (all phases). `pydantic-ai` `Agent.iter()` with read tools enabled and no `output_type`. Model reads the packet, calls read tools, reasons freeform. For P0/PRecovery/Pscale, output is a message_history passed to Stage 2. For P5c/P5j, the final assistant text is the phase output (chain theory / job narrative); no Stage 2. |
+| `LLM Stage 2` | Commit (P0, PRecovery, Pscale only). Separate `pydantic-ai` call with **zero tools** and `NativeOutput(ChosenAction)` (`response_format=json_schema, strict=true`). Takes Stage 1 message_history as input context. Emits the typed `ChosenAction`. Schema validation failure halts the program (MVP). P5c and P5j skip Stage 2. |
 | `Guardrail` | Formerly Validator - Guardrail checks the output shape, safety, and compliance with the Quota Map. If the LLM Hallucinated, and the quota/availability changed, it is just some simple IF ELSE conditions |
 | `Executor` | Map action id to current production operations. |
 | `Recorder` | Write decisions, outcomes, diagnoses, recent failure signals, and events. |
@@ -351,7 +367,6 @@ Do not add a second authoritative FSM database in v0. Derive state from current 
 | `REPLICA_RECOVERY` | `/job/replica-failed` handler context. |
 | `TERMINAL_COMPLETED` | `/job/complete`. |
 | `TERMINAL_FAILED` | launch/job failure after post-mortem. |
-| `TERMINAL_ABORTED` | deterministic admission abort or LLM-selected abort. |
 
 Explicit FSM tables can be added later for audit/replay if needed, but they are not required for v0. Early persistence should focus only on targeted data:
 
@@ -383,7 +398,6 @@ koi/harness/
   p2.py                # chain summary logic (once chain finishes successfully)
   chain_postmortem.py  # chain (P5c) diagnosis logic
   job_postmortem.py    # job (P5j) diagnosis logic
-  admission.py         # queue and admission gate
   budget.py            # repair budget counter
   theories.py          # LaunchTheory, RuntimeTheory, and theory builders
   resource_map.py      # resource accounting (renamed from resource_ledger.py) - not really needed to modify right? 
@@ -399,10 +413,10 @@ koi/harness/
 | `packets.py`        | Shared packet-building utilities and detail section management.  # please define packets and section management more                                                         |
 | `suggestions.py`    | Produces suggestions for the LLM, using PerfDB/memory. Used to present plausible and successful historical sample actions.                                                   |
 | `prompts.py`        | System prompt and micro-prompt templates for each scenario/state.                                                                                                            |
-| `reasoner.py`       | LLM invocation, structured/typed output generation, packet-scoped read tools. The agent "thinking" step. For now it can use openrouter, but next step is adding runner too   |
-| `guardrail.py`      | Validates the selected `action_id` (safety, quota, policy). Fails open only for valid, feasible actions. # i think you can fuse guardrail and config validator               |
+| `reasoner.py`       | Two-stage LLM invocation. Stage 1: `Agent.iter()` with read tools enabled, no `output_type` (free exploration over the packet). Stage 2: separate call with zero tools and `NativeOutput(ChosenAction)` (`strict:true` JSON schema), taking Stage 1's message_history as input. The two stages never share a call. |
+| `guardrail.py`      | Validates the selected `action_id`. # i think you can fuse guardrail and config validator               |
 | `config_validator.py` | Validates generated configs for shape/safety/compatibility. Ensures output can be safely executed.                                                                         |
-| `executor.py`       | Deterministic mapping from action_id to production operation. Executes actions.  # this is where expl / action tools are called                                              |
+| `executor.py`       | Deterministic mapping from action_id to production operation. Executes the chosen actions.  # this is where exploration / action tools are called                                              |
 | `cooloff.py`        | Handles recent failure signals, timestamps, and brief resource cooling logic on failed chains.                                         |
 | `p0.py`             | Initial placement: packet, suggestion, prompt logic.                                                                                   |
 | `precovery.py`      | Launch and replica recovery logic (merged p1 logic and former p4 replica recovery).                                                    |
@@ -410,7 +424,6 @@ koi/harness/
 | `p2.py`             | Chain summary generation, memory writes (terminal summary).                                                                            |
 | `chain_postmortem.py` | P5c: chain-level postmortem and diagnosis logic.                                                                                     |
 | `job_postmortem.py`   | P5j: job-level postmortem and diagnosis logic, including fan-out to chain_postmortem.                                                |
-| `admission.py`      | Admission and gating logic, pre-queue and waiting queue.      # i am not sure if its needed now to have a separate file                                                      |
 | `budget.py`         | Repair/retry budget tracking and decision.                                                                                             |
 | `theories.py`       | Defines LaunchTheory, RuntimeTheory schemas and their construction helpers/builders.                                                                                         |
 | `resource_map.py`   | Resource accounting, available and used pool bookkeeping (formerly koi/resource_ledger.py).    # again im not sure if we need to edit existing logic/file                    |
@@ -477,13 +490,13 @@ job_context = {
 }
 ```
 
-### ActionOption
+### ActionOption (suggestion shape)
 
-Each action option is executable only through a deterministic payload reference. Always up to 3 per n=3 contract.
+Each `ActionOption` is a **deterministic suggestion** built by the packet builder and shown to the LLM as advisory ranking input. The LLM is not required to pick one — it always generates its own configs in Stage 2. The `ActionOption` shape is just a labeled, evidence-annotated candidate.
 
 ```python
 class ActionOption(BaseModel):
-    action_id: str
+    action_id: str            # suggestion-side label minted by the packet builder; used as join key for detail sections (e.g. "physics:<action_id>")
     action_type: str
     summary: str
     rank: int
@@ -495,7 +508,6 @@ class ActionOption(BaseModel):
     availability: dict
     cost: dict
     risk: dict
-    executor_payload_ref: str
     detail_refs: list[str]
 ```
 
@@ -523,40 +535,42 @@ class RuntimeTheory(BaseModel):
 
 ### RepairBudget
 
-Tracks repair/retry budget, current usage, and what actions consume it.
+Tracks repair budget. The unit is **a PRecovery or Pscale invocation that produced a real repair action**. Pscale `noop` does NOT count. P0 does not count. Orca submits and started chains do not count separately.
 
 ```python
 class RepairBudget(BaseModel):
-    cap: int
-    used: int
+    cap: int                # KOI_MAX_CHAIN_ATTEMPTS, default 30
+    used: int               # count of repair actions taken so far (PRecovery + non-noop Pscale)
     remaining: int
-    consumed_by: list[str]  # action names/types
+    consumed_by: list[str]  # ordered phase names: ["precovery", "pscale", "pscale", ...]
 ```
 
-### AdmissionDecision
+### ChosenAction (Stage-2 emit shape)
 
-Outcome of admission controller.
-
-```python
-class AdmissionDecision(BaseModel):
-    outcome: Literal["admitted", "queued", "rejected"]
-    reason_code: str
-    ttl_remaining: int  # seconds remaining in hold/queue if relevant
-```
-
-### ChosenAction
-
-The final LLM output should be generated using structured generation, with the ability to inject a supporting theory. The LLM is NOT a strict re-ranker, and has full authority to use available evidence or propose its own valid choice.
+The final LLM output, emitted by Stage 2 (`NativeOutput(ChosenAction)`, `strict:true`). Generated freshly by the LLM — never picked from `ActionOption`s. The LLM has full authority to use the packet's evidence or propose its own valid plan.
 
 ```python
 class ChosenAction(BaseModel):
-    action_id: str
+    action_id: str            # LLM-minted label for the emitted config (e.g. "primary", "alt-l40s-spot"); used to correlate this emit with downstream records (decisions row, theory_blob, outcomes)
     confidence: float
     rationale: str
-    evidence_used: list[str]
-    why_not_top_choice: str | None = None
-    requested_more_context: bool = False
+    evidence_used: list[str]  # action_ids of suggestions or detail-section keys the LLM cited in Stage 1
     theory: LaunchTheory | RuntimeTheory | None = None
+    alternatives: list[Alternative]  # length = 3, ordered by $/token ascending
+```
+
+`why_not_top_choice` and `requested_more_context` from earlier drafts are removed: the LLM is not picking, and Stage 2 has no tools so it cannot request more context anyway.
+
+### Alternative
+
+Each alternative is one homogeneous group: one config plus the number of identical chains to attempt. There is no nested "groups inside a plan" — the schema is flat.
+
+```python
+class Alternative(BaseModel):
+    alternative_id: str               # static, position-based label assigned by Koi after Stage 2: "alt_0" (primary), "alt_1", "alt_2". Not emitted by the LLM.
+    config: dict                      # full engine + GPU + market + region spec
+    replica_count: int                # how many chains of this config to attempt
+    predicted_tps_per_chain: float | None  # Koi's estimate; None when unknown
 ```
 
 ---
@@ -743,13 +757,29 @@ You are Koi's bounded decision agent. Start from the provided suggestions and ev
 
 ### Runner Behavior
 
-- Use typed final output. We need to make sure it is structured generation. LLM Cannot just output a JSON without guardrails/structured generation.
-- Despite suggestions and data available for the model, it should STRIVE to explore/reason before ultimately spitting out the final structure.
-- If the agent needs more data, it queries more and should use the tools at its disposal.
-- Use `max_iterations=3` for `P0`, `PRecovery`, and `Pscale`.
-- Use `max_iterations=2` for `P5c` and `P5j`.
-- Accept valid non-top choices and log them.
-- Fall back only on invalid, unsafe, stale, or timed-out outputs.
+Decision phases split into **two classes**, with different Stage-2 behavior:
+
+| Phase | Stage 1 | Stage 2 |
+|---|---|---|
+| `P0`, `PRecovery`, `Pscale` | Yes (tools, freeform) | Yes — `NativeOutput(ChosenAction)`, strict JSON |
+| `P5c`, `P5j` | Yes (read-only tools, freeform) | **No** — Stage-1 freeform text is the final output |
+
+The reason for the split: P0 / PRecovery / Pscale produce *configs that get executed*, so they must commit through strict-JSON Stage 2. P5c / P5j are postmortem phases — they emit theories and narratives for memory, not configs. Forcing P5c / P5j through strict JSON would over-constrain a one-sentence freeform hypothesis with no value. They use Stage 1 only, and the text output is recorded as the chain/job theory + narrative.
+
+**Stage 1 — Exploration (all phases)**
+- `pydantic-ai` `Agent.iter()` with read tools enabled per the per-prompt tool gating below.
+- No `output_type` set. The model produces freeform text/messages, not a typed object.
+- `max_iterations=3` for `P0`, `PRecovery`, `Pscale`. `max_iterations=2` for `P5c`, `P5j`.
+- For `P0`/`PRecovery`/`Pscale`, the output is a `message_history` passed to Stage 2.
+- For `P5c`/`P5j`, the final assistant text **is** the phase output (recorded as `chain_theory` / job narrative). No Stage 2.
+
+**Stage 2 — Commit (P0, PRecovery, Pscale only)**
+- Separate `pydantic-ai` call. **Zero tools registered.**
+- Uses `NativeOutput(ChosenAction)` so the underlying request goes out as `response_format={"type":"json_schema","strict":true,"schema":...}`.
+- Takes Stage 1's `message_history` as input context. The packet is also re-attached so Stage 2 has the same evidence Stage 1 saw.
+- `max_iterations=1`. Stage 2 has nothing to deliberate — it commits.
+- **No deterministic fallback** and **no retries on validation failure** (MVP). If `pydantic-ai` cannot validate the response against `ChosenAction`, the program halts. Production hardening is deferred.
+- **No menu-pick path.** The LLM always generates the final config; the system never substitutes a deterministic suggestion.
 
 ### Packet-Scoped Read Tools
 
@@ -766,7 +796,9 @@ These tools let the LLM explore without forcing it back into raw global tool orc
 
 ### Per-Prompt Tool Gating
 
-| Prompt      | Tools                                                        |
+All tools below fire **only in Stage 1**. Stage 2 has zero tools registered, always — it is a pure schema-constrained commit.
+
+| Prompt      | Stage 1 Tools                                                |
 |-------------|--------------------------------------------------------------|
 | `P0`        | Packet read tools and quota detail. No action tools.         |
 | `PRecovery` | Packet read tools, quota detail, failure/prior detail. Can choose to launch |
@@ -790,19 +822,9 @@ Conventions used throughout §12:
 - All decision phases share the n=3 alternatives contract from §15 Phase 3.
 - Failure-handling phases (PRecovery, Pscale) emit a one-sentence theory inside the same structured response as the plan — no separate "prior builder" stage. Theories are free-form text (`hypothesis: str`), not enum-typed.
 
-### Admission Gate (deterministic, no prompt)
-
-Triggered by `/decide`. No LLM.
-
-- Run `quota_ok(req)` and `cost_ceiling_ok(req)`. Both pass → P0.
-- Either fails → enqueue in `admission_queue`, respond 202 with `request_id` + `queue_ttl_remaining_s`. Cluster state for that job becomes `ADMIT_WAITING`.
-- Background poll retries every `KOI_DECIDE_QUEUE_POLL_S` (default 30s); TTL is `KOI_DECIDE_QUEUE_TTL_S` (default 1800).
-- On TTL expiry → `TERMINAL_ABORTED` with reason `quota_exhausted` or `cost_ceiling_unreachable`.
-- Full implementation details in §15 Phase 2.
-
 ### P0: Initial Placement
 
-Triggered by `REQUESTED` after admission succeeds.
+Triggered by `REQUESTED`.
 
 Packet builder (deterministic):
 
@@ -813,115 +835,91 @@ Packet builder (deterministic):
 
 Plan shape:
 
-- A plan is a list of **homogeneous groups** `{config, replica_count}`, ordered by `$/token` ascending.
-- Each group is internally homogeneous (same GPU, TP, PP, market, region, engine_config). Different groups in one plan may differ.
-- The launcher walks groups progressively; SLO is checked after each group; launching stops as soon as predicted aggregate TPS clears `required_tps`.
-- For unknown models (physics fallback only), keep `replica_count` small (often 1) per group so Pscale can correct from observation.
+- A plan is a list of exactly **3 ordered alternatives** (`ChosenAction.alternatives`, see §7), ranked cheapest-`$/token` first.
+- Each alternative is one homogeneous group: `{alternative_id, config, replica_count, predicted_tps_per_chain}`. No nested groups inside a plan.
+- For unknown models (no PerfDB / physics-fallback miss), `predicted_tps_per_chain` may be `None` — the gate then treats it as `required_tps` (one chain assumed sufficient).
 
 Agent configuration generator:
 
 The deterministic packet is passed to the agent. The agent always generates the final config via structured generation. The agent is encouraged to explore tools freely and reason; it does not pick from suggestions.
 
-Example plan the agent emits — a list of homogeneous groups ordered by `$/token` ascending. LLM-generated fields are everything inside `groups`; deterministic fields are everything below `reasoning` (computed by Koi after the agent emits the plan).
+Example shape Stage 2 emits (LLM-generated fields are `config`, `replica_count`, `predicted_tps_per_chain` per alternative; the `alternative_id` is *not* emitted by the LLM — Koi assigns `alt_0` / `alt_1` / `alt_2` by position before forwarding to Orca):
 
 ```json
 {
   "job_id": "job-abc123",
   "model_name": "Qwen/Qwen2.5-72B-Instruct",
-  "config": {
-    "suggested_plan": {
-      "groups": [
-        {
-          "group_id": "g1-cheap-spot-l40s",
-          "replica_count": 5,
-          "gpu_type": "L40S",
-          "instance_type": "g6e.12xlarge",
-          "num_gpus": 4,
-          "tp": 4, "pp": 1,
-          "region": "us-west-2",
-          "market": "spot",
-          "engine_config": { "tensor_parallel_size": 4, "pipeline_parallel_size": 1, "max_num_seqs": 256, "gpu_memory_utilization": 0.9, "dtype": "auto" },
-          "predicted_per_chain_tps": 250.0,
-          "cost_per_hour_per_chain": 1.20,
-          "dollars_per_token_estimate": 1.3e-6
-        },
-        {
-          "group_id": "g2-mid-spot-a100",
-          "replica_count": 2,
-          "gpu_type": "A100",
-          "instance_type": "p4d.24xlarge",
-          "num_gpus": 4,
-          "tp": 4, "pp": 1,
-          "region": "us-east-1",
-          "market": "spot",
-          "engine_config": { "...": "same shape" },
-          "predicted_per_chain_tps": 600.0,
-          "cost_per_hour_per_chain": 4.10,
-          "dollars_per_token_estimate": 1.9e-6
-        }
-      ]
+  "alternatives": [
+    {
+      "alternative_id": "alt_0",
+      "replica_count": 5,
+      "config": {
+        "gpu_type": "L40S", "tp": 4, "pp": 1,
+        "region": "us-west-2", "market": "spot",
+        "engine_config": { "tensor_parallel_size": 4, "max_num_seqs": 256, "gpu_memory_utilization": 0.9, "dtype": "auto" }
+      },
+      "predicted_tps_per_chain": 250.0
+    },
+    {
+      "alternative_id": "alt_1",
+      "replica_count": 2,
+      "config": { "gpu_type": "A100", "tp": 4, "pp": 1, "region": "us-east-1", "market": "spot", "engine_config": { "...": "same shape" } },
+      "predicted_tps_per_chain": 600.0
+    },
+    {
+      "alternative_id": "alt_2",
+      "replica_count": 1,
+      "config": { "gpu_type": "H100", "tp": 4, "pp": 1, "region": "us-east-1", "market": "on_demand", "engine_config": { "...": "same shape" } },
+      "predicted_tps_per_chain": 1400.0
     }
-  },
-  "reasoning": "Cheapest spot L40s first; A100 spot mid-tier. Stop launching when SLO is met.",
-  "predicted_aggregate_tps_if_all_launched": 2450.0,
+  ],
+  "reasoning": "Cheapest spot L40s first; A100 spot mid-tier; H100 on-demand as last resort.",
   "required_tps": 2000.0,
-  "predicted_total_cost": 25.0,
-  "meets_cost_roofline": true,
-  "cost_roofline_usd": 50.0,
-  "effective_confidence": 0.52,
-  "data_source": "exact_match",
-  "alternatives": [ "...two more plans, same shape" ]
+  "predicted_total_cost": 25.0
 }
 ```
 
-Each group is launched as one progressive batch. Within a group all replicas are identical; across groups they differ. The launcher never bin-packs partial replicas across groups.
+Executor (Orca-owned alternative walk):
 
-Executor (progressive launch):
-
-The executor walks the `primary_plan.groups` list in order (already sorted by `$/token` ascending) and launches them progressively. Pseudocode:
+Koi's only job at launch time is to submit the menu and the goal. The walking, the gate, and the per-chain teardown are Orca's responsibility.
 
 ```text
-launched_chains = []
-predicted_aggregate_tps = 0.0
-
-for group in primary_plan.groups:
-    # Fire all replicas for this group in parallel via Orca submits.
-    # Wait up to KOI_GROUP_LAUNCH_TIMEOUT_S for chains to reach /job/started.
-    started_chains = orca.launch_group(
-        group,
-        per_chain_timeout_s = KOI_GROUP_LAUNCH_TIMEOUT_S,
-    )
-    launched_chains.extend(started_chains)
-    predicted_aggregate_tps += sum(c.predicted_tps for c in started_chains)
-
-    # Greedy SLO check after each group.
-    if predicted_aggregate_tps >= primary_plan.required_tps:
-        break   # Stop launching. Bank remaining groups (cost savings).
-
-    # If timeout consumed some replicas of this group without them starting,
-    # we DO NOT retry within the same group. We move on to the next group.
-
-# Outcomes:
-if launched_chains == []:
-    # Nothing started across all groups -> escalate to PRecovery (launch_failed).
-    invoke PRecovery(trigger=launch_failed)
-elif predicted_aggregate_tps < primary_plan.required_tps:
-    # Partial fleet: enter WARMING anyway. Pscale will scale up from runtime evidence.
-    enter WARMING
-else:
-    # SLO satisfied at launch time.
-    enter WARMING
+# Koi side — one call, returns immediately.
+orca.submit_launch(
+    job_id            = job_id,
+    required_tps      = chosen_action.required_tps,
+    alternatives      = chosen_action.alternatives,    # 3 in order, cheapest first
+)
+# Koi now waits for webhooks. No loop, no per-group timeout, no continue/skip dialog.
 ```
+
+Orca walks the alternatives in order. For each alternative, Orca fires every chain submit in parallel (one chain = one atomic launch attempt with `KOI_CHAIN_LAUNCH_TIMEOUT_S=300`). After **every chain resolution** (started or failed), Orca emits a per-chain webhook and re-evaluates the gate:
+
+```text
+contribution(chain) = chain.predicted_tps_per_chain  if not None  else  required_tps
+total_predicted     = sum(contribution(c) for c in chains_started_so_far)
+gate_satisfied      = (total_predicted >= required_tps)
+```
+
+In-flight chains within the current alternative are never cancelled by the gate — let them resolve naturally; bonus capacity is welcome. Once the current alternative fully resolves, Orca decides:
+
+- `gate_satisfied` → stop. Don't launch the next alternative.
+- otherwise → submit the next alternative.
+
+When the loop ends (gate met, alternatives exhausted, or cancelled), Orca emits one `launch_complete` webhook with the final summary.
+
+Koi reacts to `launch_complete`:
+
+- `started_chains` empty → invoke PRecovery with `launch_failed`.
+- `started_chains` non-empty → enter `WARMING`. If predicted aggregate is still below `required_tps`, Pscale handles the shortfall once telemetry stabilizes.
 
 Key behaviors:
 
-- **No bin-packing**: each group is launched whole (parallel submits) but never partial-merged across groups.
-- **Per-group timeout**: configurable via `KOI_GROUP_LAUNCH_TIMEOUT_S` (default 600s). If a group asks for N replicas but only M start within the timeout, accept M and move on. Don't keep waiting on the missing `N - M`.
-- **Greedy stop**: as soon as predicted aggregate TPS clears `required_tps`, stop launching further groups. Remaining groups are unused (cost saved).
-- **Partial fleet is fine**: if all groups exhausted and SLO not met, the started chains still serve. Pscale takes over from runtime evidence and scales up the shortfall.
-- **No new repair-budget consumption**: P0's progressive launch is initial-launch, not repair. Per-job repair budget (§15 Phase 1) is untouched here. Budget kicks in only when PRecovery or Pscale runs.
-- **Ledger semantics**: every successfully-started chain is credited to ResourceMap on `/job/started`. Submits that timed out without starting are released automatically via the existing 600s pending-reservation TTL.
-- **Orca contract**: see §13 for the per-group submit + per-chain start callback contract.
+- **Per-chain launch, never per-alternative all-or-nothing.** If alternative 1 wanted 5 chains and 2 succeed + 3 fail, those 2 keep contributing toward the goal.
+- **Gate observed continuously, skip boundary is per-alternative.** The gate is checked on every chain resolution, but the unit of "skip" is the next alternative — the current alternative always finishes its in-flight launches.
+- **Bonus chains are fine.** If the gate is met after chain 2 of 5 in alternative 1, the remaining 3 still complete. Pscale can scale down later if it's truly excess.
+- **No repair-budget consumption.** P0 is initial placement, not repair (§15 Phase 1).
+- **Cancellation** via `orca.cancel_launch(job_id)` — see §13.
 
 ### PRecovery: Unified Failure Recovery
 
@@ -930,14 +928,31 @@ Triggered by `LAUNCH_FAILED` OR `/job/replica-failed`. One prompt, two triggers.
 PRecovery always emits a one-sentence `LaunchTheory` inside its structured response, regardless of trigger. The theory is free-form text (a brief natural-language hypothesis, not a closed enum). The trigger only changes which inputs the theory sees:
 
 - on `launch_failed`: theory inputs are Orca's `reason_code` + per-config attempt counts + model/GPU physics + memory of same-model launches. No P5c exists for launch failures.
-- on `chain_died`: theory inputs include all of the above plus `P5c.diagnosis_code` + the dying chain's telemetry. P5c's output is one input to the theory, not a substitute for it.
+- on `chain_died`: theory inputs include all of the above plus `P5c.diagnosis_code` + `P5c.chain_theory` + the dying chain's telemetry. P5c's output is one input to the theory, not a substitute for it.
+
+#### PRecovery waits for P5c (chain_died trigger only)
+
+P5c and PRecovery are launched in parallel on `chain_died` (see §3 FSM diagram). They run as concurrent tasks:
+
+- **P5c task**: deterministic packet build → Stage-1 LLM call → emits `chain_theory` text → recorder writes outcome row.
+- **PRecovery task**: blocks on a `wait_for(p5c_task, timeout=KOI_P5C_WAIT_S)` before its packet builder runs. Default `KOI_P5C_WAIT_S=30` (seconds).
+
+Three outcomes:
+
+1. P5c finishes within timeout → PRecovery's packet builder includes `P5c.diagnosis_code`, `P5c.chain_theory`, `P5c.failure_scope`. The agent has full failure context.
+2. P5c times out → PRecovery proceeds without P5c data. The packet builder records `p5c_status: "timed_out"` and the agent is told explicitly: *"P5c is still running; no chain theory available yet — reason from telemetry only."* P5c continues running asynchronously and its output is written to memory when it eventually finishes; the next PRecovery invocation (or P5j synthesis) will see it.
+3. P5c crashes → same as timeout. PRecovery proceeds without P5c data; the crash is logged but does not block recovery.
+
+This is the contract: **PRecovery never blocks indefinitely on P5c**, but it does give P5c a bounded chance to provide useful context. `KOI_P5C_WAIT_S` is tunable; the default is conservative enough for a single LLM call to complete on a weak local model.
+
+`launch_failed` does not trigger a P5c (no chain ever ran), so this wait does not apply.
 
 Packet builder (deterministic):
 
 - failed launch attempts: per-config counts and failure categories.
 - beta priors and recent-failure signals; original decision context (model exact, PerfDB exact, proxy).
 - model physics features and any Orca-provided run stats from failed startups.
-- on `chain_died`: also `P5c.diagnosis_code`, `P5c.chain_theory`, `P5c.failure_scope`.
+- on `chain_died`: also `P5c.diagnosis_code`, `P5c.chain_theory`, `P5c.failure_scope` if P5c finished within `KOI_P5C_WAIT_S`; otherwise `p5c_status: "timed_out"` and proceed.
 - candidate replacements annotated with quota, priors, recent-failure signals.
 
 Agent configuration generator:
@@ -945,17 +960,16 @@ Agent configuration generator:
 The agent emits one structured response containing both:
 
 - a `LaunchTheory`: one-sentence free-form hypothesis (e.g. *"Spot capacity in us-east-1 dried up; same scope failed twice in the last 10 minutes"*) + `confidence` + supporting `evidence` text. No enum, no fixed vocabulary — the agent says it in its own words.
-- a primary recovery plan + 3 alternatives. **Each plan is itself a list of homogeneous groups** (same shape as P0; see §12 P0 example). The launcher applies the same progressive-launch behavior — walk groups in `$/token` order, per-group timeout, greedy stop when SLO is met.
+- 3 ordered alternatives in the same shape as P0 (see §7 `Alternative` and the §12 P0 example). The submission goes to Orca via the same `submit_launch` contract — Orca walks the alternatives, runs the per-chain launch + gate, emits per-chain webhooks and a final `launch_complete` (see §13).
 
 Suggestions are advisory inputs to ranking. The agent generates configs from scratch.
 
 Executor:
 
-- v0 prefers re-decide/recovery through the current Orca flow
-- avoid adding a new Koi-originated launch primitive unless needed later
-- runs the same progressive-launch loop as P0 (see §12 P0 Executor) over the chosen recovery plan's groups
-- on every successful Orca submit produced by PRecovery (one per chain that actually started), decrement per-job repair budget by 1 (§15 Phase 1). Submits that timed out without starting do not consume budget.
-- if budget is exhausted, route to P5j with reason `repair_budget_exhausted` and transition to `TERMINAL_FAILED`
+- same Orca contract as P0: `orca.submit_launch(job_id, required_tps, alternatives)`. Returns immediately; Koi awaits `launch_complete`.
+- decrement the per-job repair budget by 1 **once per PRecovery invocation** that produces a real repair plan (retry / switch / replace / migrate) (§15 Phase 1). The decrement is for the repair event, not for any individual Orca submit — even if PRecovery launches multiple chains in one plan, that's still one repair event.
+- PRecovery has no `noop` action — its trigger is always a failure that needs handling — so in practice every PRecovery invocation decrements once.
+- check the budget **before** invoking the prompt. If the budget would go negative, skip PRecovery, route to P5j with reason `repair_budget_exhausted`, and transition to `TERMINAL_FAILED`.
 
 ### Pscale: Runtime Scaling
 
@@ -977,25 +991,27 @@ The agent emits one structured response containing both:
 
 - a `RuntimeTheory`: one-sentence free-form hypothesis (e.g. *"Observed TPS is 38% below predicted and KV-cache usage is 92% on both replicas — looks like KV-cache pressure, not capacity shortage"*) + `confidence` + supporting `evidence` text. No enum, no fixed vocabulary — the agent says it in its own words.
 - a primary scaling action + 3 alternatives, each a fully typed action. Action shape:
-  - **Scale up**: `{op: "add_group", group: {config, replica_count}}`. Adds one new homogeneous group to the live plan and runs progressive launch on just that group.
-  - **Scale down**: `{op: "remove_replica", group_id: <existing>, count: 1}`. Removes one replica from an existing homogeneous group (preferring sickest replica per RuntimeTheory).
-  - **Upgrade/migrate**: `{op: "add_group", group: {…higher-tier…}}` followed by Pscale's next decision to `remove_replica` from the lower-tier group once the upgrade chain is healthy. Modeled as two consecutive scale actions, not one combined op.
+  - **Scale up** (`add_alternative`): one `Alternative` (config + `replica_count`). Submitted to Orca as a 1-element `alternatives` list with `required_tps` set to the observed shortfall. Same `submit_launch` contract as P0 — Orca runs the per-chain launch and gate, emits webhooks, returns `launch_complete`.
+  - **Scale down** (`remove_replica`): `{alternative_id: <existing>, count: 1}`. Removes one chain from an existing alternative-group (preferring sickest chain per `RuntimeTheory`). No Orca launch involved.
+  - **Upgrade/migrate**: `add_alternative` of the higher-tier config followed by Pscale's next decision to `remove_replica` from the lower-tier alternative once the new chain is healthy. Two consecutive scale actions, not one combined op.
   - **Noop**: explicit "do nothing this tick" — useful when DeadBand says wait.
 
 Suggestions are advisory. "Scale-up cheaper config" or "kill one replica" are hints, not commands. The agent generates the action from scratch.
 
 Executor:
 
-- uses current scale / kill production code
 - enters `SCALING`
 - preserves anti-windup freeze (DeadBand)
 - returns to `WARMING` when settled
-- on `add_group`: runs the same progressive-launch loop as P0 over the single new group (per-group timeout still applies)
-- decrements per-job repair budget by 1 only on **successful Orca submits produced by `add_group`**. Scale-down, drain, and noop do **not** consume budget
+- on `add_alternative`: same `orca.submit_launch(...)` call as P0, with a 1-element `alternatives` list. Orca runs per-chain launch on that single alternative; closes with `launch_complete`.
+- decrement the per-job repair budget by 1 **once per Pscale invocation that picks a real repair action** — `add_alternative`, `remove_replica`, or upgrade/migrate. `noop` does NOT decrement: if the agent decides "do nothing this tick," no repair happened, so nothing is charged. The decrement is per repair event, not per Orca submit.
+- check the budget **before** invoking the prompt. If the budget would go negative, skip Pscale and route to P5j.
 
 ### P5c: Chain Post-Mortem
 
-Triggered by `/job/replica-failed` (chain death) or scaling launch error. LLM phase. Runs in **parallel** with PRecovery's `chain_died` branch — P5c writes memory; PRecovery picks the replacement.
+Triggered by `/job/replica-failed` (chain death) or scaling launch error. LLM phase. Runs in parallel with PRecovery's `chain_died` branch — P5c writes memory and emits the chain theory; PRecovery picks the replacement (and waits briefly for P5c — see "PRecovery waits for P5c" below).
+
+**Stage 1 only.** P5c has no Stage 2: there's no config to commit, just a freeform one-sentence theory plus deterministic side-fields. Forcing strict JSON over a one-sentence hypothesis adds no value.
 
 Packet builder (deterministic):
 
@@ -1006,11 +1022,14 @@ Packet builder (deterministic):
 - market / region / instance
 - previous memory context for the same scope
 
-Output:
+Stage 1 emits (final assistant text):
+
+- a one-sentence free-form `chain_theory` hypothesis (e.g. *"KV-cache pressure on this topology — chain ran fine for 30 min then OOMed once max_model_len traffic spiked"*).
+
+Deterministic side-fields (computed by the packet builder, not the LLM, then attached to the P5c output record):
 
 - `diagnosis_code` — Orca's `reason_code`, passthrough (Orca's enum, not a Koi belief)
-- `chain_theory` — one-sentence free-form hypothesis from the agent (e.g. *"KV-cache pressure on this topology — chain ran fine for 30 min then OOMed once max_model_len traffic spiked"*) + `confidence` + supporting `evidence` text. Same shape as `LaunchTheory` and `RuntimeTheory`. No enum, no fixed vocabulary — the agent says it in its own words.
-- `failure_scope` — cooloff scope key (structured, real)
+- `failure_scope` — cooloff scope key (structured)
 - `event_at` — timestamp
 - recent-failure signal fields: `last_failed_at`, `failure_scope`, `diagnosis_code`
 
@@ -1018,7 +1037,7 @@ Both `diagnosis_code` (Orca's word) and `chain_theory` (Koi's agent's word) beco
 
 Recorder:
 
-- writes outcome diagnosis and chain_theory
+- writes outcome diagnosis and chain_theory (text)
 - updates availability priors when appropriate
 - writes a recent-failure signal for fresh spot / no-capacity / OOM scopes
 
@@ -1026,11 +1045,13 @@ Recorder:
 
 Triggered by terminal job failure, repair-budget exhaustion, or abort.
 
+**Stage 1 only.** Like P5c, P5j has no Stage 2 — it produces a freeform diagnosis and narrative, not a config. The Stage-1 final assistant text is the phase output.
+
 Behavior:
 
 - fan out `P5c` for any undiagnosed dead chains first
-- consume LaunchTheory + RuntimeTheory + all P5c diagnoses written for this job
-- synthesize a one-sentence job-level diagnosis (free-form text) + a longer free-text narrative
+- consume LaunchTheory + RuntimeTheory + all P5c chain theories written for this job
+- Stage 1 emits a one-sentence job-level diagnosis (free-form text) + a longer free-text narrative
 - write job-level outcome and narrative
 - transition cluster state to `TERMINAL_FAILED`
 
@@ -1105,10 +1126,12 @@ Later, after cutover, remove giant prompt builders and legacy parse logic.
 
 ### `koi/llm/runner.py`
 
-Add typed final-output support. If typed output plus tools is unsupported by the pinned `pydantic-ai` version, use a two-stage fallback:
+Two-stage is the standard path, not a fallback. The runner exposes one method per stage:
 
-1. tool-capable reasoning call
-2. final typed extraction call
+1. **Stage 1** (`run()` today): `pydantic-ai` `Agent.iter()` with read tools registered and **no `output_type`**. Returns the message history. This is the freeform exploration step.
+2. **Stage 2** (`run_typed()` today, rewired): a fresh `pydantic-ai` call with **zero tools registered** and `NativeOutput(ChosenAction)`. Takes Stage 1's `message_history` as input context. The pinned `pydantic-ai` version routes `NativeOutput` to OpenAI-compatible `response_format={"type":"json_schema","strict":true,...}` against OpenRouter (or any other OpenAI-compatible endpoint via `KOI_BASE_URL`). On schema validation failure the call raises and the program halts (MVP).
+
+The existing `run()` / `run_typed()` skeleton in the repo is the foundation; the migration is to (a) drop `output_type` from `run()`, (b) switch `run_typed()` to `NativeOutput` mode with no tools, (c) thread `message_history` from Stage 1 into Stage 2.
 
 ### `koi/runtime_state.py`
 
@@ -1117,83 +1140,97 @@ Do not add full FSM tables in v0. Add only targeted persistence if needed:
 - retry budget entries
 - recent-failure entries (currently stored in the `cooloffs` table)
 - optional packet/choice audit entries
-- admission_queue table for the waiting queue
 
 ### `koi/tools/memory.py`
 
 Reuse existing decisions/outcomes/launch_attempts/availability_priors. Add targeted helpers only if current queries cannot retrieve recent failure/failure-scope data cleanly.  
 Add a `chain_id` column and a `theory_blob` JSON column.
 
-### Orca Integration (cross-repo: `Tandemn-orca/`)
+### Orca Integration
 
-This section grounds the Koi ↔ Orca contract in concrete Orca files. The Orca repo lives at `Tandemn-orca/` (sibling of `koi/`). All citations below are file:line in that repo.
+The Koi ↔ Orca contract for launches is intentionally narrow: **Koi declares the goal and the menu; Orca walks the menu, runs the gate, and reports outcomes via webhooks.** Orca owns the launch loop. Koi owns the goal and the post-hoc reaction.
 
-#### Contract changes for homogeneous-groups + progressive launch (§15 Phase 6)
+#### Submission
 
-The new Koi-side plan shape is `groups: list[{config, replica_count, …}]` ordered by `$/token`. Orca needs to walk groups in order, fire `replica_count` parallel submits per group, wait up to a per-group timeout, accept whatever started, and call back to Koi after each group with `started_count` so Koi can decide whether to continue or skip the rest. Concrete deltas:
+One Koi → Orca call per launch event (P0 initial placement, PRecovery recovery, Pscale `add_alternative`):
 
-**A. Request schema** (`Tandemn-orca/models/requests.py`)
-- Add a `GroupSpec` model: `{gpu_type, tp, pp, dp=1, planned_market, replica_count: int, group_timeout_sec: Optional[float]}`. Could subclass `KoiPlacementAlternative` (`models/requests.py:10-17`).
-- Add `groups: Optional[list[GroupSpec]]` to `BatchedRequest` (`models/requests.py:20`). Mutually exclusive with `replicas` + `koi_alternatives` (the legacy "one homogeneous group + per-replica fallback" path).
+```text
+POST /submit/launch
+{
+  job_id,
+  required_tps,                 # SLO target the launch must satisfy
+  alternatives: [               # 3 ordered alternatives, cheapest $/token first
+    {
+      alternative_id,           # static position-based label ("alt_0", "alt_1", "alt_2"); assigned by Koi, used as join key
+      config,                   # full engine + GPU + market + region spec
+      replica_count,            # how many chains of this config to attempt
+      predicted_tps_per_chain   # nullable; null → gate treats as required_tps
+    },
+    ...
+  ]
+}
+```
 
-**B. Server entrypoint** (`Tandemn-orca/server.py`)
-- New branch in `submit_batch` (`server.py:2000-2384`): if `request.groups` is set, build `List[(config: MagicOutput, replica_count: int)]` and dispatch to a new `launch_progressive_groups(...)` instead of `launch_chunked_replicas`.
-- Skip the "merge alternatives into configs[]" step at `server.py:2135-2166` for the new path — it flattens groups into per-replica fallback, which is the wrong semantic.
-- Honor `groups` in **both** solver branches (`user_specified` and `roofline`); currently `koi_alternatives` is only honored by `user_specified`.
+Returns immediately with an ack. Koi does not block — it waits for webhooks.
 
-**C. Launcher** (`Tandemn-orca/orca_server/launcher.py`)
-- Replace or wrap `launch_chunked_replicas` (`launcher.py:822-1058`) with a per-group outer loop:
-  1. For each group, compute `group_id = f"{parent_job_id}:g{idx}"`.
-  2. Pre-register replicas in `cm` with that `group_id` (today `cm.set_replica_state` carries no `group_id` field — `launcher.py:911-913`; needs adding).
-  3. Spawn `replica_count` threads, each calling a slimmed `_launch_chunked_replica` with **a single config** (the inner `for j, cfg in enumerate(configs)` fallback loop at `launcher.py:922` collapses to one iteration — fallback is now group-level, not replica-level).
-  4. Wait up to `group_timeout_sec` on a `threading.Event` set as replicas reach `phase=model_ready` (signaled via `_notify_koi_replica_ready` at `server.py:894-951`).
-  5. On timeout: tear down still-launching replicas via `sky_down_with_retry(replica_id)` (already imported at `launcher.py:35`) and emit `/job/group-complete`.
+#### Orca's loop
 
-**D. New webhooks**
-None of these exist today — all would be new emissions through `_post_koi_webhook`:
+For each alternative in submitted order:
 
-| New webhook | Trigger | Payload |
+1. Fire all `replica_count` chain submits in parallel. Each chain is an atomic launch attempt with timeout `KOI_CHAIN_LAUNCH_TIMEOUT_S=300` (configurable per launch).
+2. As each chain resolves, Orca emits exactly one webhook for it (`chain_started` or `chain_failed`) and re-evaluates the gate:
+
+   ```text
+   contribution(chain) = chain.predicted_tps_per_chain  if not None  else  required_tps
+   total_predicted     = sum(contribution(c) for c in chains_started_so_far)
+   gate_satisfied      = (total_predicted >= required_tps)
+   ```
+
+3. **In-flight chains within the current alternative are never cancelled by the gate.** Let them resolve naturally; bonus capacity is welcome.
+4. When the current alternative fully resolves (every chain either started or failed):
+   - if `gate_satisfied` → stop. Don't launch the next alternative.
+   - else → submit the next alternative.
+5. When the loop ends — gate met, alternatives exhausted, or cancelled — emit one `launch_complete` webhook with the final summary.
+
+#### Webhooks
+
+| Webhook | Trigger | Payload |
 |---|---|---|
-| `/job/group-launching` | start of each group | `job_id`, `group_id`, `group_index`, `target_count`, `config_summary` |
-| `/job/group-complete` | end of group's launch window (timeout or all-started) | `job_id`, `group_id`, `group_index`, `target_count`, `started_count`, `accepted_replicas: list[replica_id]`, `failed_replicas: list[{replica_id, reason_code, reason}]`, `elapsed_seconds` |
-| `/job/group-skipped` | Koi told Orca to skip remaining groups (SLO satisfied early) | `job_id`, `group_id`, `group_index`, `reason: "slo_satisfied_early"` |
+| `chain_started` | chain reached "model ready" | `job_id`, `chain_id`, `alternative_id`, `started_at`, `predicted_tps_per_chain` |
+| `chain_failed` | chain failed to start (timeout, OOM, no-capacity, etc.) | `job_id`, `chain_id`, `alternative_id`, `reason_code`, `reason_text` |
+| `launch_complete` | end of loop | `job_id`, `started_chains: [...]`, `failed_chains: [...]`, `total_predicted_tps`, `slo_satisfied: bool`, `cancelled: bool` |
 
-`/job/group-complete` is the central new hook — it tells Koi how many chains actually started so Koi can decide to skip remaining groups or move to the next one. Emit through `launcher.py:_post_koi_webhook` with dedup key `f"group_complete:{group_id}"`.
+`launch_complete` is the trigger for Koi's FSM transition:
+- `started_chains` empty → invoke PRecovery with `launch_failed`.
+- `started_chains` non-empty → enter `WARMING`. If `slo_satisfied=false`, Pscale handles the shortfall once telemetry stabilizes.
 
-**E. `group_id` widening**
-Existing webhook payloads already carry `group_id` (`launcher.py:255, 890, 1252, 1299`; `server.py:925, 1262, 1537`) but `group_id == parent_job_id` today. Widen to a sub-job identifier (e.g. `f"{parent_job_id}:g{idx}"`). Backward compatible — existing single-group jobs still work with `group_id` matching `parent_job_id`.
+Per-chain webhooks fire as they happen and drive incremental state updates (each `chain_started` adds a chain to `JobTracker`; each `chain_failed` is recorded for memory and recent-failure signals).
 
-**F. ClusterManager state** (`Tandemn-orca/orca_server/job_manager.py`)
-Add `group_id` and `group_index` fields to replica state. Update `cm.get_replica_states(job_id)` callers (e.g. watchdog at `Tandemn-orca/orca_server/watchdog.py:79, 130-141, 183`) so they can filter by group.
+#### Cancellation
 
-**G. Per-group timeout plumbing**
-Add a new constant alongside `REPLICA_DEAD_THRESHOLD_SEC` in `Tandemn-orca/orca_server/config.py:54-57`:
-
-```python
-KOI_GROUP_LAUNCH_TIMEOUT_SEC = int(os.environ.get("KOI_GROUP_LAUNCH_TIMEOUT_SEC", "600"))
+```text
+POST /submit/cancel-launch
+{ job_id }
 ```
 
-Allow override per group via `GroupSpec.group_timeout_sec`. Default 600 s — matches Koi's `KOI_GROUP_LAUNCH_TIMEOUT_S` (§14).
+On cancel:
+- No new alternatives are walked.
+- In-flight launch attempts in the current alternative are torn down.
+- Already-`chain_started` chains keep running — they're real cluster state. Koi can scale them down later via Pscale if needed.
+- Orca emits `launch_complete` with `cancelled: true` and the partial summary.
 
-**H. `ReasonCode` extensions** (`Tandemn-orca/orca_server/koi_contract.py:30-43` and the mirrored `koi/koi/contract.py`)
-Add two values for the new path:
+Use cases: user cancels job, repair budget exhausted mid-flight, operator manual intervention.
+
+#### Reason codes
+
+Orca's `chain_failed.reason_code` is the source of truth for Koi's recent-failure signals and PRecovery theory inputs (see §10). Notable values to add for this contract:
 
 ```python
-GROUP_LAUNCH_TIMEOUT = "group_launch_timeout"
-GROUP_SKIPPED_BY_KOI = "group_skipped_by_koi"
+CHAIN_LAUNCH_TIMEOUT = "chain_launch_timeout"  # KOI_CHAIN_LAUNCH_TIMEOUT_S elapsed
+LAUNCH_CANCELLED     = "launch_cancelled"      # tore down due to /cancel-launch
 ```
 
-Both repos must update in lockstep (`koi_contract.py:1-9` requires byte-identical mirror).
-
-#### What does NOT change
-
-- The outbox / dedup machinery (`Tandemn-orca/orca_server/outbox.py`) handles new event types transparently — `event_type = event.replace("-", "_")` at `launcher.py:172`.
-- The chunked work-queue (`Tandemn-orca/chunk_manager.py`) is independent of how replicas are grouped; chunks are pulled by `replica_id` regardless of group membership.
-- `_notify_koi_replica_ready` at `server.py:894-951` continues to fire `/job/started` per replica with `is_fallback` and `decision_id`; it just needs to forward the new `group_id` from `koi_webhook_info` (`launcher.py:888-895`).
-
-#### Standing inconsistency to fix in passing
-
-The watchdog emits `/job/replica-failed` **without** a `reason_code` field (`Tandemn-orca/orca_server/watchdog.py:185-200`). Other emit sites always set one. If Koi is migrating to require `reason_code` everywhere, the watchdog payload needs `"reason_code": ReasonCode.HEARTBEAT_TIMEOUT.value` added. Independent of the groups change but worth landing alongside it.
+Standard pre-existing codes (`no_capacity`, `oom`, `vllm_init_failed`, `spot_preemption`, etc.) continue to apply.
 
 ---
 
@@ -1209,12 +1246,11 @@ KOI_HARNESS_MODEL_PROFILE=weak|strong
 KOI_HARNESS_MAX_SUGGESTIONS=8                           # renamed from KOI_HARNESS_MAX_MENU
 KOI_HARNESS_N_ALTERNATIVES=3                            # NEW: strict n=3 contract for alternatives
 KOI_MAX_CHAIN_ATTEMPTS=30                               # NEW: per-job repair attempt budget
-KOI_DECIDE_QUEUE_TTL_S=1800                             # NEW: admission queue time-to-live (seconds)
-KOI_DECIDE_QUEUE_POLL_S=30                              # NEW: queue polling interval (seconds)
-KOI_GROUP_LAUNCH_TIMEOUT_S=600                          # NEW: per-group timeout for progressive launch (P0 / PRecovery / Pscale add_group)
+KOI_CHAIN_LAUNCH_TIMEOUT_S=300                          # NEW: per-chain launch timeout for Orca's per-chain submits (P0 / PRecovery / Pscale add_alternative)
+KOI_P5C_WAIT_S=30                                       # NEW: how long PRecovery waits for parallel P5c on chain_died before proceeding without it
 ```
 
-`KOI_HARNESS_HETEROGENEOUS` is removed — the system uses homogeneous-groups + progressive launch unconditionally (see §15 Phase 6).
+`KOI_HARNESS_HETEROGENEOUS` is removed — every alternative is a single homogeneous group; no nested groups inside a plan.
 
 ---
 
@@ -1225,15 +1261,13 @@ Foundation-first: vocabulary and identity before contracts, contracts before beh
 | Phase | Lands | Primary test gate | Flag(s) |
 |---|---|---|---|
 | 0. Vocabulary + PRecovery merge | Rename `p1.py`+`p4.py` → `precovery.py`; rename `p5c.py`→`chain_postmortem.py`, `p5j.py`→`job_postmortem.py`, `resource_ledger.py`→`resource_map.py`; rename `_classify_status_with_hysteresis`→`_classify_status_with_deadband` (+ `DeadBand` wrapper). Mechanical only. | Full unit + sim suite green with no functional change. | — |
-| 1. Chain identity + repair budget | Add `chain_id` column to `decisions`/`outcomes`/`launch_attempts`. Add `count_chain_attempts(job_id)`. Replace `MAX_STARTUP_RETRIES`/`P1_RETRY_BUDGET`/`P4_RETRY_BUDGET` with one per-job cap. Decrement only on real Orca submits and scale-up. Exhaustion → P5j → `TERMINAL_FAILED`. | Sim runs PRecovery 30 times for one job; 31st transitions to `TERMINAL_FAILED`. Scale-down does not consume budget. | `KOI_MAX_CHAIN_ATTEMPTS=30` |
-| 3. n=3 alternatives + feasibility check | `ChosenAction` requires exactly 3 typed alternatives, validated by `pydantic-ai`. Feasibility checker runs on every emitted config (VRAM / TP heads / PP layers / market availability / cooloff scope). On infeasibility: agent retries up to `max_iterations`, then falls back to top deterministic suggestion. Apply to P0, PRecovery, Pscale. | Schema rejects `len < 3` / `len > 3`; feasibility check rejects bad VRAM/TP/PP; agent converges within retries on test scenarios. | `KOI_HARNESS_N_ALTERNATIVES=3`, `KOI_HARNESS_MAX_SUGGESTIONS=8` |
-| 4. Theories (Launch + Runtime) | Add `koi/harness/theories.py` with `LaunchTheory` + `RuntimeTheory`: `{hypothesis: str (one-sentence), confidence: float, evidence: str}`. Free-form, no enum. Extend `ChosenAction.theory` so theory + plan emit in one structured response. PRecovery emits on every trigger; Pscale emits on `DEGRADED`/`OVERPROV`. Persist as `decisions.theory_blob`. | Theory is a non-empty one-sentence string; round-trips through `theory_blob`; `(theory → action → outcome)` triples join cleanly. | — |
+| 1. Chain identity + repair budget | Add `chain_id` column to `decisions`/`outcomes`/`launch_attempts`. Add `count_repair_actions(job_id)`. Replace `MAX_STARTUP_RETRIES`/`P1_RETRY_BUDGET`/`P4_RETRY_BUDGET` with one per-job cap. **Decrement once per PRecovery invocation, and once per Pscale invocation that picks a real action** (`add_alternative`, `remove_replica`, upgrade/migrate). Pscale `noop` does NOT decrement. P0 does not decrement. Budget is checked before the prompt fires; exhaustion → skip the prompt, route to P5j → `TERMINAL_FAILED`. | Sim invokes PRecovery 30 times for one job; 31st invocation is skipped and transitions to `TERMINAL_FAILED`. P0 does not consume budget. Pscale `noop` does not consume budget; Pscale `add_alternative` does. | `KOI_MAX_CHAIN_ATTEMPTS=30` |
+| 3. n=3 alternatives + feasibility check | `ChosenAction` requires exactly 3 typed alternatives, validated by `pydantic-ai` `strict:true`. Feasibility checker runs **once** on every Stage-2 emitted config (VRAM / TP heads / PP layers / market availability / cooloff scope). **No retry loop, no deterministic fallback** — on infeasibility the phase fails hard: route to P5j → `TERMINAL_FAILED` with reason `generation_infeasible`. (Stage 2 already has `max_iterations=1` and no retries; Stage 1 doesn't emit configs, so there is nowhere to retry.) Apply to P0, PRecovery, Pscale. | Schema rejects `len < 3` / `len > 3`; feasibility check rejects bad VRAM/TP/PP; on infeasibility the job transitions to P5j → `TERMINAL_FAILED` with reason `generation_infeasible`. | `KOI_HARNESS_N_ALTERNATIVES=3`, `KOI_HARNESS_MAX_SUGGESTIONS=8` |
+| 3.5. Two-stage commit | Refactor `koi/llm/runner.py` to enforce two-stage. **Stage 1**: `Agent.iter()` with read tools registered, **no `output_type`** (free exploration). **Stage 2**: separate call with **zero tools** and `NativeOutput(ChosenAction)` (`response_format=json_schema, strict=true`); takes Stage 1's `message_history` as input. The two stages never share a call. On Stage-2 schema validation failure the program halts (MVP — no retries, no fallback). Wire **P0, PRecovery, Pscale** to the two-stage runner (Stage 1 + Stage 2). Wire **P5c, P5j** to Stage 1 only — final assistant text is the phase output (chain theory / job narrative); no Stage 2 because there's no config to commit. | Stage 2 produces a schema-valid `ChosenAction` against `strict:true`; Stage 1 message history flows into Stage 2 for P0/PRecovery/Pscale; P5c and P5j produce text output without invoking Stage 2; running with `output_type` set in Stage 1 is rejected by tests; running with tools registered in Stage 2 is rejected by tests. | — |
+| 4. Theories (Launch + Runtime) | Add `koi/harness/theories.py` with `LaunchTheory` + `RuntimeTheory`: `{hypothesis: str (one-sentence), confidence: float, evidence: str}`. Free-form, no enum. Extend `ChosenAction.theory` so theory + plan emit in one structured response (Stage 2). PRecovery emits on every trigger; Pscale emits on `DEGRADED`/`OVERPROV`. Persist as `decisions.theory_blob`. | Theory is a non-empty one-sentence string; round-trips through `theory_blob`; `(theory → action → outcome)` triples join cleanly. | — |
 | 5. P2 chain summary on success | Add `koi/harness/p2.py: run_chain_summary(job_id, chain_id)`. Deterministic stats by default; optional LLM reflection ≤300 tokens behind flag. Wire into `/job/complete` success path. | Every successful chain has a `chain_summary` row. Memory queries return both success and failure rows for the same model class. | `KOI_HARNESS_PROMPTS=…,p2` (optional reflection) |
-| 6. Homogeneous groups + progressive launch | `primary_plan.groups: list[Group]`. Add `koi/harness/group_launcher.py` for the progressive-launch loop (per-group timeout, greedy SLO stop, partial-fleet fallback to Pscale). `Pscale.add_group` runs the same loop on one new group. | Per-group timeout test, greedy-stop test, zero-start test (all groups timeout → PRecovery). | `KOI_GROUP_LAUNCH_TIMEOUT_S=600` |
-| 2. Admission gate + waiting queue *(deferred to last)* | `admission_queue` table; `quota_ok` + `cost_ceiling_ok` gates in `/decide`; background poll; TTL → `TERMINAL_ABORTED`. | Queue-and-drain sim, TTL-expiry sim, restart-resume sim. | `KOI_DECIDE_QUEUE_TTL_S=1800`, `KOI_DECIDE_QUEUE_POLL_S=30` |
+| 6. Per-chain launch + Orca-owned alternative walk | `ChosenAction.alternatives: list[Alternative]` of length 3 (flat, no nested groups). Koi calls `orca.submit_launch(job_id, required_tps, alternatives)` once per launch event; Orca walks alternatives in order, fires per-chain submits in parallel within each alternative, evaluates the gate after every chain resolution, and emits `chain_started` / `chain_failed` / `launch_complete` webhooks. Add `orca.cancel_launch(job_id)`. `Pscale.add_alternative` uses the same call with a 1-element list. | Per-chain timeout (chain that doesn't start in time is failed; alternative continues with remaining chains). Partial-alternative test (5 requested, 2 start, 3 fail; gate sees 2). Greedy alternative-skip (alternative 1's gate met → alternatives 2 and 3 not launched; in-flight chains in alternative 1 still finish). Zero-start across all alternatives → PRecovery (`launch_failed`). Cancel mid-flight → `launch_complete.cancelled=true`. Missing `predicted_tps_per_chain` treated as `required_tps`. | `KOI_CHAIN_LAUNCH_TIMEOUT_S=300` |
 | 7. Cutover | Shadow mode → per-prompt cutover (`P0` → `PRecovery` → `Pscale` → `P5c` → `P5j` → `P2`). After one release cycle stable, delete the legacy giant-prompt path. | Parity tests green, Tier 3 sim parity, no safety regressions, weak-model quality near strong-model baseline. | `KOI_HARNESS=1` |
-
-Phase 2 is intentionally last — admission queue is the most operationally invasive piece and benefits from everything else being stable first.
 
 ### Optional Follow-Ups (deferred)
 
@@ -1256,13 +1290,12 @@ Do it for major functions inside every phase.
 - strong-model parity run
 - weak-model run with `xiaomi/mimo-v2-pro`
 - launch failure → PRecovery scenario (LaunchTheory emission + n=3 alternatives)
-- chain death → P5c (parallel) + PRecovery scenario (ChainTheory + replacement)
+- chain death → P5c (parallel) + PRecovery scenario, P5c finishes within `KOI_P5C_WAIT_S` → PRecovery sees `chain_theory` + `diagnosis_code`
+- chain death → P5c (parallel) + PRecovery scenario, P5c slow → PRecovery times out the wait, packet records `p5c_status: "timed_out"`, agent proceeds without P5c data, P5c output still lands in memory asynchronously
 - spot preemption recent-failure ranking scenario
 - post-mortem coverage scenario
 - per-job repair budget exhaustion → P5j → `TERMINAL_FAILED`
-- admission queue: capacity arrives mid-TTL → admitted
-- admission queue: TTL expiry → `TERMINAL_ABORTED`
-- infeasible LLM-emitted config → agent retries → fallback to top suggestion
+- infeasible LLM-emitted config → feasibility check fails once → P5j → `TERMINAL_FAILED` with reason `generation_infeasible` (no retry, no silent fallback)
 - successful job completion → P2 writes `chain_summary` row for every chain
 
 ### Cutover Gates
@@ -1291,24 +1324,28 @@ harness.alternatives_emitted        # n=3 contract adherence
 harness.llm_reasoned
 harness.detail_requested
 harness.feasibility_check_failed    # LLM-emitted config rejected, agent retrying
-harness.fallback_to_top_suggestion  # max_iterations exhausted, safety net engaged
+harness.generation_infeasible       # Stage-2 emit failed feasibility check — routes to P5j (no retries)
 harness.executed
 harness.budget_decremented
 harness.budget_exhausted
-harness.admission_queued
-harness.admission_ttl_expired
 harness.recent_failure_signal_applied
+harness.p5c_wait_resolved              # P5c finished within KOI_P5C_WAIT_S; PRecovery has full context
+harness.p5c_wait_timed_out             # P5c did not finish in time; PRecovery proceeded without it
 harness.state_transition
 harness.chain_summary_written       # P2 success path
-harness.group_launch_started        # one per Group submit (P0 / PRecovery / Pscale add_group)
-harness.group_launch_timed_out      # group's per-chain timeout hit before all replicas started
-harness.group_launch_complete       # all replicas of the group either started or timed out
-harness.slo_satisfied_early         # progressive launch stopped before exhausting all groups
+harness.launch_submitted            # one per orca.submit_launch (P0 / PRecovery / Pscale add_alternative)
+harness.chain_resolved              # one per chain_started or chain_failed webhook
+harness.alternative_completed       # all chains in an alternative resolved (started or failed)
+harness.gate_satisfied              # cumulative predicted_tps reached required_tps
+harness.alternatives_exhausted      # walked all 3 alternatives without satisfying the gate
+harness.launch_complete_received    # final summary webhook from Orca
+harness.launch_cancelled            # /submit/cancel-launch invoked
+harness.zero_start_escalated_to_precovery
 ```
 
 Track metrics:
 
-- fallback rate (LLM-emitted config infeasible after retries)
+- generation-infeasibility rate (Stage-2 emit failed feasibility check → P5j)
 - timeout rate
 - detail-tool usage rate
 - weak-model success rate
@@ -1317,15 +1354,14 @@ Track metrics:
 - cost overage
 - post-mortem coverage (every dead chain has a P5c diagnosis)
 - recent-failure hit rate
-- admission queue depth
-- admission TTL hit rate
 - per-job repair budget remaining (histogram)
 - n=3 contract adherence rate
 - feasibility check rejection rate
 - theory emission rate per phase
-- group launch fill rate (replicas requested vs replicas started, per group)
-- groups skipped due to early SLO satisfaction (count + cost saved)
-- groups exhausted without satisfying SLO (count → handed off to Pscale)
+- per-alternative fill rate (chains requested vs started, per alternative)
+- gate-hit-on-which-alternative histogram (1 / 2 / 3 / never)
+- bonus chains after gate (chains that started after the gate was satisfied — accepted as headroom)
+- launch cancellation rate
 
 ---
 
@@ -1333,19 +1369,21 @@ Track metrics:
 
 | Risk | Mitigation |
 | --- | --- |
-| Tool calls + typed outputs flaky on some `pydantic-ai` versions. | Two-stage fallback: reasoning call, then typed extraction. |
-| LLM emits malformed shape (wrong `len`, missing fields). | `pydantic-ai` validates and retries; final fallback to top deterministic suggestion. |
-| LLM-emitted config is shape-valid but physically infeasible. | Feasibility check on every emit; retry; fallback to top suggestion. |
-| Harness adds latency. | Compact packets, cap suggestions and tool iterations; fallback rather than block. |
+| Stage-2 model lacks `strict:true` json_schema support. | Pin Stage-2 to a model whose OpenRouter capability list includes `structured_outputs`. Reject incompatible models at config-load time so the program never ships unverified output. |
+| Stage-2 schema validation fails at runtime (malformed shape, missing fields). | MVP halts the program. No retries, no deterministic fallback. Production hardening (retry policy, graceful degradation) is deferred. |
+| PRecovery waits the full `KOI_P5C_WAIT_S` on a stuck P5c, slowing recovery. | Hard timeout; PRecovery proceeds without P5c data after it elapses. P5c continues asynchronously and its output is captured for the next invocation or P5j synthesis. Watch `harness.p5c_wait_timed_out` rate; tune the flag down if P5c is consistently slow. |
+| LLM-emitted config is shape-valid but physically infeasible. | Feasibility check runs **once** on every Stage-2 emit. On failure, route to P5j → `TERMINAL_FAILED` with reason `generation_infeasible`. No retries, no deterministic fallback. |
+| Harness adds latency. | Compact packets, cap suggestions and tool iterations. If exhausted, fail hard rather than ship a non-LLM config. |
+| Generation-infeasibility rate spikes (weak model can't produce feasible configs). | Tracked via `harness.generation_infeasible` (§17). Mitigation is upstream: better packet, better suggestions to reason over, or stronger model — not a deterministic safety net. |
 | Recent-failure signals over-penalize scarce resources. | Soft downrank only; agent may override when SLO requires it. |
-| Repair budget exhausts on noisy spot regions. | Theories steer the agent away from same-scope retries; Pscale prefers on-demand fallback. |
+| Repair budget exhausts on noisy spot regions. | Theories steer the agent away from same-scope retries; Pscale prefers on-demand alternatives when spot churns. |
 | Free-form theory quality varies model-to-model. | Persist every theory; mine post-hoc; causal-graph follow-up flags bad models. |
-| Admission queue starves a job for full 1800 s. | TTL → `TERMINAL_ABORTED` with explicit reason_code; queue depth visible in §17. |
 | Dual state sources create bugs. | Derive state from production sources in v0; defer persistent FSM tables. |
-| Progressive launch exhausts all groups under SLO. | At least one chain → enter `WARMING`, let Pscale scale up. Zero chains → PRecovery. |
-| Per-group timeout too aggressive (abandons recoverable launches). | `KOI_GROUP_LAUNCH_TIMEOUT_S` tunable; watch `harness.group_launch_timed_out` rate. |
-| Per-group timeout too generous (waits too long on stuck region). | Same flag, opposite direction. One knob, not a per-region table. |
-| Agent emits groups in sub-optimal `$/token` order. | Executor re-sorts by deterministic `dollars_per_token_estimate` before walking. |
+| All 3 alternatives exhaust without satisfying the gate. | At least one chain started → enter `WARMING`, let Pscale scale up the shortfall. Zero chains → PRecovery (`launch_failed`). |
+| Per-chain timeout too aggressive (abandons launches that were 1 second from starting). | `KOI_CHAIN_LAUNCH_TIMEOUT_S` tunable; watch the rate of `chain_failed` with `reason_code=chain_launch_timeout`. |
+| Bonus chains after gate produce excess capacity. | Accepted as headroom in MVP. Pscale scales down later from runtime evidence if truly excess. |
+| `predicted_tps_per_chain` is missing for an alternative. | Gate treats `null` as `required_tps` (single chain assumed sufficient). Optimistic; Pscale corrects from observation if reality says otherwise. |
+| Agent emits alternatives in sub-optimal `$/token` order. | Executor re-sorts by deterministic `dollars_per_token_estimate` before submitting to Orca. |
 
 ---
 
@@ -1355,17 +1393,18 @@ The final production decision path should look like this:
 
 ```text
 Koi / Orca event
--> derived ClusterState  +  DecisionPhase
--> deterministic transition packet (job_context + runtime_context + failure_context)
--> deterministic suggestions (advisory, not picked verbatim)
+-> derived ClusterState + DecisionPhase
+-> deterministic packet (job_context + runtime_context + failure_context)
+-> deterministic suggestions (advisory)
 -> small phase-specific prompt
--> LLM (structured generation) emits in one response:
-     - one-sentence Theory (LaunchTheory / RuntimeTheory / ChainTheory)
-     - primary plan + 3 typed alternatives
--> feasibility check on every emitted config (retry on fail; fallback to top suggestion)
--> deterministic executor (Orca submit / scale / drain)
--> ResourceMap update + memory write (decision row + theory_blob + outcomes / chain_summary)
--> per-job repair budget −1 if Orca submit happened
+-> Stage 1: agent loop (tools enabled, freeform, no JSON enforcement)
+       └── produces message_history
+-> Stage 2: strict JSON commit (no tools, response_format=json_schema, strict:true)
+       └── emits ChosenAction { theory, alternatives[3] }
+-> feasibility check runs once on the Stage-2 emit (on failure → P5j → TERMINAL_FAILED, reason=generation_infeasible. No retries.)
+-> orca.submit_launch(job_id, required_tps, alternatives) — Orca walks alternatives, runs per-chain launch + gate, emits chain_started/chain_failed/launch_complete webhooks
+-> ResourceMap update + memory write
+-> repair budget −1 if PRecovery or non-noop Pscale
 ```
 
-This gives Koi a harnessed agent loop that is reliable enough for small local models while preserving the useful part of agentic behavior: reasoned, free-form theorizing over rich evidence, with deterministic safety nets around it.
+This gives Koi a harnessed agent loop that is reliable enough for small local models while preserving the useful part of agentic behavior: reasoned, free-form theorizing over rich evidence. Determinism lives in evidence preparation, feasibility checking, and execution — never in substituting a config for the LLM. If Stage 2 fails to produce a schema-valid `ChosenAction`, the program halts (MVP); the system does not silently ship a deterministic config.
