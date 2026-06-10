@@ -388,7 +388,7 @@ class SurrogatePrediction:
         # Inputs: SurrogateInput
         # Outputs: y_hat, v_hat
         from dynamo.mocker import MockEngineArgs  # type: ignore[import-untyped]
-        from dynamo.replay.api import run_synthetic_trace_replay  # type: ignore[import-untyped]
+        from dynamo.replay.api import run_synthetic_trace_replay
 
         engine_args = surrogate_input["engine_args"]
         replay_args = surrogate_input["replay_args"]
