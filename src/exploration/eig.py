@@ -3,11 +3,11 @@ EIG proxy for causal expected information gain.
 Exact Bayesian EIG needs outcome distributions and mechanism posteriors, which
 we do not have. This deterministic proxy keeps the same purpose: favor candidates
 that test uncertain and under-sampled edges/mechanisms.
-    alpha(L') = sum_e a_e*u(c_e)*w_rare(n_e) + kappa*sum_M a_M*u(c_M)*w_rare(n_M)
-u(c)=4c(1-c) peaks at uncertainty c=0.5. w_rare(n)=1/sqrt(1+n) rewards
-less-tested structures. Eligibility masks a_e and a_M decide what is tested.
-alpha is the exploration term in sigma, weighted by annealed beta_t. Cluster EIG
-uses saturation aggregation to avoid double-counting the same edge in one plan.
+    alpha(L') = sum_e a_e*beta_uncertainty(e) + kappa*sum_M a_M*beta_uncertainty(M)
+beta_uncertainty = 4*c*(1-c)/(alpha+beta+1), where c = alpha/(alpha+beta).
+Eligibility masks a_e and a_M decide what is tested. alpha is the exploration
+term in sigma, weighted by annealed beta_t. Cluster EIG uses saturation
+aggregation to avoid double-counting the same edge in one plan.
 """
 
 from collections.abc import Sequence
@@ -22,24 +22,22 @@ DEFAULT_N_ENV_MIN = 3  # min envs required for ICP
 
 def compute_eig(
     L_prime,
-    edge_table,
-    mechanism_registry,
+    confidence_service,
     evidence_store,
     n: int | None = None,
 ) -> float:
     """
     Definition: Proxy Causal-EIG for one candidate ladder.
-                    alpha(L') = sum_e a_e*u(c(e))*w_rare(n_e)
-                          + kappa*sum_M a_M*u(c(M))*w_rare(n_M)
+                    alpha(L') = sum_e a_e*beta_uncertainty(e)
+                          + kappa*sum_M a_M*beta_uncertainty(M)
                 Sums over edges/mechanisms touched by L'.
     Usage:      The alpha term in sigma(L') = J + beta*alpha - lambda*Pr_DRO - lambda*SwitchCost.
                 Called by agent.tools.compute_eig per (config, mechanism)
     Inputs:
         L_prime            : Ladder with .ranks; each rank has .mechanism_id,
                              .config, .n_replicas
-        edge_table         : EdgeTable with .confidence(edge), .visit_count(edge)
-        mechanism_registry : MechanismRegistry with .get(id), .confidence(id),
-                             .visit_count(id)
+        confidence_service : ConfidenceService with candidate_graph and
+                             mechanism_registry references
         evidence_store     : EvidenceStore (for eligibility-gate lookups)
         n                  : optional visit-count cap (n_e_used = min(n_e, n))
     Outputs:
@@ -47,6 +45,9 @@ def compute_eig(
     """
     if not L_prime.ranks:
         return 0.0
+
+    candidate_graph = confidence_service.candidate_graph
+    mechanism_registry = confidence_service.mechanism_registry
 
     deployed_mids = {r.mechanism_id for r in L_prime.ranks}
     if not deployed_mids:
@@ -62,23 +63,29 @@ def compute_eig(
     for e in touched_edges:
         if not _edge_eligible(e, L_prime, evidence_store):
             continue
-        c_e = edge_table.confidence(e)
-        n_e = edge_table.visit_count(e)
+        edge_metadata = candidate_graph.edge_metadata_table[e.edge_id]
+        alpha_e = edge_metadata.alpha
+        beta_e = edge_metadata.beta
+        c_e = alpha_e / (alpha_e + beta_e)
+        n_e = alpha_e + beta_e
         if n is not None:
             n_e = min(n_e, n)
-        edge_sum += _u(c_e) * _rare(n_e)
+        edge_sum += 4.0 * c_e * (1.0 - c_e) / (n_e + 1.0)
 
     # Mechanism term
     mech_sum = 0.0
     for mid in deployed_mids:
         M = mechanism_registry.get(mid)
-        if not check_mechanism_eligibility(M, L_prime, (edge_table, evidence_store)):
+        if not check_mechanism_eligibility(M, L_prime, (candidate_graph, evidence_store)):
             continue
-        c_m = mechanism_registry.confidence(mid)
-        n_m = mechanism_registry.visit_count(mid)
+        mechanism_metadata = mechanism_registry.mechanism_metadata_table[mid]
+        alpha_m = mechanism_metadata.alpha
+        beta_m = mechanism_metadata.beta
+        c_m = alpha_m / (alpha_m + beta_m)
+        n_m = alpha_m + beta_m
         if n is not None:
             n_m = min(n_m, n)
-        mech_sum += _u(c_m) * _rare(n_m)
+        mech_sum += 4.0 * c_m * (1.0 - c_m) / (n_m + 1.0)
 
     return edge_sum + KAPPA * mech_sum
 
