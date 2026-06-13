@@ -21,6 +21,7 @@ If there are too few envs or samples per env, return undecided.
 """
 
 from collections import defaultdict
+from collections.abc import Hashable
 from enum import Enum
 
 import numpy as np
@@ -56,8 +57,8 @@ class ICP:
         Inputs:
             edge           : Edge (.edge_id, .src, .dst)
             evidence_store : EvidenceStore exposing get_rows_for_edge(id);
-                             each row has .env (env_label) and .residual
-                             (= observed_y_or_v - surrogate_predicted)
+                             each row has .env_label plus residuals_per_v /
+                             residuals_per_y keyed by observed variable.
             alpha_icp      : significance level (default 0.05)
             min_envs       : minimum distinct envs required (default 3)
             n_b            : minimum samples per env for power (default 15)
@@ -73,9 +74,15 @@ class ICP:
         if not rows:
             return ICPResult.UNDECIDED
 
-        by_env: dict[str, list[float]] = defaultdict(list)
+        by_env: dict[Hashable, list[float]] = defaultdict(list)
         for r in rows:
-            by_env[r.env].append(float(r.residual))
+            # EvidenceRow stores residual series by destination variable;
+            # an edge's ICP residual is the residual of edge.dst.
+            residuals_by_name = r.residuals_per_v if edge.dst_type == "V" else r.residuals_per_y
+            residuals = residuals_by_name.get(edge.dst)
+            if residuals is None:
+                continue
+            by_env[r.env_label].extend(np.asarray(residuals, dtype=float).ravel())
 
         envs_with_power = [e for e, lst in by_env.items() if len(lst) >= n_b]
         if len(envs_with_power) < min_envs:
@@ -128,7 +135,7 @@ class ICP:
 
     def _f_test_invariance(
         self,
-        residuals_by_env: dict[str, np.ndarray],
+        residuals_by_env: dict[Hashable, np.ndarray],
     ) -> float:
         """
         Definition: One-way ANOVA F-test on residuals grouped by env.
@@ -153,7 +160,7 @@ class ICP:
 
     def _permutation_test_invariance(
         self,
-        residuals_by_env: dict[str, np.ndarray],
+        residuals_by_env: dict[Hashable, np.ndarray],
         n_perm: int,
     ) -> float:
         """
@@ -179,7 +186,7 @@ class ICP:
         count_geq = 0
         for _ in range(n_perm):
             permuted = rng.permutation(all_residuals)
-            shuffled: dict[str, np.ndarray] = {}
+            shuffled: dict[Hashable, np.ndarray] = {}
             idx = 0
             for env, k in zip(envs, env_sizes, strict=True):
                 shuffled[env] = permuted[idx : idx + k]
@@ -191,7 +198,7 @@ class ICP:
 
     @staticmethod
     def _cross_env_variance_ratio(
-        residuals_by_env: dict[str, np.ndarray],
+        residuals_by_env: dict[Hashable, np.ndarray],
     ) -> float:
         """
         Definition: max(var) / min(var) across environments, Larger = stronger evidence
@@ -207,3 +214,100 @@ class ICP:
         if not variances:
             return 1.0
         return max(variances) / min(variances)
+
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+    from src.core.models import Edge, EvidenceRow
+
+    class FakeEvidenceStore:
+        def __init__(self, rows_by_edge):
+            self.rows_by_edge = rows_by_edge
+
+        def get_rows_for_edge(self, edge_id, limit=None):
+            rows = list(self.rows_by_edge.get(edge_id, []))
+            return rows if limit is None else rows[-limit:]
+
+    def make_row(row_id, env_label, residuals_per_v=None, residuals_per_y=None):
+        return EvidenceRow(
+            row_id=row_id,
+            tick=1,
+            deploy_timestamp_utc=0.0,
+            job_id="job_1",
+            rank_id=row_id,
+            env_label=env_label,
+            X={},
+            W_observed={},
+            V_observed_trajectory={},
+            V_predicted_trajectory={},
+            y_observed_trajectory={},
+            y_predicted={},
+            y_observed_mean={},
+            residuals_per_v=residuals_per_v or {},
+            residuals_per_y=residuals_per_y or {},
+            mechanism_ids=["M_demo"],
+            cusum_per_mechanism={},
+            q_label_per_mechanism={},
+            icp_result_per_edge={},
+            w_t_snapshot={},
+            z_star_snapshot={},
+            J_realized=0.0,
+            sigma_realized=0.0,
+        )
+
+    def make_rows(edge, residuals_by_env):
+        rows = []
+        for idx, (env, residuals) in enumerate(residuals_by_env.items()):
+            residual_dict = {edge.dst: np.asarray(residuals, dtype=float)}
+            rows.append(
+                make_row(
+                    row_id=f"row_{edge.edge_id}_{idx}",
+                    env_label=env,
+                    residuals_per_v=residual_dict if edge.dst_type == "V" else {},
+                    residuals_per_y=residual_dict if edge.dst_type == "Y" else {},
+                )
+            )
+        return rows
+
+    v_edge = Edge(
+        edge_id="shared_prefix_length_avg->kvcache_hit_rate",
+        src="shared_prefix_length_avg",
+        dst="kvcache_hit_rate",
+        src_type="X",
+        dst_type="V",
+    )
+    y_edge = Edge(
+        edge_id="kvcache_hit_rate->p99_ttft_ms",
+        src="kvcache_hit_rate",
+        dst="p99_ttft_ms",
+        src_type="V",
+        dst_type="Y",
+    )
+
+    envs = [
+        ("aws", "us-east-1", "on_demand", "H100"),
+        ("aws", "us-west-2", "on_demand", "H100"),
+        ("gcp", "us-central1", "reserved", "H100"),
+    ]
+    base = np.linspace(-0.2, 0.2, 15)
+    stable_v = {env: base.copy() for env in envs}
+    shifted_y = {env: base + idx * 5.0 for idx, env in enumerate(envs)}
+
+    store = FakeEvidenceStore(
+        {
+            v_edge.edge_id: make_rows(v_edge, stable_v),
+            y_edge.edge_id: make_rows(y_edge, shifted_y),
+        }
+    )
+
+    icp = ICP()
+    v_result = icp.compute_icp_per_edge(v_edge, store)
+    y_result = icp.compute_icp_per_edge(y_edge, store)
+
+    assert v_result == ICPResult.ACCEPT, v_result
+    assert y_result == ICPResult.REJECT, y_result
+    print(f"ICP smoke test passed: V edge={v_result.value}, Y edge={y_result.value}")
