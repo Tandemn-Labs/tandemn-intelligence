@@ -763,15 +763,40 @@ class KoiAgentHarness:
                     raise PlanMaterializationError(
                         f"job {job_id}: action {action_type} requires a ladder dict"
                     )
+                try:
+                    float(ladder.get("duration_minutes", 5.0))
+                except (TypeError, ValueError) as exc:
+                    raise PlanMaterializationError(
+                        f"job {job_id}: ladder duration_minutes must be numeric"
+                    ) from exc
                 ranks = ladder.get("ranks")
                 if not isinstance(ranks, list) or not ranks:
                     raise PlanMaterializationError(
                         f"job {job_id}: ladder requires a non-empty ranks list"
                     )
-                for rank in ranks:
-                    if not isinstance(rank, dict) or "n_replicas" not in rank:
+                for idx, rank in enumerate(ranks):
+                    if not isinstance(rank, dict):
                         raise PlanMaterializationError(
-                            f"job {job_id}: ladder ranks need n_replicas"
+                            f"job {job_id}: ladder rank {idx} must be a dict"
+                        )
+                    for field in ("mechanism_id", "config", "env", "n_replicas"):
+                        if field not in rank:
+                            raise PlanMaterializationError(
+                                f"job {job_id}: ladder rank {idx} needs {field}"
+                            )
+                    if not isinstance(rank["config"], dict):
+                        raise PlanMaterializationError(
+                            f"job {job_id}: ladder rank {idx} config must be a dict"
+                        )
+                    try:
+                        replicas = int(rank["n_replicas"])
+                    except (TypeError, ValueError) as exc:
+                        raise PlanMaterializationError(
+                            f"job {job_id}: ladder rank {idx} n_replicas must be an int"
+                        ) from exc
+                    if replicas <= 0:
+                        raise PlanMaterializationError(
+                            f"job {job_id}: ladder rank {idx} n_replicas must be positive"
                         )
                 if book is not None and not action.get("budget_ref"):
                     raise PlanMaterializationError(
