@@ -1,58 +1,83 @@
+"""Confidence state access and Beta updates for edges and mechanisms.
+
+ConfidenceService is the single writer for alpha/beta, visit counts,
+environment coverage, recency, and Q histograms. The FSM applies updates in
+S3 after EvidenceRows are written, keeping observation collection idempotent.
+"""
+
+from typing import Any
+
 from src.config.hyperparameters import EDGE_BETA_UPDATE, MECHANISM_BETA_UPDATE
 from src.core.models import EdgeConfidenceRecord, MechanismConfidenceRecord
 
 
-def _key(value):
+def _key(value: Any) -> str:
+    """Normalize Enum values and strings to confidence-table keys."""
     return value.value if hasattr(value, "value") else str(value)
 
 
 class ConfidenceService:
+    """Read and update confidence metadata for the causal graph."""
+
     def __init__(self, candidate_graph, mechanism_registry):
+        """Store graph and registry references used as metadata tables."""
         self.candidate_graph = candidate_graph
         self.mechanism_registry = mechanism_registry
 
-    def get_edge_confidence(self, edge_id):
+    def get_edge_confidence(self, edge_id: str) -> float:
+        """Return c(e) = alpha / (alpha + beta) for one edge."""
         alpha = self.candidate_graph.edge_metadata_table[edge_id].alpha
         beta = self.candidate_graph.edge_metadata_table[edge_id].beta
         return alpha / (alpha + beta)
 
-    def get_edge_visit_count(self, edge_id):
+    def get_edge_visit_count(self, edge_id: str) -> int:
+        """Return how many S3 confidence updates touched the edge."""
         return self.candidate_graph.edge_metadata_table[edge_id].visit_count
 
-    def get_edge_environment_seen(self, edge_id):
+    def get_edge_environment_seen(self, edge_id: str) -> set:
+        """Return ICP environment labels where the edge was updated."""
         return self.candidate_graph.edge_metadata_table[edge_id].envs_seen
 
-    def get_edge_last_touched(self, edge_id):
+    def get_edge_last_touched(self, edge_id: str) -> int | None:
+        """Return the last FSM tick that updated this edge, if any."""
         return self.candidate_graph.edge_metadata_table[edge_id].last_touched_tick
 
-    def get_edge_q_histogram(self, edge_id):
+    def get_edge_q_histogram(self, edge_id: str) -> dict[str, int]:
+        """Return Q1-Q4 counts accumulated for one edge."""
         return self.candidate_graph.edge_metadata_table[edge_id].q_histogram
 
-    def get_all_edge_records(self):
+    def get_all_edge_records(self) -> list[EdgeConfidenceRecord]:
+        """Return frozen edge + metadata records for diagnostics/tools."""
         records = []
         for edge_id, edge in self.candidate_graph.edge_table.items():
             edge_metadata = self.candidate_graph.edge_metadata_table[edge_id]
             records.append(EdgeConfidenceRecord(edge=edge, metadata=edge_metadata))
         return records
 
-    def get_mechanism_confidence(self, mechanism_id):
+    def get_mechanism_confidence(self, mechanism_id: str) -> float:
+        """Return c(M) = alpha / (alpha + beta) for one mechanism."""
         alpha = self.mechanism_registry.mechanism_metadata_table[mechanism_id].alpha
         beta = self.mechanism_registry.mechanism_metadata_table[mechanism_id].beta
         return alpha / (alpha + beta)
 
-    def get_mechanism_visit_count(self, mechanism_id):
+    def get_mechanism_visit_count(self, mechanism_id: str) -> int:
+        """Return how many S3 confidence updates touched the mechanism."""
         return self.mechanism_registry.mechanism_metadata_table[mechanism_id].visit_count
 
-    def get_mechanism_environment_seen(self, mechanism_id):
+    def get_mechanism_environment_seen(self, mechanism_id: str) -> set:
+        """Return environment labels where the mechanism was updated."""
         return self.mechanism_registry.mechanism_metadata_table[mechanism_id].envs_seen
 
-    def get_mechanism_last_touched(self, mechanism_id):
+    def get_mechanism_last_touched(self, mechanism_id: str) -> int | None:
+        """Return the last FSM tick that updated this mechanism, if any."""
         return self.mechanism_registry.mechanism_metadata_table[mechanism_id].last_touched_tick
 
-    def get_mechanism_q_histogram(self, mechanism_id):
+    def get_mechanism_q_histogram(self, mechanism_id: str) -> dict[str, int]:
+        """Return Q1-Q4 counts accumulated for one mechanism."""
         return self.mechanism_registry.mechanism_metadata_table[mechanism_id].q_histogram
 
-    def get_mechanism_record(self, mechanism_ids):
+    def get_mechanism_record(self, mechanism_ids: list[str]) -> list[MechanismConfidenceRecord]:
+        """Return frozen mechanism + metadata records for diagnostics/tools."""
         records = []
         for mechanism_id in mechanism_ids:
             mechanism = self.mechanism_registry.mechanism_table[mechanism_id]
@@ -65,7 +90,26 @@ class ConfidenceService:
             )
         return records
 
-    def apply_delta_c_edge(self, edge_id, q_label, icp_result, env_label=None, tick=None):
+    def apply_delta_c_edge(
+        self,
+        edge_id: str,
+        q_label: Any,
+        icp_result: Any,
+        env_label: Any = None,
+        tick: int | None = None,
+    ) -> tuple[float, bool]:
+        """Apply one edge Beta update from a Q label and ICP result.
+
+        Args:
+            edge_id: Edge being updated.
+            q_label: Q1/Q2/Q3/Q4 label from CUSUM quadrant classification.
+            icp_result: accept/reject/undecided invariance result.
+            env_label: Optional environment label for coverage tracking.
+            tick: Optional FSM tick for recency tracking.
+
+        Returns:
+            Updated edge confidence and True when the write succeeds.
+        """
         edge_metadata = self.candidate_graph.edge_metadata_table[edge_id]
         delta_alpha, delta_beta = self.get_delta_c_edge(q_label, icp_result)
 
@@ -82,7 +126,18 @@ class ConfidenceService:
         edge_metadata.q_histogram[q_key] = edge_metadata.q_histogram.get(q_key, 0) + 1
         return self.get_edge_confidence(edge_id), True
 
-    def apply_delta_c_mechanism(self, mechanism_id, q_label, env_label=None, tick=None):
+    def apply_delta_c_mechanism(
+        self,
+        mechanism_id: str,
+        q_label: Any,
+        env_label: Any = None,
+        tick: int | None = None,
+    ) -> tuple[float, bool]:
+        """Apply one mechanism Beta update from a Q label.
+
+        Mechanism updates do not use ICP directly; ICP modulates only the
+        edge update magnitude for the same evidence row.
+        """
         mechanism_metadata = self.mechanism_registry.mechanism_metadata_table[mechanism_id]
         delta_alpha, delta_beta = self.get_delta_c_mechanism(q_label)
 
@@ -98,13 +153,16 @@ class ConfidenceService:
         mechanism_metadata.q_histogram[q_key] = mechanism_metadata.q_histogram.get(q_key, 0) + 1
         return self.get_mechanism_confidence(mechanism_id), True
 
-    def seed_new_mechanism_confidence(self, edges):
+    def seed_new_mechanism_confidence(self, edges) -> None:
+        """Reserved hook for LLM- or prior-seeded mechanism confidence."""
         pass  # TODO - an LLM should do it for now.
 
-    def get_delta_c_edge(self, q_label, icp_result):
+    def get_delta_c_edge(self, q_label: Any, icp_result: Any) -> tuple[float, float]:
+        """Return configured edge alpha/beta increment."""
         return EDGE_BETA_UPDATE[_key(icp_result)][_key(q_label)]
 
-    def get_delta_c_mechanism(self, q_label):
+    def get_delta_c_mechanism(self, q_label: Any) -> tuple[float, float]:
+        """Return configured mechanism alpha/beta increment."""
         return MECHANISM_BETA_UPDATE[_key(q_label)]
 
 
