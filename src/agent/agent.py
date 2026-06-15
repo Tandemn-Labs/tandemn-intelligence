@@ -60,9 +60,21 @@ from src.core.models import (
 
 log = logging.getLogger("koi.agent")
 
-# Specialist actions a single job may propose (a subset is meaningful per job;
-# DIAGNOSE/TERMINATE are root-only cluster decisions).
-SPECIALIST_ACTIONS = frozenset(a.value for a in ActionType)
+# A specialist optimizes ONE job inside its BudgetSlice, so it may only
+# propose place/keep/swap/defer. The lifecycle and cross-job transitions
+# (preempt, resume, retry, terminate, diagnose) are root-only: preempt is a
+# cross-job tradeoff, resume/retry/terminate are scheduling/repair-budget
+# decisions, diagnose is a cluster-plan annotation. The root still uses the
+# specialist's sized ladder when it issues a resume/retry - it just owns the
+# lifecycle semantics. A specialist proposing a root-only action is rejected.
+SPECIALIST_ACTIONS = frozenset(
+    {
+        ActionType.PLACE.value,
+        ActionType.KEEP.value,
+        ActionType.SWAP.value,
+        ActionType.DEFER.value,
+    }
+)
 
 ALLOWED_FITNESS = frozenset({"starved", "happy", "overprovisioned", "blocked"})
 
@@ -218,6 +230,11 @@ class SpecialistRunner:
             "cluster-level reconciliation. Do not reason about other jobs "
             "or cluster tradeoffs - that is the root's job, and you cannot "
             "see the information needed to do it.\n\n"
+            "type must be one of: place, keep, swap, defer. You CANNOT "
+            "preempt, resume, retry, terminate, or diagnose - those are "
+            "cross-job and lifecycle decisions only the root makes. If no "
+            "safe ladder fits the budget, return keep (running job) or "
+            "defer (waiting job) and report fitness=starved or blocked.\n\n"
             "Output a single JSON object with keys: job_id, tenant_id, "
             "type, ladder, predicted_y, predicted_sigma, "
             "budget_utilization, used_capacity, fitness, "
