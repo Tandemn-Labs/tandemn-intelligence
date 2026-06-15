@@ -177,7 +177,13 @@ REQUIRED_JOB_STATE = {
     ActionType.DIAGNOSE: None,
 }
 
-KNOWN_ROLES = frozenset({"prefill", "decode", "aggregate"})
+# v0 is AGGREGATE-ONLY: one engine serves prefill+decode for a job. Prefill/
+# decode disaggregation is disabled this version - the surrogate exposes no
+# per-role throughput (it returns one system-level output tok/s) and rejects
+# online PD. To re-enable, restore the full set on the commented line below.
+# KNOWN_ROLES = frozenset({"prefill", "decode", "aggregate"})  # full PD set
+KNOWN_ROLES = frozenset({"aggregate"})
+_V0_DISABLED_ROLES = frozenset({"prefill", "decode"})  # rejected until PD lands
 
 
 def _as_env_tuple(env) -> tuple | None:
@@ -196,16 +202,18 @@ def _as_env_tuple(env) -> tuple | None:
 class RankSpec:
     """One rank in a ladder: a role-tagged chain config in one environment.
 
-    The user-facing shorthand {"prefill": {"gpu": ..., "chains": ...}} is
-    accepted by from_dict, but the canonical stored form is explicit. env
-    and mechanism_id are NOT in the illustrative shorthand yet both are
-    required by the system: env is the ICP environment AND the launch
-    target (gpu_type alone cannot be launched — which cloud/region?), and
-    mechanism_id is the committed mechanism the evidence loop attributes
-    each rank's CUSUM/Q to.
+    v0 is AGGREGATE-ONLY: role is always "aggregate" (one engine serves
+    prefill+decode). The role-keyed shorthand {"aggregate": {"gpu": ...,
+    "chains": ...}} is accepted by from_dict, but the canonical stored form
+    is explicit. env and mechanism_id are NOT in the illustrative shorthand
+    yet both are required by the system: env is the ICP environment AND the
+    launch target (gpu_type alone cannot be launched — which cloud/region?),
+    and mechanism_id is the committed mechanism the evidence loop attributes
+    each rank's CUSUM/Q to. (Prefill/decode disaggregation is disabled this
+    version; see KNOWN_ROLES.)
     """
 
-    role: str  # "prefill" | "decode" | "aggregate"
+    role: str  # v0: "aggregate" only ("prefill"/"decode" disabled, see KNOWN_ROLES)
     env: tuple | None  # (cloud, region, market, gpu_type)
     config: dict  # X decision variables for this chain
     n_replicas: int = 1  # "chains" in the shorthand
@@ -217,14 +225,26 @@ class RankSpec:
         """Parse a rank from the explicit form or the role-keyed shorthand.
 
         Explicit: {"role", "env", "config", "n_replicas", "mechanism_id"}.
-        Shorthand: {"prefill": {"gpu":..., "count":..., "tp":..., "pp":...,
+        Shorthand: {"aggregate": {"gpu":..., "count":..., "tp":..., "pp":...,
                     "chains":..., "env":..., "mechanism_id":...}}.
 
+        v0 is aggregate-only; a prefill/decode rank (either form) is
+        rejected with a clear error until disaggregation lands.
+
         Raises:
-            ValueError: If raw is not a dict or the role is unknown.
+            ValueError: If raw is not a dict, the role is unknown, or the
+                role is a v0-disabled (prefill/decode) role.
         """
         if not isinstance(raw, dict):
             raise ValueError(f"rank must be a dict, got {type(raw).__name__}")
+
+        requested = next(iter(raw)) if len(raw) == 1 else raw.get("role")
+        if requested in _V0_DISABLED_ROLES:
+            raise ValueError(
+                f"role {requested!r} is disabled in v0 (aggregate-only); emit a "
+                "single 'aggregate' rank - prefill/decode disaggregation is not "
+                "supported this version"
+            )
 
         if len(raw) == 1:
             only_key = next(iter(raw))
