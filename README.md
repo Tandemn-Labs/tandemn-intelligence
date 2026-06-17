@@ -36,21 +36,31 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 ```
 
-### 5. Get Dynamo Source and Install it in the same uv venv
+### 5. Install Dynamo Stable in the same uv venv
 
 ```
-cd ..
-git clone https://github.com/ai-dynamo/dynamo.git
+source .venv/bin/activate
+uv pip install 'ai-dynamo[mocker]==1.2.1'
+```
+
+`[mocker]` installs AIC support via `aiconfigurator`.
+
+Only use a local Dynamo checkout for Dynamo development. If you do, rebuild and
+reinstall all Dynamo pieces from the same checkout/revision so `components/src`,
+`lib/bindings/python/src`, and the compiled `dynamo._core` extension match:
+
+```
+cd ../dynamo
 source ../koi/.venv/bin/activate
-cd dynamo
 cd lib/bindings/python
 maturin develop --uv
 cd "$(git rev-parse --show-toplevel)"
-uv pip install -e lib/gpu_memory_service
 uv pip install -e '.[mocker]'
 ```
 
-.[mocker] installs AIC support via aiconfigurator.
+Mixed Dynamo revisions usually show up as import/signature errors such as
+`dynamo.mocker` missing `MockEngineArgs`, missing AIC helpers in
+`dynamo._internal.aic`, or `_core` passing more AIC args than Python accepts.
 
 
 ### 6. Configure Hugging Face Access With .env
@@ -79,6 +89,7 @@ python -m dynamo.replay \
     "engine_type": "vllm",
     "block_size": 64,
     "aic_backend": "vllm",
+    "aic_backend_version": "0.19.0",
     "aic_system": "h200_sxm",
     "aic_model_path": "nvidia/Llama-3.1-8B-Instruct-FP8",
     "aic_tp_size": 1
