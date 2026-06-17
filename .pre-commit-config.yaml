@@ -1,4 +1,3 @@
----
 repos:
   # Ruff (Python)
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -7,7 +6,6 @@ repos:
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
-
   # Mypy (Python type checking). Configure with pyproject.toml.
   - repo: local
     hooks:
@@ -17,7 +15,22 @@ repos:
         language: system
         types_or: [python, pyi]
         pass_filenames: false
-
+  # YAML formatter. Configure with .yamlfmt at repo root.
+  - repo: https://github.com/google/yamlfmt
+    rev: v0.21.0
+    hooks:
+      - id: yamlfmt
+        files: \.(yaml|yml)$
+  # YAML style linter. Configure with .yamllint.yaml at repo root.
+  - repo: https://github.com/adrienverge/yamllint.git
+    rev: v1.38.0
+    hooks:
+      - id: yamllint
+        args:
+          - --config-file
+          - .yamllint.yaml
+          - --strict
+        files: \.(yaml|yml)$
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
