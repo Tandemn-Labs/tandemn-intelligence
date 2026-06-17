@@ -786,11 +786,11 @@ class KoiAgentHarness:
         if states is not None:
             self._autofill_coverage(plan, states)
 
-        # Empty is valid only when the snapshot explicitly exposes an empty
-        # job inventory. If inventory is unavailable, an empty commit gives us
-        # no way to distinguish "no work" from an incomplete plan.
-        if not plan.actions and states is None:
-            raise PlanMaterializationError("plan has no actions and no job inventory to cover")
+        # An empty commit is "keep everything" when the snapshot has jobs
+        # (auto-fill covers them). It is only malformed when nothing at all
+        # could be derived.
+        if not plan.actions:
+            raise PlanMaterializationError("plan has no actions and no jobs to cover")
 
         return plan
 
@@ -1013,12 +1013,17 @@ class KoiAgentHarness:
             "   'config': {tp, pp, dp, ep, gpu_count, engine_name, ...},\n"
             "   'n_replicas': int,\n"
             "   'mechanism_id': 'M_...'}            # defaults to the action's mechanism_id\n"
-            "v0 is AGGREGATE-ONLY. Do NOT split a job into separate prefill and "
-            "decode ranks, and do NOT set pd_enabled / prefill_worker_count / "
-            "decode_worker_count in config - prefill/decode disaggregation is "
-            "disabled this version (the surrogate exposes no per-role throughput "
-            "and rejects online PD). Every rank is one full prefill+decode "
-            "engine; the only role is 'aggregate'.\n"
+            "v0 is AGGREGATE-ONLY per rank: every rank is one full "
+            "prefill+decode engine (role 'aggregate'); do NOT split prefill/"
+            "decode or set pd_enabled / prefill_worker_count / "
+            "decode_worker_count. But a ladder MAY mix multiple HETEROGENEOUS "
+            "ranks - different gpu_type, tp/pp, quant, even different clouds - "
+            "whenever that improves the job's sigma or cost (e.g. spill a job "
+            "across H100 and A100 pools, or pair a low-latency rank with a "
+            "cheap high-throughput one). The only hard rule per rank: it must "
+            "hold one whole model copy (tp*pp must fit the model). Pick "
+            "whatever mix of ranks maximizes sigma - scoring and sizing compose "
+            "your ranks for you (see size_ladder below).\n"
             "Action types and the job state each needs:\n"
             "  place    waiting->running   (needs ladder, target_tps)\n"
             "  keep     running->running   (no ladder)\n"
@@ -1034,16 +1039,18 @@ class KoiAgentHarness:
             "Jobs you omit are auto-kept (running) or auto-deferred (waiting), "
             "so list only the jobs you actually decide.\n"
             "Do NOT guess n_replicas. Call size_ladder(ranks, job_features): "
-            "it derives n_replicas per rank from the surrogate's per-replica "
-            "throughput and free capacity, regime-aware. For batch jobs it "
-            "sizes on throughput vs deadline at full utilization. For online "
-            "jobs it also (a) rejects any config whose predicted p99 TTFT or "
-            "p99 TPOT exceeds the job's target - that config is not viable "
-            "for online no matter how many replicas, pick another - and "
-            "(b) derates per-replica throughput by a utilization target so "
-            "queue wait stays bounded and p99 TTFT holds. Use it as: "
-            "sized = size_ladder(ranks, job_features); action['ladder'] = "
-            "sized['ranks']. The other returned fields (meets_target, "
-            "per-rank slo_violations, marginal_value) are diagnostics and "
-            "should not be copied into ladder.\n\n"
+            "it SHARES one throughput target across your ranks (filling them in "
+            "the order you list, each covering the remaining target) and sizes "
+            "each rank's n_replicas; achieved_tps is the SUM across ranks, so "
+            "heterogeneous ranks add capacity. For online it EXCLUDES any rank "
+            "whose predicted p99 TTFT/TPOT exceeds target (latency is "
+            "per-replica - replicas cannot fix it) and spills its share to the "
+            "others, and it derates per-replica throughput so queue wait stays "
+            "bounded. Scoring composes your ranks the same way: compute_sigma "
+            "sums throughput, takes the worst-case latency, and blends cost "
+            "across ranks, so a heterogeneous ladder is scored as the whole "
+            "job, not one rank. Use it as: sized = size_ladder(ranks, "
+            "job_features); action['ladder'] = sized['ranks']. The other fields "
+            "(meets_target, unmet_tps, per-rank slo_violations, marginal_value) "
+            "are diagnostics.\n\n"
         )
