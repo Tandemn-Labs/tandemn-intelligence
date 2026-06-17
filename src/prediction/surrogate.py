@@ -334,7 +334,6 @@ class SurrogatePrediction:
             "block_size": direct_x_values.get("block_size", 64),
             "max_num_seqs": direct_x_values.get("max_num_seq"),
             "max_num_batched_tokens": direct_x_values.get("max_num_batched_tokens"),
-            "gpu_memory_utilization": direct_x_values.get("gpu_mem_util", 0.90),
             "aic_backend": direct_x_values.get("engine_name", "vllm"),
             "aic_backend_version": direct_x_values.get("engine_version"),
             "aic_system": self.map_gpu_to_aic_system(gpu_type),
@@ -387,7 +386,7 @@ class SurrogatePrediction:
         # Run the AIC DynoSim model.
         # Inputs: SurrogateInput
         # Outputs: y_hat, v_hat
-        from dynamo.mocker import MockEngineArgs  # type: ignore[import-untyped]
+        from dynamo.llm import MockEngineArgs
         from dynamo.replay.api import run_synthetic_trace_replay
 
         engine_args = surrogate_input["engine_args"]
@@ -709,11 +708,9 @@ class SurrogatePrediction:
 
 #     predictor = SurrogatePrediction(objective="batched")
 
-#     direct_x, derive_x, direct_v, derive_v, direct_y, derive_y = (
-#         predictor.resolve_prediction_scope(
-#             candidate_graph=MockCandidateGraph(),
-#             method="AIC_DynoSim",
-#         )
+#     direct_x, derive_x, direct_v, derive_v, direct_y, derive_y = predictor.resolve_prediction_scope(
+#         candidate_graph=MockCandidateGraph(),
+#         method="AIC_DynoSim",
 #     )
 
 #     print("direct_x:", direct_x)
@@ -727,7 +724,7 @@ class SurrogatePrediction:
 #     job_config = {
 #         "model_id": "nvidia/Llama-3.1-8B-Instruct-FP8",
 #         "engine_name": "vllm",
-#         "engine_version": None,
+#         "engine_version": "0.19.0",
 #         "tp": 1,
 #         "ep": 1,
 #         "block_size": 64,
@@ -752,11 +749,9 @@ class SurrogatePrediction:
 #         "instance_type": "p5e.48xlarge",
 #         "num_nodes_per_chain": 1,
 #         "interconnect_type": "nvlink",
-
 #         "isl_token_avg": 4000,
 #         "osl_token_avg": 500,
 #         "request_arrival_rate": 100,
-
 #         "workload_prefix_concentration": 0.20,
 #         "shared_prefix_length_avg": 1024,
 #         "is_session_affinity": False,
