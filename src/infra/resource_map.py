@@ -208,10 +208,15 @@ class ResourceMapManager:
             if env is None:
                 continue
             env_key = self._env_key(env)
-            gpus = shape.get("gpu_count", shape.get("count"))
-            if gpus is None:
-                gpus = int(shape.get("tp", 1)) * int(shape.get("pp", 1))
-            used[env_key] = used.get(env_key, 0) + max(1, int(gpus))
+            # tandemn-store guarantees a positive int 'count' at launch; read
+            # it directly with no parallelism-derived fallback.
+            count = shape.get("count")
+            if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+                raise ValueError(
+                    f"chain {chain.get('chain_id')} shape_json missing positive int "
+                    f"'count'; got {count!r}"
+                )
+            used[env_key] = used.get(env_key, 0) + count
         return used
 
     @staticmethod
