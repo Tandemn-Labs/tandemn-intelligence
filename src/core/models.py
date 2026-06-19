@@ -92,11 +92,11 @@ class EvidenceRow:
     W_observed: dict[str, float]  # 22 workload features
     V_observed_trajectory: dict[str, np.ndarray]  # sub-tick V samples (all measured V's)
     V_predicted_trajectory: dict[str, np.ndarray]  # surrogate's V_hat(t)
-    y_observed_trajectory: dict[str, np.ndarray]  # sub-tick Y samples — Y-CUSUM input
+    y_observed_trajectory: dict[str, np.ndarray]  # sub-tick Y samples - Y-CUSUM input
     y_predicted: dict[str, float]  # surrogate's y_hat (scalar; CUSUM broadcasts)
     y_observed_mean: dict[str, float]  # mean of y_observed_trajectory per obj
-    residuals_per_v: dict[str, np.ndarray]  # V_obs - V_pred — ICP + CUSUM recalibration
-    residuals_per_y: dict[str, np.ndarray]  # y_obs - y_hat — ICP + DRO coverage tracking
+    residuals_per_v: dict[str, np.ndarray]  # V_obs - V_pred - ICP + CUSUM recalibration
+    residuals_per_y: dict[str, np.ndarray]  # y_obs - y_hat - ICP + DRO coverage tracking
     mechanism_ids: list[str]  # all whose scope matched (includes committed)
     cusum_per_mechanism: dict[str, tuple[object, object]]  # mid -> (v_verdict, y_verdict)
     q_label_per_mechanism: dict[str, object | None]  # None = bundle not observable this rank.
@@ -112,7 +112,7 @@ class EvidenceRow:
 
 
 # ======================================================================
-# Plan schema — the typed, validated output the S4 agent must emit.
+# Plan schema - the typed, validated output the S4 agent must emit.
 #
 # The root LLM assembles a loose dict/list in its REPL (easy for any
 # model, including small open ones), commits it with FINAL_VAR(plan), and
@@ -130,7 +130,7 @@ class ActionType(Enum):
     KEEP      running  -> running   no change
     SWAP      running  -> running   relaunch on a new/modified ladder
                                      (scale up/down, migrate, retune, replace
-                                      a dead chain — see swap_reason)
+                                      a dead chain - see swap_reason)
     DEFER     waiting  -> waiting    stay queued
     RETRY     launch_failed -> running  retry after a failed launch
     TERMINATE any      -> stopped    give up (budget/policy exhausted)
@@ -216,7 +216,7 @@ class RankSpec:
     "chains": ...}} is accepted by from_dict, but the canonical stored form
     is explicit. env and mechanism_id are NOT in the illustrative shorthand
     yet both are required by the system: env is the ICP environment AND the
-    launch target (gpu_type alone cannot be launched — which cloud/region?),
+    launch target (gpu_type alone cannot be launched - which cloud/region?),
     and mechanism_id is the committed mechanism the evidence loop attributes
     each rank's CUSUM/Q to. (Prefill/decode disaggregation is disabled this
     version; see KNOWN_ROLES.)
@@ -227,7 +227,7 @@ class RankSpec:
     config: dict  # X decision variables for this chain
     n_replicas: int = 1  # "chains" in the shorthand
     mechanism_id: str | None = None
-    chain_id: str | None = None  # stable fingerprint for switch-cost ΔL matching
+    chain_id: str | None = None  # stable fingerprint for switch-cost delta matching
 
     @classmethod
     def from_dict(cls, raw) -> "RankSpec":
@@ -400,8 +400,8 @@ class Plan:
     """The cluster-wide decision for one tick: one action per job.
 
     A Plan spans every tenant's jobs, so tenant identity lives on each
-    PlanAction (not on the Plan). operator_id is provenance only — who/what
-    produced the plan — mapping the illustrative "user_id" field.
+    PlanAction (not on the Plan). operator_id is provenance only - who/what
+    produced the plan - mapping the illustrative "user_id" field.
     """
 
     tick: int

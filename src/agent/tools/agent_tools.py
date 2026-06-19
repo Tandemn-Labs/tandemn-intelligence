@@ -1786,12 +1786,19 @@ def _switch_pricing_map() -> dict:
     return {}
 
 
-def compute_switching_cost(ladder_prev: Any, ladder_new: Any) -> dict[str, float]:
+def compute_switching_cost(
+    ladder_prev: Any,
+    ladder_new: Any,
+    pred_y_new: dict[str, float] | None = None,
+    slo_thresholds: dict[str, float] | None = None,
+) -> dict[str, float]:
     """Compute the 4-component switch cost between two ladders.
 
     Args:
         ladder_prev: Current ladder (chain entry dicts or objects).
         ladder_new: Proposed ladder.
+        pred_y_new: Optional proposed ladder prediction for DRO risk.
+        slo_thresholds: Optional per-objective SLO thresholds for DRO risk.
 
     Returns:
         {"c_coldstart", "c_parallel", "c_kill", "c_risk", "total"}.
@@ -1805,6 +1812,8 @@ def compute_switching_cost(ladder_prev: Any, ladder_new: Any) -> dict[str, float
         residual_history=_CTX.dro,
         epsilon_dro=_CTX.slow_loop.get_sss_radius_dro(),
         pricing_map=_switch_pricing_map(),
+        slo_thresholds=slo_thresholds,
+        pred_y_new=pred_y_new,
     )
     return bundle.as_dict()
 
@@ -1887,6 +1896,7 @@ def compute_sigma(plan) -> dict[str, Any]:
         y_hat = _compose_job_y_hat(action)
         if not y_hat:
             continue
+        slo_thresholds = _slo_thresholds_for(snapshot, job_id)
 
         J = float(
             _CTX.tchebycheff_module.compute_tchebycheff(
@@ -1911,11 +1921,13 @@ def compute_sigma(plan) -> dict[str, Any]:
             residual_history=_CTX.dro,
             epsilon_dro=eps_dro,
             pricing_map=pricing_map,
+            slo_thresholds=slo_thresholds,
+            pred_y_new=y_hat,
         )
         pr_slo = float(
             _CTX.dro.dro_chance_constraint(
                 pred_y=y_hat,
-                slo_thresholds=_slo_thresholds_for(snapshot, job_id),
+                slo_thresholds=slo_thresholds,
             ).get("_any_violated", 0.0)
         )
 
@@ -2182,12 +2194,13 @@ def _materialize_ladder(ladder_ranks):
 
 
 def _materialize_chain_list(chain_list):
-    """Adapt rank dicts into ChainEntry objects for switchcost.py.
+    """Adapt rank/store-chain dicts into ChainEntry objects for switchcost.py.
 
     Synthesizes a stable chain_id when one is absent (role + env +
-    sorted config), because switch cost matches ΔL+/ΔL- by chain_id -
+    sorted config), because switch cost matches delta_L+/delta_L- by chain_id -
     None ids would collapse every distinct rank into one and break the
-    add/kill diff. env is coerced to a hashable tuple for pricing lookups.
+    add/kill diff. Store rows use shape_json/target_node; planner ranks use
+    config/env. env is coerced to a hashable tuple for pricing lookups.
     """
     if not chain_list:
         return []
@@ -2197,23 +2210,26 @@ def _materialize_chain_list(chain_list):
 
     out = []
     for c in chain_list:
-        env = c.get("env")
+        shape = c.get("shape_json") or {}
+        config = c.get("config") or shape
+        env = c.get("env") or c.get("target_node") or shape.get("env") or shape.get("target_node")
         env = tuple(env) if isinstance(env, (list, tuple)) else env
-        config = c.get("config", {})
         chain_id = c.get("chain_id")
         if not chain_id:
+            import hashlib
+
             # repr over key-sorted config tolerates unhashable values
             # (nested lists/dicts) while staying deterministic per tick.
             fingerprint = repr(
                 (c.get("role", ""), env, sorted(config.items(), key=lambda kv: kv[0]))
             )
-            chain_id = "auto_" + str(abs(hash(fingerprint)))
+            chain_id = "auto_" + hashlib.sha1(fingerprint.encode()).hexdigest()[:12]
         out.append(
             ChainEntry(
                 chain_id=chain_id,
                 config=config,
                 env=env,
-                n_replicas=int(c.get("n_replicas", 1)),
+                n_replicas=int(c.get("n_replicas") or c.get("chains") or 1),
             )
         )
     return out
