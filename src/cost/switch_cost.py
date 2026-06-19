@@ -130,6 +130,8 @@ def compute_switch_cost(
 
     delta_plus = compute_delta_L_plus(L_prev, L_new)
     delta_minus = compute_delta_L_minus(L_prev, L_new)
+    if not delta_plus and not delta_minus:
+        return SwitchCostBundle()
 
     bundle = SwitchCostBundle()
     bundle.c_coldstart = c_cold_start(delta_plus, img_fn, wt_fn, kv_fn)
@@ -165,9 +167,9 @@ def compute_delta_L_plus(
     Outputs:
         List[ChainEntry] - canary additions only
     """
-    prev_by_id = {ce.chain_id: ce for ce in L_prev}
+    prev_by_id = _chains_by_id(L_prev)
     out: list[ChainEntry] = []
-    for ce in L_new:
+    for ce in _chains_by_id(L_new).values():
         prev = prev_by_id.get(ce.chain_id)
         if prev is None:
             out.append(ce)
@@ -199,9 +201,9 @@ def compute_delta_L_minus(
     Outputs:
         List[ChainEntry] - decommissions only
     """
-    new_by_id = {ce.chain_id: ce for ce in L_new}
+    new_by_id = _chains_by_id(L_new)
     out: list[ChainEntry] = []
-    for ce in L_prev:
+    for ce in _chains_by_id(L_prev).values():
         new = new_by_id.get(ce.chain_id)
         if new is None:
             out.append(ce)
@@ -219,6 +221,25 @@ def compute_delta_L_minus(
     return out
 
 
+def _chains_by_id(chains: list[ChainEntry]) -> dict[str, ChainEntry]:
+    merged: dict[str, ChainEntry] = {}
+    for ce in chains:
+        n_replicas = _positive_replicas(ce)
+        existing = merged.get(ce.chain_id)
+        if existing is None:
+            merged[ce.chain_id] = ChainEntry(ce.chain_id, ce.config, ce.env, n_replicas)
+            continue
+        existing.n_replicas += n_replicas
+    return merged
+
+
+def _positive_replicas(chain: ChainEntry) -> int:
+    n_replicas = int(chain.n_replicas)
+    if n_replicas < 1:
+        raise ValueError(f"chain {chain.chain_id}: n_replicas must be >= 1")
+    return n_replicas
+
+
 # ===================== COMPONENTS ============================
 
 
@@ -234,11 +255,11 @@ def c_cold_start(
     Usage:      Inner helper for compute_switch_cost.
     Inputs:
         delta_L_plus    : List[ChainEntry] - canary additions
-        image_pull_fn   : config → $ image pull (default: cached → $0)
-        weight_load_fn  : config → $ weight load (default: ∝ model_size_gb)
-        kv_init_fn      : config → $ kv allocator init (default: $0.003)
+        image_pull_fn   : config -> $ image pull (default: cached -> $0)
+        weight_load_fn  : config -> $ weight load (default: proportional to model_size_gb)
+        kv_init_fn      : config -> $ kv allocator init (default: $0.003)
     Outputs:
-        float ≥ 0
+        float >= 0
     """
     img = image_pull_fn or _default_image_pull_cost
     wt = weight_load_fn or _default_weight_load_cost
@@ -264,9 +285,9 @@ def c_parallel(
     Inputs:
         delta_L_plus    : List[ChainEntry]
         ab_cost         : canary test window in HOURS (default 1/12 = 5 min)
-        hourly_rate_fn  : ChainEntry → $/hour
+        hourly_rate_fn  : ChainEntry -> $/hour
     Outputs:
-        float ≥ 0
+        float >= 0
     """
     rate_fn = hourly_rate_fn or (lambda chain: hourly_rate(chain, None))
     chain_sum = 0.0
@@ -288,9 +309,9 @@ def c_kill(
     Usage:      Inner helper for compute_switch_cost.
     Inputs:
         delta_L_minus : List[ChainEntry]
-        kill_cost_fn  : config → $ per-chain drain cost (default $0.02)
+        kill_cost_fn  : config -> $ per-chain drain cost (default $0.02)
     Outputs:
-        float ≥ 0
+        float >= 0
     """
     kill_fn = kill_cost_fn or _default_kill_cost
     return float(sum(ce.n_replicas * kill_fn(ce.config) for ce in delta_L_minus))
@@ -325,7 +346,7 @@ def c_risk(
         slo_thresholds   : per-objective thresholds
         pred_y_new       : surrogate y_hat for L_new
     Outputs:
-        float ≥ 0
+        float >= 0
     """
     p = probability_transition_fails_dro(
         L_new=L_new,
@@ -344,25 +365,21 @@ def c_risk(
 def hourly_rate(chain, pricing_map: dict | None = None) -> float:
     """
     Definition: Per-chain hourly cost in USD. Resolution order:
-                  1. config["hourly_rate"]
-                  2. pricing_map[env]["by_instance_type"][instance_type]
-                  3. pricing_map[env]["default"]
-                  4. pricing_map[gpu_type]
-                  5. $1.00/hour
+                  1. pricing_map[env]["by_instance_type"][instance_type]
+                  2. pricing_map[env]["default"]
+                  3. pricing_map[gpu_type]
+                  4. $1.00/hour
     Usage:      c_parallel default rate function; standalone budgeting.
     Inputs:
         chain        : ChainEntry OR a dict (config-like)
         pricing_map  : optional pricing table
     Outputs:
-        float ≥ 0 ($/hour)
+        float >= 0 ($/hour)
     """
     cfg = chain.config if hasattr(chain, "config") else (chain or {})
     env = _env_key(getattr(chain, "env", cfg.get("env")))
     instance_type = cfg.get("instance_type")
     gpu = cfg.get("gpu_type")
-
-    if "hourly_rate" in cfg and cfg["hourly_rate"] is not None:
-        return float(cfg["hourly_rate"])
 
     if pricing_map:
         if env and env in pricing_map and isinstance(pricing_map[env], dict):
@@ -400,9 +417,9 @@ def probability_transition_fails_dro(
                   Path 1 (full): residual_history has
                                  .dro_chance_constraint(...) AND
                                  slo_thresholds AND pred_y_new available
-                                 → returns "_any_violated".
+                                 -> returns "_any_violated".
                   Path 2 (band): dro_band + slo_thresholds available
-                                 → fraction of objectives whose band upper
+                                 -> fraction of objectives whose band upper
                                  edge crosses the threshold.
                   Path 3 (coarse): epsilon_DRO * 0.5 envelope.
     Usage:      Default backend for c_risk. Production callers should
