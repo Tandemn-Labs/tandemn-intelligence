@@ -730,10 +730,8 @@ class KoiAgentHarness:
             - Action is legal for the job's current state (PLACE only on
               waiting, SWAP only on running, ...).
             - Ladder actions carry a non-empty ladder; every rank has a
-              5-tuple env (launch target + ICP key) and >= 1 replica;
-              missing per-rank mechanism_id falls back to the action's,
-              and a missing mechanism_id is a warning (evidence degrades)
-              not a rejection.
+              5-tuple env (launch target + ICP key), >= 1 replica, and a
+              mechanism_id (rank-level or inherited from the action).
             - budget_ref present on ladder actions when a BudgetBook was
               validated this tick.
             - Coverage: jobs in the snapshot with no action are auto-filled
@@ -810,12 +808,7 @@ class KoiAgentHarness:
             if rank.mechanism_id is None:
                 rank.mechanism_id = action.mechanism_id
             if rank.mechanism_id is None:
-                log.warning(
-                    "job %s rank %d has no mechanism_id; evidence loop "
-                    "cannot attribute its CUSUM/Q",
-                    jid,
-                    i,
-                )
+                raise PlanMaterializationError(f"job {jid} rank {i}: mechanism_id is required")
 
         if book is not None and not action.budget_ref:
             raise PlanMaterializationError(
@@ -1037,8 +1030,8 @@ class KoiAgentHarness:
             "  retry    launch_failed->running (needs ladder)\n"
             "  terminate any->stopped       (no ladder; give up after budget/policy exhaustion)\n"
             "  diagnose  no change          (no ladder; record a theory only)\n"
-            "Every ladder rank MUST carry a 5-element env and should carry a "
-            "mechanism_id; a rank without env is rejected (not launchable). "
+            "Every ladder rank MUST carry a 5-element env and MUST resolve a "
+            "mechanism_id, either on the rank or inherited from the action. "
             "For cloud instance pools, config.instance_type is required when "
             "the env has multiple pools. gpu_count is engine GPU demand, not "
             "reserved capacity; Koi reserves and charges one full instance per "
