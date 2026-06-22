@@ -132,7 +132,6 @@ class ActionType(Enum):
                                      (scale up/down, migrate, retune, replace
                                       a dead chain - see swap_reason)
     DEFER     waiting  -> waiting    stay queued
-    RETRY     launch_failed -> running  retry after a failed launch
     TERMINATE any      -> stopped    give up (budget/policy exhausted)
     DIAGNOSE  no state change        record a theory only
     """
@@ -141,10 +140,10 @@ class ActionType(Enum):
     KEEP = "keep"
     SWAP = "swap"
     DEFER = "defer"
-    # TODO(v0): restore PREEMPT/RESUME with paused-job snapshot/executor support.
+    # TODO(v0): restore PREEMPT/RESUME/RETRY with lifecycle snapshot/executor support.
     # PREEMPT = "preempt"
     # RESUME = "resume"
-    RETRY = "retry"
+    # RETRY = "retry"
     TERMINATE = "terminate"
     DIAGNOSE = "diagnose"
 
@@ -154,7 +153,6 @@ LADDER_ACTIONS = frozenset(
     {
         ActionType.PLACE,
         ActionType.SWAP,
-        ActionType.RETRY,
     }
 )
 
@@ -163,7 +161,6 @@ LADDER_ACTIONS = frozenset(
 SWAP_BUDGET_ACTIONS = frozenset(
     {
         ActionType.SWAP,
-        ActionType.RETRY,
     }
 )
 
@@ -173,7 +170,6 @@ REQUIRED_JOB_STATE = {
     ActionType.DEFER: "waiting",
     ActionType.KEEP: "running",
     ActionType.SWAP: "running",
-    ActionType.RETRY: "launch_failed",
     ActionType.TERMINATE: None,
     ActionType.DIAGNOSE: None,
 }

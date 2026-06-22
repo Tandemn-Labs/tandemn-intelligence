@@ -1904,7 +1904,7 @@ def compute_sigma(plan) -> dict[str, Any]:
     """Score a plan: per-job sigma and the cluster aggregate.
 
     sigma = J + beta_t * eig - gamma * Pr_DRO - lambda_swit * switch_cost,
-    over every ladder-bearing action (place/swap/retry). The
+    over every ladder-bearing action (place/swap). The
     scoring inputs are DERIVED, not trusted from the LLM: prev_ladder and
     slo_thresholds come from the snapshot, y_hat from the action's
     advisory predicted_y or a fresh surrogate call. Non-ladder actions
@@ -2027,7 +2027,7 @@ def check_feasibility(plan) -> dict[str, Any]:
 def swap_counter(plan) -> int:
     """Count active-job churn against the C4 swap budget B_t.
 
-    Counts actions in SWAP_BUDGET_ACTIONS (swap, retry). PLACE
+    Counts actions in SWAP_BUDGET_ACTIONS (swap). PLACE
     and DEFER are admission, not churn; KEEP/DIAGNOSE/TERMINATE move no
     running workload.
 

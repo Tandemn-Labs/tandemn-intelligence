@@ -61,8 +61,8 @@ from src.core.models import (
 log = logging.getLogger("koi.agent")
 
 # A specialist optimizes ONE job inside its BudgetSlice, so it may only
-# propose place/keep/swap/defer. Root-only actions remain retry, terminate,
-# and diagnose. TODO(v0): restore preempt/resume with paused-job support.
+# propose place/keep/swap/defer. Root-only actions remain terminate and
+# diagnose. TODO(v0): restore preempt/resume/retry with lifecycle support.
 SPECIALIST_ACTIONS = frozenset(
     {
         ActionType.PLACE.value,
@@ -228,8 +228,8 @@ class SpecialistRunner:
             "or cluster tradeoffs - that is the root's job, and you cannot "
             "see the information needed to do it.\n\n"
             "type must be one of: place, keep, swap, defer. You CANNOT "
-            "retry, terminate, or diagnose - those are root-only. "
-            "Preempt/resume are disabled in MVP v0. If no "
+            "terminate or diagnose - those are root-only. "
+            "Preempt/resume/retry are disabled in MVP v0. If no "
             "safe ladder fits the budget, return keep (running job) or "
             "defer (waiting job) and report fitness=starved or blocked.\n\n"
             "Output a single JSON object with keys: job_id, tenant_id, "
@@ -999,7 +999,7 @@ class KoiAgentHarness:
             "  }\n"
             "Action dict:\n"
             "  {'job_id': str, 'type': <action>, 'tenant_id': str,\n"
-            "   'ladder': [<rank>, ...],            # only for place/swap/retry\n"
+            "   'ladder': [<rank>, ...],            # only for place/swap\n"
             "   'target_tps': float,                # required throughput for place/swap\n"
             "   'mechanism_id': 'M_...',            # committed mechanism for the job\n"
             "   'swap_reason': 'scale_up|scale_down|migrate|replace|retune',  # swap only\n"
@@ -1027,7 +1027,6 @@ class KoiAgentHarness:
             "  keep     running->running   (no ladder)\n"
             "  swap     running->running   (needs ladder; scale/migrate/retune/replace)\n"
             "  defer    waiting->waiting    (no ladder)\n"
-            "  retry    launch_failed->running (needs ladder)\n"
             "  terminate any->stopped       (no ladder; give up after budget/policy exhaustion)\n"
             "  diagnose  no change          (no ladder; record a theory only)\n"
             "Every ladder rank MUST carry a 5-element env and MUST resolve a "

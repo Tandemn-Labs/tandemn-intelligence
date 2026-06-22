@@ -39,8 +39,8 @@ from src.core.models import (
 # Actions whose target job must already exist in the cluster snapshot. PLACE and
 # DEFER admit waiting jobs; DIAGNOSE/TERMINATE may reference jobs outside the
 # running/waiting inventory (post-mortems, cleanup), so existence is not enforced
-# for them. TODO(v0): add preempt/resume when paused jobs are in the snapshot.
-_EXISTENCE_REQUIRED = frozenset({ActionType.KEEP, ActionType.SWAP, ActionType.RETRY})
+# for them. TODO(v0): add preempt/resume/retry with lifecycle snapshot support.
+_EXISTENCE_REQUIRED = frozenset({ActionType.KEEP, ActionType.SWAP})
 
 _KNOWN_WORKLOAD_TYPES = frozenset({"any", "online", "batch", "batched", "offline"})
 
@@ -214,7 +214,7 @@ class Validator:
     def _check_swap_budget(self, typed: Plan, snapshot, slow_state) -> list[str]:
         """Active-job churn must not exceed the slow loop's swap budget B_t.
 
-        Counts actions in SWAP_BUDGET_ACTIONS (swap, retry) on jobs
+        Counts actions in SWAP_BUDGET_ACTIONS (swap) on jobs
         that are currently active - matching the C4 definition that only
         running-workload churn is budgeted.
         """
