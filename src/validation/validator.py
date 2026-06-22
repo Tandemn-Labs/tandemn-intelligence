@@ -1,6 +1,6 @@
 """Deterministic plan and mechanism-proposal validation.
 
-The Validator is the authoritative C0-C7 feasibility gate. The FSM runs
+The Validator is the authoritative C0-C6 feasibility gate. The FSM runs
 ``val_plan`` in S5 (one repair iteration back to the agent on failure, then a
 keep-all fallback); the agent pre-screens K_P candidates with the same call;
 agent tools expose it as ``check_feasibility``. ``val_mechanism_proposal`` and
@@ -21,7 +21,9 @@ Constraint hierarchy (tenant policy ahead of resource feasibility):
     C4 swap budget    active-job churn does not exceed B_t
     C5 capacity       allocation-unit footprint fits snapshot free capacity
     C6 chain physics  each rank is launchable (5-tuple env, >=1 replica, fits)
-    C7 SLO chance     predicted DRO breach below threshold (skipped w/o predictor)
+
+MVP note: SLO/DRO risk is score-only via compute_sigma, not validation-gated.
+TODO(v1): revisit a hard SLO gate once the cutoff policy is well understood.
 """
 
 from dataclasses import dataclass, field
@@ -70,10 +72,8 @@ class Validator:
         mechanism_registry: MechanismRegistry; used for duplicate detection.
         tenant_registry: Optional tenant policy service. When present and it
             exposes ``check_plan(plan, snapshot) -> (ok, violations)``, C3 runs.
-        slo_predictor: Optional callable ``(action, snapshot) -> float`` giving
-            a job's predicted DRO SLO-breach probability. When present, C7 runs.
-        slo_breach_threshold: C7 fails an action whose predicted breach
-            probability exceeds this (default 0.5).
+        slo_predictor: Reserved for a future hard SLO gate; MVP does not call it.
+        slo_breach_threshold: Reserved threshold for the future SLO gate.
         resource_map: Optional resource service; when present it owns allocation
             footprint semantics for C5/C6.
     """
@@ -101,7 +101,7 @@ class Validator:
     def val_plan(self, plan, cluster_snapshot=None, slow_state=None) -> ValidationResult:
         """Validate a cluster plan against the snapshot and slow state.
 
-        Runs the C0-C7 hierarchy. C0 (structure) short-circuits: a plan that
+        Runs the C0-C6 hierarchy. C0 (structure) short-circuits: a plan that
         does not parse or repeats a job cannot be checked further. The
         remaining tiers all run and their violations are collected together
         (tier-ordered), so one repair pass can fix everything at once.
@@ -132,7 +132,9 @@ class Validator:
         self._record(by, "C4", self._check_swap_budget(typed, cluster_snapshot, slow_state))
         self._record(by, "C5", self._check_capacity(typed, cluster_snapshot))
         self._record(by, "C6", self._check_chain_physics(typed, cluster_snapshot))
-        self._record(by, "C7", self._check_slo(typed, cluster_snapshot))
+        # TODO(v1): Re-enable when SLO/DRO has a clear hard-gate policy.
+        # MVP keeps SLO/DRO score-only in agent_tools.compute_sigma.
+        # self._record(by, "C7", self._check_slo(typed, cluster_snapshot))
 
         return self._result(by)
 
@@ -329,13 +331,12 @@ class Validator:
                             )
         return violations
 
-    # ----- C7 SLO chance (optional) -----
+    # ----- Future C7 SLO chance (disabled in MVP) -----
 
     def _check_slo(self, typed: Plan, snapshot) -> list[str]:
-        """Predicted DRO SLO-breach probability must stay under threshold.
+        """Future hard SLO gate; intentionally not called in MVP.
 
-        Skipped entirely unless a slo_predictor was injected, so the gate is
-        runnable before the surrogate/DRO path is wired.
+        SLO/DRO risk is currently score-only via agent_tools.compute_sigma.
         """
         predictor = self.slo_predictor
         if predictor is None:

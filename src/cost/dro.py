@@ -9,8 +9,8 @@ The radius epsilon_DRO adapts from observed coverage:
 Residuals are logged as:
     residual = observed_y - predicted_y
 DRO is used to estimate downside risk, especially SLO violation probability and
-transition failure risk. These risks enter sigma as penalties and make candidate
-selection more conservative when uncertainty or drift is high.
+transition failure risk. In MVP these risks are consumed by agent scoring and
+switch cost only, not by a hard validator gate.
 """
 
 from collections import deque
@@ -284,8 +284,8 @@ class DRO:
                         Pr_DRO[g > 0] <= Pr_{P_hat_t}[g > 0] + epsilon * Lip(g) / sigma
                     Plus aggregate "_any_violated" via union bound:
                         1 - prod(1 - p_j)  (treating SLOs as independent)
-        Usage:      Validator C3 (SLO chance constraint) and SwitchCost
-                    risk computation. Caller passes per-objective SLO
+        Usage:      Agent scoring and SwitchCost risk computation. MVP does
+                    not use DRO as a hard validator gate. Caller passes per-objective SLO
                     thresholds and gets back DRO-bounded violation probs.
         Inputs:
             pred_y            : objective -> y_hat_j (point prediction)
